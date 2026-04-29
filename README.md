@@ -4,7 +4,7 @@
 
 ## 项目结构
 
-`
+```
 trip-score-price-scraper/
 ├── main.py          # 程序入口
 ├── gui.py           # GUI 界面 (Tkinter)
@@ -13,23 +13,24 @@ trip-score-price-scraper/
 ├── models.py        # 数据模型
 ├── requirements.txt # Python 依赖
 └── *.pyw            # Windows 可执行入口
-`
+```
 
 ## 安装与运行
 
-\\ash
+```bash
 # 安装依赖
 pip install -r requirements.txt
 
 # 运行
-python trip-score-price-scraper.pyw
-\
+python trip_get_scoreandprice.pyw
+```
+
 ## 构建 (PyInstaller)
 
-\\ash
-pyinstaller trip-score-price-scraper.spec
-\
+```bash
+pyinstaller trip_get_scoreandprice.spec
+```
+
 ## 依赖
 
-详见 
-equirements.txt。
+详见 `requirements.txt`。
