@@ -1,5 +1,5 @@
 ﻿import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox
+from tkinter import ttk, scrolledtext, messagebox, filedialog
 import threading
 import time
 import re
@@ -22,6 +22,11 @@ import json
 import gc
 import uuid
 import tempfile
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 # 禁用SSL警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -247,6 +252,21 @@ class WebScraperApp:
         # 临时用户数据目录（支持多开）
         self._temp_user_data_dir = None
 
+        # 浏览器内存保护配置
+        self.browser_memory_guard_enabled = True
+        self.browser_memory_limit_mb = 8192
+        self.browser_restart_every = 20
+        self._processed_since_browser_restart = 0
+        self._browser_restart_count = 0
+        self.cli_headless = False
+        self.cli_output_path = None
+        self.cli_output_dir = None
+        self.last_saved_filepath = None
+        self.last_save_error = None
+        self.include_vendor_column = False
+        self.excel_input_path = None
+        self.vendor_workers_var = tk.IntVar(value=5)
+
         # --- GUI Setup ---
         self._create_widgets()
         self.log("程序已就绪。")
@@ -257,6 +277,7 @@ class WebScraperApp:
         self.log("  - 实价抓取：勾选后抓取SKU选择后的动态加载实价")
         self.log("  - 商品资讯：勾选后抓取产品详情页的设备信息")
         self.log("  - 自动禁用屏保：打开浏览器后自动禁用Windows锁屏/macOS屏保")
+        self.log("  - 浏览器内存保护：默认超过8GB或每20条自动重启Chrome释放内存")
         self.log("请点击 [打开浏览器] 开始任务。")
 
     def _create_widgets(self):
@@ -313,6 +334,18 @@ class WebScraperApp:
         ttk.Label(url_frame, text="在此处输入批量网址 (每行一个):").pack(fill=tk.X, anchor=tk.W)
         self.url_text = scrolledtext.ScrolledText(url_frame, height=6, width=80)
         self.url_text.pack(fill=tk.BOTH, expand=True)
+
+        excel_frame = ttk.Frame(url_frame)
+        excel_frame.pack(fill=tk.X, pady=(6, 0))
+        self.btn_choose_excel = ttk.Button(excel_frame, text="选择Excel", command=self.choose_excel_input)
+        self.btn_choose_excel.pack(side=tk.LEFT, padx=(0, 5))
+        self.btn_clear_excel = ttk.Button(excel_frame, text="清除Excel", command=self.clear_excel_input)
+        self.btn_clear_excel.pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(excel_frame, text="并发浏览器数:").pack(side=tk.LEFT)
+        self.spin_workers = ttk.Spinbox(excel_frame, from_=1, to=5, width=4, textvariable=self.vendor_workers_var)
+        self.spin_workers.pack(side=tk.LEFT, padx=(5, 10))
+        self.excel_file_label = ttk.Label(excel_frame, text="未选择Excel（选择后优先使用Excel输入）")
+        self.excel_file_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
         
         # Results TreeView Frame
         results_frame = ttk.LabelFrame(self.root, text="抓取结果实时预览", padding="10")
@@ -359,11 +392,32 @@ class WebScraperApp:
         def _update():
             self.progress_label.config(text=f"进度: {current}/{total}")
         self.root.after(0, _update)
+
+    def choose_excel_input(self):
+        path = filedialog.askopenfilename(
+            title="选择厂商链接Excel",
+            filetypes=[("Excel files", "*.xlsx *.xlsm"), ("All files", "*.*")]
+        )
+        if path:
+            self.excel_input_path = path
+            self.excel_file_label.config(text=path)
+            self.include_vendor_column = True
+            self._setup_treeview_columns()
+            self.log(f"已选择Excel输入: {path}")
+
+    def clear_excel_input(self):
+        self.excel_input_path = None
+        self.excel_file_label.config(text="未选择Excel（选择后优先使用Excel输入）")
+        self.include_vendor_column = False
+        self._setup_treeview_columns()
+        self.log("已清除Excel输入，将使用文本框网址。")
     
     def _setup_treeview_columns(self):
         """设置TreeView的列 - 真正动态显示有数据的列"""
         # 总是显示的基本列
         base_columns = ['ID', 'URL', '商品名称']
+        if getattr(self, "include_vendor_column", False):
+            base_columns.insert(0, '厂商')
         
         # 评分列（总是显示，调整顺序：预定数 -> 评价数 -> 评分 -> ...）
         rating_columns = ['预定数', '评价数', '评分', '客户服务', '方便程度', '讯号状态', '中差评价数']
@@ -397,6 +451,7 @@ class WebScraperApp:
         # 设置列宽度和标题
         column_widths = {
             'ID': 100,
+            '厂商': 120,
             'URL': 100,
             '商品名称': 200,
             '货币': 50,
@@ -490,18 +545,13 @@ class WebScraperApp:
                 else:
                     self.log(f"未找到匹配Chrome {chrome_major}的ChromeDriver，将自动下载")
             
-            # 根据操作系统选择初始化策略
-            if self.current_os == "Darwin":  # macOS
-                self._initialize_chrome_browser_mac()
-            elif self.current_os == "Windows":  # Windows
-                self._initialize_chrome_browser_windows()
-            else:
-                raise Exception(f"不支持的操作系统: {self.current_os}")
+            self._initialize_driver_for_current_os()
             
             if self.driver:
                 # 设置页面加载超时
                 self.driver.set_page_load_timeout(30)
                 self.driver.implicitly_wait(10)
+                self._log_memory_guard_config()
                 
                 # 启用屏保禁用
                 if self.screen_saver_preventer.start_prevention():
@@ -525,6 +575,32 @@ class WebScraperApp:
                 self.browser_state = "CLOSED"
             # 在主线程中显示错误
             self.root.after(0, self._browser_initialized_callback, False, str(e))
+
+    def _initialize_driver_for_current_os(self):
+        """根据当前系统初始化Chrome Driver。"""
+        if self.current_os == "Darwin":  # macOS
+            self._initialize_chrome_browser_mac()
+        elif self.current_os == "Windows":  # Windows
+            self._initialize_chrome_browser_windows()
+        else:
+            raise Exception(f"不支持的操作系统: {self.current_os}")
+
+    def _configure_driver_after_restart(self):
+        """内存保护重启后恢复Driver基础设置。"""
+        if not self.driver:
+            raise Exception("浏览器重启失败：Driver为空")
+        self.driver.set_page_load_timeout(30)
+        self.driver.implicitly_wait(10)
+
+    def _log_memory_guard_config(self):
+        if not self.browser_memory_guard_enabled:
+            self.log("浏览器内存保护已关闭。")
+            return
+        psutil_state = "可用" if psutil else "不可用，仅按处理数量重启"
+        self.log(
+            f"浏览器内存保护已启用：超过 {self.browser_memory_limit_mb}MB "
+            f"或每 {self.browser_restart_every} 条URL自动重启Chrome（psutil: {psutil_state}）。"
+        )
     
     def _create_temp_user_data_dir(self):
         """创建临时用户数据目录，支持多实例同时运行"""
@@ -544,23 +620,47 @@ class WebScraperApp:
             "--disable-background-timer-throttling",
             "--disable-backgrounding-occluded-windows",
             "--disable-renderer-backgrounding",
-            "--disable-features=TranslateUI",
             "--disable-ipc-flooding-protection",
             "--disable-client-side-phishing-detection",
             "--disable-component-update",
             "--disable-domain-reliability",
             "--disable-hang-monitor",
             "--disable-prompt-on-repost",
+            "--disable-application-cache",
+            "--disable-extensions",
+            "--disable-features=TranslateUI,BackForwardCache",
             "--no-first-run",
             "--safebrowsing-disable-auto-update",
             "--aggressive-cache-discard",
+            "--disk-cache-size=104857600",
+            "--media-cache-size=52428800",
             "--js-flags=--max-old-space-size=512",
         ]
         for arg in memory_args:
             options.add_argument(arg)
 
+    def _apply_cli_browser_options(self, options):
+        """Apply optional CLI-only browser settings without changing GUI defaults."""
+        if not getattr(self, "cli_headless", False):
+            return
+        options.add_argument("--headless=new")
+        options.add_argument("--window-size=1920,1080")
+        options.add_argument("--disable-gpu")
+        self.log("CLI headless模式已启用。")
+
     def _clear_browser_memory(self):
         """清理浏览器内存 - 在每个URL处理完毕后调用"""
+        if not self.driver:
+            gc.collect()
+            return
+        try:
+            self.driver.execute_script("window.stop();")
+        except:
+            pass
+        try:
+            self.driver.execute_cdp_cmd('Memory.forciblyPurgeJavaScriptMemory', {})
+        except:
+            pass
         try:
             self.driver.execute_cdp_cmd('Network.clearBrowserCache', {})
         except:
@@ -570,6 +670,269 @@ class WebScraperApp:
         except:
             pass
         gc.collect()
+
+    def _get_driver_service_pid(self, driver=None):
+        """获取当前ChromeDriver服务进程PID。"""
+        driver = driver or self.driver
+        if not driver:
+            return None
+        try:
+            service = getattr(driver, "service", None)
+            process = getattr(service, "process", None)
+            return getattr(process, "pid", None)
+        except:
+            return None
+
+    def _collect_process_tree(self, pid):
+        if not psutil or not pid:
+            return []
+        try:
+            parent = psutil.Process(pid)
+            return [parent] + parent.children(recursive=True)
+        except:
+            return []
+
+    def _iter_managed_browser_processes(self, driver=None):
+        """列出本程序创建的Chrome/ChromeDriver进程，避免影响用户自己的Chrome。"""
+        if not psutil:
+            return []
+
+        processes = {}
+        for proc in self._collect_process_tree(self._get_driver_service_pid(driver)):
+            processes[proc.pid] = proc
+
+        temp_dir = self._temp_user_data_dir
+        if temp_dir:
+            for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+                try:
+                    cmdline = " ".join(proc.info.get("cmdline") or [])
+                    if temp_dir in cmdline:
+                        processes[proc.pid] = proc
+                        for child in proc.children(recursive=True):
+                            processes[child.pid] = child
+                except:
+                    continue
+
+        return list(processes.values())
+
+    def _managed_browser_rss_mb(self):
+        """统计本程序管理的Chrome相关进程RSS。"""
+        if not psutil:
+            return None
+        total = 0
+        for proc in self._iter_managed_browser_processes():
+            try:
+                total += proc.memory_info().rss
+            except:
+                pass
+        return total / (1024 * 1024)
+
+    def _terminate_managed_browser_processes(self, driver=None, timeout=5):
+        """强制清理本程序创建的残留Chrome进程。"""
+        if not psutil:
+            return 0
+
+        current_pid = os.getpid()
+        processes = []
+        for proc in self._iter_managed_browser_processes(driver):
+            try:
+                if proc.pid != current_pid and proc.is_running():
+                    processes.append(proc)
+            except:
+                pass
+
+        if not processes:
+            return 0
+
+        for proc in processes:
+            try:
+                proc.terminate()
+            except:
+                pass
+
+        try:
+            _, alive = psutil.wait_procs(processes, timeout=timeout)
+        except:
+            alive = processes
+
+        killed = 0
+        for proc in alive:
+            try:
+                proc.kill()
+                killed += 1
+            except:
+                pass
+
+        if killed:
+            try:
+                psutil.wait_procs(alive, timeout=2)
+            except:
+                pass
+        return len(processes)
+
+    def _cleanup_temp_user_data_dir(self):
+        if self._temp_user_data_dir and os.path.exists(self._temp_user_data_dir):
+            try:
+                shutil.rmtree(self._temp_user_data_dir, ignore_errors=True)
+                self.log(f"已清理临时用户数据目录: {self._temp_user_data_dir}")
+            except Exception as e:
+                self.log(f"清理临时目录失败（可忽略）: {e}")
+        self._temp_user_data_dir = None
+
+    def _close_extra_tabs(self, keep_handle=None):
+        """关闭多余标签页，确保每条URL结束后只保留主窗口。"""
+        if not self.driver:
+            return None
+        try:
+            handles = list(self.driver.window_handles)
+        except:
+            return None
+        if not handles:
+            return None
+
+        keep_handle = keep_handle if keep_handle in handles else handles[0]
+        for handle in handles:
+            if handle == keep_handle:
+                continue
+            try:
+                self.driver.switch_to.window(handle)
+                self.driver.close()
+            except Exception as e:
+                self.log(f"关闭多余选项卡时出错（可忽略）: {e}")
+
+        try:
+            self.driver.switch_to.window(keep_handle)
+            return keep_handle
+        except:
+            return None
+
+    def _shutdown_driver(self, stop_screen_prevention=True, force_process_cleanup=True):
+        """关闭当前Driver并清理临时Profile。"""
+        driver_to_close = self.driver
+        self.driver = None
+
+        if stop_screen_prevention:
+            try:
+                self.screen_saver_preventer.stop_prevention()
+                self.log("✓ 已恢复屏保和锁屏设置")
+            except:
+                pass
+
+        if driver_to_close:
+            quit_done = threading.Event()
+            quit_error = []
+
+            def quit_driver():
+                try:
+                    driver_to_close.quit()
+                except Exception as exc:
+                    quit_error.append(exc)
+                finally:
+                    quit_done.set()
+
+            threading.Thread(target=quit_driver, daemon=True).start()
+            if quit_done.wait(timeout=15):
+                if quit_error:
+                    self.log(f"正常关闭失败，将强制清理浏览器进程: {quit_error[0]}")
+                else:
+                    self.log("浏览器已成功关闭。")
+            else:
+                self.log("浏览器关闭超时，将强制清理浏览器进程。")
+
+        if force_process_cleanup:
+            cleaned = self._terminate_managed_browser_processes(driver_to_close)
+            if cleaned:
+                self.log(f"已清理 {cleaned} 个浏览器相关残留进程。")
+
+        self._cleanup_temp_user_data_dir()
+        gc.collect()
+
+    def _load_session_after_restart(self):
+        """重启浏览器后尽量恢复Trip登录态。"""
+        try:
+            self.driver.get("https://www.trip.com/")
+            if self.session_manager.load_session(self.driver):
+                self.driver.refresh()
+                self.log("✓ 浏览器重启后已恢复会话。")
+            else:
+                self.log("⚠ 浏览器重启后未找到可恢复的会话。")
+        except Exception as e:
+            self.log(f"⚠ 浏览器重启后恢复会话失败: {e}")
+
+    def _restart_browser_for_memory_guard(self, reason):
+        if self.is_stopped.is_set():
+            return None
+
+        self._browser_restart_count += 1
+        self.log(
+            f"触发浏览器内存保护重启（第 {self._browser_restart_count} 次）：{reason}。"
+        )
+
+        try:
+            if self.driver:
+                self.session_manager.save_session(self.driver)
+        except Exception as e:
+            self.log(f"重启前保存会话失败（继续重启）: {e}")
+
+        with self.browser_lock:
+            self.browser_state = "CLOSING"
+
+        self._shutdown_driver(stop_screen_prevention=False, force_process_cleanup=True)
+        time.sleep(1)
+
+        with self.browser_lock:
+            self.browser_state = "OPENING"
+
+        self._initialize_driver_for_current_os()
+        self._configure_driver_after_restart()
+        self._load_session_after_restart()
+        self._processed_since_browser_restart = 0
+
+        with self.browser_lock:
+            self.browser_state = "OPEN"
+
+        self.log("浏览器内存保护重启完成，继续处理后续URL。")
+        try:
+            return self.driver.current_window_handle
+        except:
+            return None
+
+    def _maybe_restart_browser_for_memory_guard(self):
+        if not self.browser_memory_guard_enabled or not self.driver or self.is_stopped.is_set():
+            return None
+
+        self._processed_since_browser_restart += 1
+        rss_mb = self._managed_browser_rss_mb()
+        reason = None
+
+        if rss_mb is not None:
+            self.log(
+                f"浏览器内存统计：{rss_mb:.0f}MB，当前批次已处理 "
+                f"{self._processed_since_browser_restart}/{self.browser_restart_every} 条。"
+            )
+            if self.browser_memory_limit_mb > 0 and rss_mb >= self.browser_memory_limit_mb:
+                reason = f"Chrome内存 {rss_mb:.0f}MB 已超过 {self.browser_memory_limit_mb}MB"
+        else:
+            self.log(
+                f"浏览器内存统计不可用，当前批次已处理 "
+                f"{self._processed_since_browser_restart}/{self.browser_restart_every} 条。"
+            )
+
+        if (
+            not reason
+            and self.browser_restart_every > 0
+            and self._processed_since_browser_restart >= self.browser_restart_every
+        ):
+            reason = f"已连续处理 {self._processed_since_browser_restart} 条URL"
+
+        if reason:
+            try:
+                return self._restart_browser_for_memory_guard(reason)
+            except Exception as e:
+                self.log(f"浏览器内存保护重启失败，任务将停止: {e}")
+                self.is_stopped.set()
+                return None
+        return None
 
     def _initialize_chrome_browser_windows(self):
         """Windows系统初始化Chrome浏览器 - 优先使用undetected-chromedriver"""
@@ -595,6 +958,7 @@ class WebScraperApp:
             options.add_argument("--disable-dev-shm-usage")
             options.add_argument(f"--user-data-dir={user_data_dir}")
             self._add_memory_optimization_args(options)
+            self._apply_cli_browser_options(options)
 
             self.log(f"启动undetected Chrome浏览器 (version_main={version_main})...")
             self.driver = uc.Chrome(options=options, version_main=version_main, use_subprocess=True)
@@ -612,9 +976,11 @@ class WebScraperApp:
             options = uc.ChromeOptions()
             options.add_argument(f"--user-data-dir={user_data_dir}")
             self._add_memory_optimization_args(options)
+            self._apply_cli_browser_options(options)
 
             self.driver = uc.Chrome(options=options)
-            self.driver.maximize_window()
+            if not getattr(self, "cli_headless", False):
+                self.driver.maximize_window()
             
             self.log("✓ undetected Chrome（无选项模式）启动成功！")
             return
@@ -638,6 +1004,7 @@ class WebScraperApp:
                 options.add_argument("--disable-blink-features=AutomationControlled")
                 options.add_argument(f"--user-data-dir={user_data_dir}")
                 self._add_memory_optimization_args(options)
+                self._apply_cli_browser_options(options)
 
                 options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
                 options.add_experimental_option('useAutomationExtension', False)
@@ -679,6 +1046,7 @@ class WebScraperApp:
             options.add_argument("--disable-blink-features=AutomationControlled")
             options.add_argument(f"--user-data-dir={user_data_dir}")
             self._add_memory_optimization_args(options)
+            self._apply_cli_browser_options(options)
 
             # 尝试启动
             self.driver = uc.Chrome(options=options, version_main=None, driver_executable_path=None)
@@ -731,6 +1099,7 @@ class WebScraperApp:
             options.add_argument("--disable-extensions")
             options.add_argument(f"--user-data-dir={user_data_dir}")
             self._add_memory_optimization_args(options)
+            self._apply_cli_browser_options(options)
 
             options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
             options.add_experimental_option('useAutomationExtension', False)
@@ -1294,58 +1663,19 @@ class WebScraperApp:
     
     def _safe_driver_quit(self):
         """安全关闭浏览器 - 带超时和多重尝试"""
-        driver_to_close = self.driver
-        
-        if not driver_to_close:
+        if not self.driver:
             self.log("浏览器实例不存在。")
+            self._shutdown_driver(stop_screen_prevention=True, force_process_cleanup=True)
             with self.browser_lock:
                 self.browser_state = "CLOSED"
             return
         
         self.log("正在关闭浏览器...")
-        
-        # 恢复屏保设置
         try:
-            self.screen_saver_preventer.stop_prevention()
-            self.log("✓ 已恢复屏保和锁屏设置")
-        except:
-            pass
-        
-        # 先清空driver引用，防止其他操作使用
-        self.driver = None
-        
-        try:
-            # 方法1：尝试正常quit
-            try:
-                driver_to_close.quit()
-                self.log("浏览器已成功关闭。")
-            except Exception as e1:
-                self.log(f"正常关闭失败，尝试强制关闭: {e1}")
-                # 方法2：尝试close所有窗口
-                try:
-                    for handle in driver_to_close.window_handles:
-                        driver_to_close.switch_to.window(handle)
-                        driver_to_close.close()
-                except:
-                    pass
-                # 方法3：再次尝试quit
-                try:
-                    driver_to_close.quit()
-                except:
-                    pass
-                self.log("浏览器已强制关闭。")
+            self._shutdown_driver(stop_screen_prevention=True, force_process_cleanup=True)
         except Exception as e:
             self.log(f"关闭浏览器时出错（可忽略）: {e}")
         finally:
-            # 清理临时用户数据目录
-            if self._temp_user_data_dir and os.path.exists(self._temp_user_data_dir):
-                try:
-                    shutil.rmtree(self._temp_user_data_dir, ignore_errors=True)
-                    self.log(f"已清理临时用户数据目录: {self._temp_user_data_dir}")
-                except Exception as e:
-                    self.log(f"清理临时目录失败（可忽略）: {e}")
-                self._temp_user_data_dir = None
-
             with self.browser_lock:
                 self.browser_state = "CLOSED"
 
@@ -1427,6 +1757,9 @@ class WebScraperApp:
         threading.Thread(target=export_thread, daemon=True).start()
 
     def start_scraping(self):
+        if self.excel_input_path:
+            self.start_excel_scraping()
+            return
         if not self.driver: 
             messagebox.showwarning("提示", "请先点击 '打开浏览器' 按钮。")
             return
@@ -1448,6 +1781,80 @@ class WebScraperApp:
         self.scraping_thread.start()
         self.update_button_states(is_running=True)
         self.log(f"任务开始，共 {len(self.urls_to_process)} 个网址待处理。")
+
+    def start_excel_scraping(self):
+        if self.scraping_thread and self.scraping_thread.is_alive():
+            self.log("任务已在进行中。")
+            return
+        try:
+            workers = int(self.vendor_workers_var.get())
+        except Exception:
+            workers = 5
+        workers = max(1, min(5, workers))
+        self.vendor_workers_var.set(workers)
+        self.is_stopped.clear()
+        self.is_paused.set()
+        self.include_vendor_column = True
+        self.results_data = []
+        self._setup_treeview_columns()
+        self.update_progress(0, 0)
+        self.update_button_states(is_running=True)
+        self.log(f"Excel厂商并发任务开始，并发浏览器数: {workers}")
+
+        def run_batch():
+            try:
+                from models import BrowserOptions, TaskRequest
+                from service import scrape_vendor_batches
+
+                request = TaskRequest(
+                    excel_input=self.excel_input_path,
+                    workers=workers,
+                    rating_only=self.rating_only_var.get(),
+                    extract_real_price=self.extract_real_price_var.get(),
+                    extract_product_info=self.extract_product_info_var.get(),
+                    browser_options=BrowserOptions(
+                        memory_guard_enabled=self.browser_memory_guard_enabled,
+                        memory_limit_mb=self.browser_memory_limit_mb,
+                        restart_every=self.browser_restart_every,
+                    ),
+                )
+
+                def reporter(message):
+                    self.log(message)
+
+                def progress(current, total):
+                    self.update_progress(current, total)
+
+                def rows_callback(rows):
+                    self.results_data.extend(rows)
+                    self.root.after(0, self._setup_treeview_columns)
+                    for row in rows:
+                        self._add_result_to_treeview(row)
+
+                result = scrape_vendor_batches(
+                    request,
+                    reporter,
+                    output_base_dir=str(Path.home() / "Downloads"),
+                    should_stop=lambda: self.is_stopped.is_set(),
+                    progress_callback=progress,
+                    rows_callback=rows_callback,
+                )
+                if result.success:
+                    self.log(f"Excel厂商任务完成，共抓取 {result.processed_count} 行，输出 {len(result.output_paths)} 个文件。")
+                    for path in result.output_paths:
+                        self.log(f"输出文件: {path}")
+                else:
+                    self.log(f"Excel厂商任务结束：{result.error}")
+                    if result.output_paths:
+                        for path in result.output_paths:
+                            self.log(f"已输出文件: {path}")
+            except Exception as e:
+                self.log(f"Excel厂商任务失败: {e}")
+            finally:
+                self.root.after(0, self.update_button_states, False)
+
+        self.scraping_thread = threading.Thread(target=run_batch, daemon=True)
+        self.scraping_thread.start()
 
     def pause_resume_scraping(self):
         if self.is_paused.is_set():
@@ -1553,11 +1960,19 @@ class WebScraperApp:
             self.log(f"检查页面加载状态时出错: {e}")
             return False
 
+    def _normalize_scrape_task(self, task):
+        if isinstance(task, str):
+            return task, None
+        if isinstance(task, dict):
+            return task.get('url', ''), task.get('vendor')
+        return getattr(task, 'url', str(task)), getattr(task, 'vendor', None)
+
     def _scraping_logic(self):
         self.results_data = []  # 重置结果数据
         original_window = self.driver.current_window_handle
         
-        for i, url in enumerate(self.urls_to_process):
+        for i, task in enumerate(self.urls_to_process):
+            url, vendor = self._normalize_scrape_task(task)
             if self.is_stopped.is_set(): 
                 self.log("检测到停止信号，正在退出任务循环。")
                 break
@@ -1568,7 +1983,8 @@ class WebScraperApp:
                 self.log("从暂停中恢复后检测到停止信号，退出。")
                 break
             
-            self.log(f"--- 开始处理第 {i+1}/{len(self.urls_to_process)} 个网址: {url} ---")
+            vendor_label = f" [{vendor}]" if vendor else ""
+            self.log(f"--- 开始处理第 {i+1}/{len(self.urls_to_process)} 个网址{vendor_label}: {url} ---")
             
             try:
                 self.driver.switch_to.new_window('tab')
@@ -1583,7 +1999,7 @@ class WebScraperApp:
                 if self.is_stopped.is_set():
                     break
                     
-                current_result_list = self._scrape_single_page(url)
+                current_result_list = self._scrape_single_page(url, vendor)
                 self.results_data.extend(current_result_list)
                 self.log(f"网址 {url} 数据提取尝试完成，共获取 {len(current_result_list)} 条记录。")
                 
@@ -1595,23 +2011,32 @@ class WebScraperApp:
                     self.log(f"任务被用户停止，已成功中断对 {url} 的处理。")
                 else:
                     self.log(f"处理 {url} 时发生浏览器错误: {e}")
-                    self.results_data.append(self._create_error_record(url, f'浏览器错误: {e}'))
+                    self.results_data.append(self._create_error_record_for_vendor(url, f'浏览器错误: {e}', vendor))
             except Exception as e:
                 self.log(f"处理 {url} 时发生未知严重错误: {e}")
-                self.results_data.append(self._create_error_record(url, f'处理错误: {e}'))
+                self.results_data.append(self._create_error_record_for_vendor(url, f'处理错误: {e}', vendor))
             finally:
-                if len(self.driver.window_handles) > 1 and self.driver.current_window_handle != original_window:
+                if self.driver:
                     try:
-                        self.driver.close()
-                        self.driver.switch_to.window(original_window)
-                        self.log("当前选项卡已关闭。")
+                        handles = list(self.driver.window_handles)
+                        if len(handles) > 1 and self.driver.current_window_handle != original_window:
+                            self.driver.close()
+                            self.driver.switch_to.window(original_window)
+                            self.log("当前选项卡已关闭。")
+                        original_window = self._close_extra_tabs(original_window) or original_window
                     except Exception as e:
                         self.log(f"关闭选项卡时出错: {e}。正在尝试切换回主窗口。")
-                        if self.driver.current_window_handle != original_window:
-                            self.driver.switch_to.window(original_window)
+                        try:
+                            original_window = self._close_extra_tabs(original_window) or original_window
+                        except:
+                            pass
 
-                # 清理浏览器内存
-                self._clear_browser_memory()
+                    # 清理浏览器内存，并按阈值或批次数重启Chrome
+                    self._clear_browser_memory()
+                    if i + 1 < len(self.urls_to_process):
+                        new_original_window = self._maybe_restart_browser_for_memory_guard()
+                        if new_original_window:
+                            original_window = new_original_window
         
         # 更新最终进度显示
         if not self.is_stopped.is_set():
@@ -1674,6 +2099,10 @@ class WebScraperApp:
 
     def _create_error_record(self, url, error_msg):
         """创建错误记录"""
+        return self._create_error_record_for_vendor(url, error_msg, None)
+
+    def _create_error_record_for_vendor(self, url, error_msg, vendor=None):
+        """创建错误记录"""
         product_id = self._extract_product_id(url)
         record = {
             '商品ID': product_id, 
@@ -1687,6 +2116,8 @@ class WebScraperApp:
             '讯号状态': '', 
             '中差评价数': ''
         }
+        if getattr(self, "include_vendor_column", False):
+            record['厂商'] = vendor or ''
         
         # 添加价格相关列（如果不是仅评分模式）
         if not self.rating_only_var.get():
@@ -1706,12 +2137,14 @@ class WebScraperApp:
             
         return record
 
-    def _scrape_single_page(self, url):
+    def _scrape_single_page(self, url, vendor=None):
         """抓取单个页面的数据"""
         product_id = self._extract_product_id(url)
         
         # 获取基础数据（评分、评价数等）
         base_data = self._get_base_rating_data(product_id, url)
+        if getattr(self, "include_vendor_column", False):
+            base_data['厂商'] = vendor or ''
         
         # 如果仅抓取评分，直接返回
         if self.rating_only_var.get():
@@ -1762,6 +2195,7 @@ class WebScraperApp:
             if index > 0:
                 # 清空商品ID、商品名称和其他基础信息
                 result.update({
+                    '厂商': '',
                     '商品ID': '',
                     'URL': '',
                     '商品名称': '',
@@ -2589,20 +3023,27 @@ class WebScraperApp:
             self.log("没有数据可保存。")
             return
         
-        downloads_path = Path.home() / "Downloads"
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        # 根据模式选择不同的文件名
-        if self.rating_only_var.get():
-            filename = f"trip_score_results_{timestamp}.xlsx"
+        requested_path = getattr(self, "cli_output_path", None)
+        if requested_path:
+            filepath = Path(requested_path).expanduser()
         else:
-            filename = f"trip_scoreandprice_results_{timestamp}.xlsx"
-        
-        filepath = downloads_path / filename
+            output_dir = Path(getattr(self, "cli_output_dir", None) or (Path.home() / "Downloads")).expanduser()
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            
+            # 根据模式选择不同的文件名
+            if self.rating_only_var.get():
+                filename = f"trip_score_results_{timestamp}.xlsx"
+            else:
+                filename = f"trip_scoreandprice_results_{timestamp}.xlsx"
+            
+            filepath = output_dir / filename
         
         self.log(f"正在将结果保存到: {filepath}")
+        self.last_saved_filepath = None
+        self.last_save_error = None
         
         try:
+            filepath.parent.mkdir(parents=True, exist_ok=True)
             # 创建工作簿
             workbook = openpyxl.Workbook()
             worksheet = workbook.active
@@ -2615,6 +3056,8 @@ class WebScraperApp:
             
             # 动态构建列标题
             fieldnames = ['商品ID', 'URL', '商品名称']
+            if getattr(self, "include_vendor_column", False) or any('厂商' in item for item in data):
+                fieldnames.insert(0, '厂商')
             
             # 仅抓取评分模式：不包含SKU列
             if not self.rating_only_var.get():
@@ -2683,6 +3126,8 @@ class WebScraperApp:
                     adjusted_width = 50
                 elif header_text == '商品名称':
                     adjusted_width = 40
+                elif header_text == '厂商':
+                    adjusted_width = 20
                 elif header_text == 'URL':
                     adjusted_width = 30
                 else:
@@ -2692,10 +3137,12 @@ class WebScraperApp:
             
             # 保存文件
             workbook.save(filepath)
+            self.last_saved_filepath = str(filepath)
             self.log("XLSX文件保存成功！")
-            messagebox.showinfo("完成", f"数据已成功保存到您的'下载'文件夹中：\n{filepath}\n\n共保存 {len(data)} 条记录")
+            messagebox.showinfo("完成", f"数据已成功保存到：\n{filepath}\n\n共保存 {len(data)} 条记录")
             
         except Exception as e:
+            self.last_save_error = str(e)
             self.log(f"错误：保存XLSX文件失败: {e}")
             messagebox.showerror("保存失败", f"无法保存XLSX文件。\n\n错误详情: {e}")
 
@@ -2736,24 +3183,18 @@ class WebScraperApp:
                 # 停止所有执行中的任务
                 self.stop_scraping()
                 
-                # 在后台线程中关闭浏览器，避免GUI卡死
-                if self.driver:
-                    def close_and_exit():
-                        try:
-                            self.driver.quit()
-                            self.log("浏览器已关闭")
-                        except:
-                            pass  # 忽略关闭浏览器时的错误
-                        # 在主线程中销毁GUI
-                        self.root.after(0, self.root.destroy)
-                    
-                    close_thread = threading.Thread(target=close_and_exit, daemon=True)
-                    close_thread.start()
-                    
-                    # 设置超时，防止无限等待
-                    self.root.after(3000, self.root.destroy)  # 3秒后强制关闭
-                else:
-                    self.root.destroy()
+                def close_and_exit():
+                    try:
+                        self._safe_driver_quit()
+                    except:
+                        pass
+                    self.root.after(0, self.root.destroy)
+
+                close_thread = threading.Thread(target=close_and_exit, daemon=True)
+                close_thread.start()
+
+                # 设置超时，防止无限等待
+                self.root.after(20000, self.root.destroy)
                     
             except Exception as e:
                 self.log(f"退出时发生错误: {e}")
