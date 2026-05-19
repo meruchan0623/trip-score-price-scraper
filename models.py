@@ -17,6 +17,9 @@ class BrowserOptions:
     browser: str = "chrome"
     headless: bool = False
     session_file: str | None = None
+    chrome_path: str | None = None
+    chrome_version_main: int | None = None
+    driver_executable_path: str | None = None
     wait_login: bool = False
     timeout: int = 300
     memory_guard_enabled: bool = True
@@ -33,6 +36,8 @@ class TaskRequest:
     output_dir: str | None = None
     log_file: str | None = None
     workers: int | None = None
+    startup_stagger: float = 0.5
+    stop_grace_seconds: int = 30
     rating_only: bool = False
     extract_real_price: bool = True
     extract_product_info: bool = True
@@ -46,5 +51,7 @@ class TaskResult:
     output_paths: list[str] = field(default_factory=list)
     processed_count: int = 0
     warnings: list[str] = field(default_factory=list)
+    failed_vendors: list[str] = field(default_factory=list)
+    log_file: str | None = None
     error: str | None = None
     exit_code: int = 0
