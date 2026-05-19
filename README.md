@@ -87,10 +87,10 @@ CLI 还提供运行模式，用于打包常用抓取选项：
 | 运行模式 | Headless | 仅评分 | 动态实价 | 商品资讯 | 用途 |
 | --- | --- | --- | --- | --- | --- |
 | 不传 `--run-mode` | 关闭 | 关闭 | 开启 | 开启 | 保持旧默认行为。 |
-| `--run-mode mode1` | 开启 | 关闭 | 开启 | 开启 | 无头完整抓取。 |
+| `--run-mode mode1` | 开启 | 关闭 | 开启 | 开启 | 无头完整抓取，结果表输出 `实价` 列。 |
 | `--run-mode mode2` | 关闭 | 开启 | 关闭 | 开启 | 有头仅评分抓取。 |
 
-优先级：先应用程序默认值，再应用 `--run-mode`，最后应用显式开关。因此显式开关会覆盖运行模式。
+优先级：先应用程序默认值，再应用 `--run-mode`，最后应用显式开关。因此显式开关会覆盖运行模式。如果 `mode1` 同时传入 `--no-real-price` 或 `--rating-only`，则不会输出 `实价` 列。
 
 示例：
 
@@ -124,6 +124,8 @@ CLI 自动完成浏览器生命周期：
 - 任务结束后自动关闭 Chrome。
 - 普通模式默认单浏览器。
 - 厂商 Excel 模式按厂商并发，多进程启动多个独立 Chrome，最多 5 个。
+- CLI 会在启动 worker 前预热 `undetected_chromedriver`，driver 下载/patch 只执行一次，随后所有 worker 复用同一个已准备好的 driver。
+- CLI 会自动优先使用 `certifi` 配置 `SSL_CERT_FILE`，避免 Python 新机证书链缺失导致 driver 下载失败。
 
 CLI 参数：
 
@@ -151,6 +153,18 @@ Headless 会向 Chrome 注入：
 ```
 
 如果 Trip 页面在 headless 下出现验证码、空结果或启动失败，去掉 `--headless`，改用可见 Chrome。
+
+Mac 新机首次运行时，如果日志出现 `CERTIFICATE_VERIFY_FAILED`，先执行：
+
+```bash
+/Applications/Python\ 3.13/Install\ Certificates.command
+```
+
+当前 CLI 也会自动尝试使用 `certifi` 证书路径；如果 driver 已经缓存，后续启动会跳过联网准备，通常明显更快。需要压缩多浏览器启动等待时，可在 driver 缓存成功后使用：
+
+```bash
+python3 main.py --excel-input ./vendors.xlsx --workers 5 --startup-stagger 0
+```
 
 ## 5. 浏览器内存保护
 
@@ -207,11 +221,28 @@ kill -TERM <pid>
 - 保存 session。
 - 关闭浏览器。
 
+CLI 中断采用两段式退出：
+
+- 第一次 `Ctrl+C` / `SIGINT` / `SIGTERM`：进入优雅停止，只通知 worker 停止，等待已完成 URL 导出和浏览器自行关闭。
+- 第二次 `Ctrl+C` / `SIGINT` / `SIGTERM`：升级为强制停止，立即终止剩余 worker 或关闭当前浏览器。
+- 如果第一次中断后超过 `--stop-grace-seconds`，程序会自动升级为强制终止剩余 worker。
+
 ## 7. 日志区
 
 GUI 底部显示调试与日志信息。
 
-CLI 默认把日志输出到终端。需要文件日志时使用：
+CLI 的输出分为三层：
+
+- stdout：任务开始、进度、结果路径、简短 warning。
+- stderr：参数错误、最终失败摘要、厂商失败摘要。
+- `--log-file`：完整诊断事件、worker 细节、traceback 和浏览器启动噪声。未指定时 CLI 会自动生成默认日志。
+
+默认日志路径：
+
+- 厂商 Excel 模式：`~/Documents/trip_vendor_results/YYMMDD-HHMM/run.log`。
+- 普通单文件模式：输出文件同目录下的 `trip_cli_YYMMDD-HHMM.log`。
+
+需要指定日志路径时使用：
 
 ```bash
 python3 main.py \
@@ -219,7 +250,74 @@ python3 main.py \
   --log-file "$HOME/Documents/trip_scrape.log"
 ```
 
-日志文件目录不存在时会自动创建。
+日志文件目录不存在时会自动创建。终端失败摘要会带上日志路径，便于直接定位完整 traceback。
+
+### 7.1 终端输出模式
+
+CLI 默认使用 `normal` 输出，适合人工看进度，也适合 Agent 抓取摘要。
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `--log-level quiet` | 否 | 只输出开始和最终结果，适合 cron/nohup。 |
+| `--log-level normal` | 是 | 输出任务总览、厂商进度、warning 和结果路径。 |
+| `--log-level verbose` | 否 | 额外输出 URL/浏览器阶段日志；traceback 仍只进 `--log-file`。 |
+| `--json-lines` | 关闭 | 每行输出一个 JSON event，适合 Agent/脚本解析。 |
+| `--no-color` | 关闭 | 禁用 ANSI 颜色；当前默认也不主动输出颜色。 |
+
+普通人类可读输出：
+
+```bash
+python3 main.py \
+  --excel-input ./vendors.xlsx \
+  --workers 3 \
+  --log-file "$HOME/Documents/trip_scrape.log"
+```
+
+安静模式：
+
+```bash
+python3 main.py \
+  --excel-input ./vendors.xlsx \
+  --log-level quiet \
+  --log-file "$HOME/Documents/trip_scrape.log"
+```
+
+Agent 推荐模式：
+
+```bash
+python3 main.py \
+  --run-mode mode1 \
+  --excel-input ./vendors.xlsx \
+  --workers 3 \
+  --json-lines \
+  --no-color \
+  --log-file "$HOME/Documents/trip_scrape.log"
+```
+
+`--json-lines` 示例：
+
+```json
+{"event":"run_started","vendor_count":5,"url_count":327,"workers":5,"headless":false}
+{"event":"driver_prepare_started","stage":"driver_prepare","message":"preparing chromedriver"}
+{"event":"driver_prepare_done","stage":"driver_prepare","driver_reused":true,"elapsed_ms":28}
+{"event":"worker_spawn_started","vendor":"BC","worker_id":1,"message":"spawning worker"}
+{"event":"browser_start_started","vendor":"BC","worker_id":1,"message":"starting Chrome"}
+{"event":"browser_start_done","vendor":"BC","worker_id":1,"elapsed_ms":7321}
+{"event":"vendor_started","vendor":"BC","url_count":57}
+{"event":"url_started","vendor":"BC","worker_id":1,"url_index":12,"url_total":57,"url":"https://www.trip.com/..."}
+{"event":"url_done","vendor":"BC","worker_id":1,"url_index":12,"url_total":57,"rows":1,"elapsed_ms":18300,"url":"https://www.trip.com/..."}
+{"event":"vendor_done","vendor":"BC","success":true,"rows":214,"output_path":"/Users/example/BC_260519-1538.xlsx"}
+{"event":"run_done","success":true,"exit_code":0,"processed_count":830,"output_paths":["/Users/example/BC_260519-1538.xlsx"]}
+```
+
+约定：
+
+- 最后一行 JSON event 固定是 `run_done`。
+- `run_done.exit_code` 与进程退出码一致。
+- 输出路径使用绝对路径。
+- 多进程 worker 不直接向终端输出；主进程统一渲染。
+- 终端不直接打印 traceback；需要排查时查看 `--log-file`。
+- CLI worker 不初始化 Tk，因此 macOS 程序坞不会因为 worker 出现 Python 小火箭图标。
 
 ## 8. 结果预览与导出
 
@@ -245,7 +343,7 @@ python3 main.py \
 厂商 Excel 模式默认输出目录：
 
 ```text
-~/Documents/trip_vendor_results_YYYYMMDD_HHMMSS/
+~/Documents/trip_vendor_results/YYMMDD-HHMM/
 ```
 
 厂商 Excel 模式指定输出目录：
@@ -259,11 +357,12 @@ python3 main.py \
 厂商模式输出规则：
 
 - 每个厂商生成一个 Excel 文件。
-- 文件名格式：`厂商名_YYYYMMDD_HHMMSS.xlsx`。
+- 文件名格式：`厂商名_YYMMDD-HHMM.xlsx`。
 - 文件名非法字符会替换为 `_`。
 - 重复厂商名会追加列号或序号。
 - 结果第一列增加 `厂商`。
 - 同一产品产生多行 SKU 时，`厂商` 只在该产品系列第一行写入。
+- 中断时已完成 URL 的结果会尽量写入同一目录下的厂商文件。
 
 ## 9. 输出字段
 
@@ -352,11 +451,16 @@ CLI 不提供“打开浏览器后等待人工登录”的流程。需要登录�
 | `--output OUTPUT` | path | 自动生成 | 导出到Excel | 普通模式输出文件。 |
 | `--output-dir OUTPUT_DIR` | path | 自动生成 | 厂商模式导出目录 | 厂商多文件输出目录。 |
 | `--workers WORKERS` | int, `1..5` | `min(厂商数, 5)` | 并发浏览器数 | 厂商模式并发数量。 |
+| `--startup-stagger STARTUP_STAGGER` | float | `0.5` | 并发浏览器数 | 多 worker 启动错峰秒数，`0` 表示关闭。 |
+| `--stop-grace-seconds STOP_GRACE_SECONDS` | int | `30` | 停止执行 | 收到停止信号后等待 worker 导出部分结果的秒数。 |
 | `--run-mode {mode1,mode2}` | enum | `None` | 抓取选项预设 | 打包常用抓取参数。 |
 | `--browser {chrome}` | enum | `chrome` | 打开浏览器 | 当前只支持 Chrome。 |
 | `--headless` / `--no-headless` | flag | 关闭 | 无 | 开启或关闭无头模式。 |
 | `--session-file SESSION_FILE` | path | 旧版默认路径 | 自动加载/保存登录状态 | 指定 session 文件。 |
-| `--log-file LOG_FILE` | path | `None` | 日志区 | 同步写入日志文件。 |
+| `--log-file LOG_FILE` | path | 自动生成 | 日志区 | 同步写入日志文件；显式传入时覆盖默认日志路径。 |
+| `--log-level {quiet,normal,verbose}` | enum | `normal` | 日志区 | 控制终端输出详细程度。 |
+| `--json-lines` | flag | 关闭 | 日志区 | 输出机器可解析 JSON event。 |
+| `--no-color` | flag | 关闭 | 日志区 | 关闭颜色输出，便于日志系统消费。 |
 | `--timeout TIMEOUT` | int | `300` | 打开浏览器等待 | 浏览器启动超时秒数。 |
 | `--browser-memory-limit-mb N` | int | `8192` | 浏览器内存保护 | RSS 超阈值重启。 |
 | `--browser-restart-every N` | int | `20` | 浏览器内存保护 | 每处理 N 个 URL 重启。 |
@@ -421,15 +525,50 @@ python3 main.py --run-mode mode2 --no-rating-only --real-price --urls-file ./url
 成功输出示例：
 
 ```text
+run started vendors=1 urls=12 workers=1 headless=False mode=default output=/Users/example/trip_scoreandprice_results_20260519_120000.xlsx
 captured <rows> rows -> <output.xlsx>
 ```
 
 厂商多文件成功输出示例：
 
 ```text
+run started vendors=5 urls=327 workers=5 headless=False mode=default output=/Users/example/Documents/trip_vendor_results/260519-1538
+[BC] spawning worker
+[BC] starting Chrome
+[BC] Chrome started
+[BC] url started 12/57 url=https://www.trip.com/...
+[BC] url done 12/57 rows=1 elapsed=18.3s url=https://www.trip.com/...
+progress urls=128/327 vendors=3/5 active=BC:12/57:done,TGT:8/63:open failed=0
+[BC] done urls=57/57 rows=214 output=/Users/example/Documents/trip_vendor_results/260519-1538/BC_260519-1538.xlsx
 captured <rows> rows -> <n> files
   /path/vendor_a.xlsx
   /path/vendor_b.xlsx
+```
+
+失败输出示例：
+
+```text
+[FR] chrome detect failed stage=chrome_detect error="Google Chrome not found" log=/Users/example/Documents/trip_vendor_results/260519-1538/run.log
+[FR] worker failed stage=chrome_detect exitcode=None error="Google Chrome not found" log=/Users/example/Documents/trip_vendor_results/260519-1538/run.log
+[FR] failed urls=0/95 rows=0 output=/Users/example/Documents/trip_vendor_results/260519-1538/FR_260519-1538.xlsx reason="Google Chrome not found" log=/Users/example/Documents/trip_vendor_results/260519-1538/run.log
+failed: FR: Google Chrome not found; log=/Users/example/Documents/trip_vendor_results/260519-1538/run.log
+```
+
+如果 worker 进程退出但没有发出 `vendor_done`，主进程会按失败处理，不会再输出 `captured 0 rows -> ...` 的假成功。
+
+中断保存示例：
+
+```text
+stop requested; waiting for partial exports grace=30s
+[BC] partial export rows=18 output=/Users/example/Documents/trip_vendor_results/260519-1538/BC_260519-1538.xlsx
+captured 18 rows before failure -> 1 files
+failed: stopped by signal
+```
+
+第二次中断或宽限期超时会出现：
+
+```text
+force stop requested; terminating remaining browser work
 ```
 
 ## 15. 项目结构和实现对应
@@ -439,9 +578,12 @@ trip-score-price-scraper/
 ├── main.py                    # 程序入口
 ├── gui.py                     # GUI 包装入口
 ├── cli.py                     # CLI 参数解析
-├── service.py                 # CLI/厂商并发批处理编排
+├── service.py                 # CLI/厂商并发批处理编排（不依赖Tk/GUI）
 ├── models.py                  # 请求、结果、ScrapeItem 数据结构
-├── trip_get_scoreandprice.pyw # GUI 与 Selenium 抓取核心
+├── trip_cli_scraper.py        # CLI-only Selenium 抓取运行器
+├── session_store.py           # CLI session 加载/保存
+├── xlsx_export.py             # CLI Excel 导出
+├── trip_get_scoreandprice.pyw # 旧 GUI 入口（CLI 不依赖）
 ├── requirements.txt           # Python 依赖
 └── trip_get_scoreandprice.spec # PyInstaller 构建配置
 ```
@@ -454,11 +596,12 @@ main.py
         ├── 解析 CLI 参数
         ├── 构造 TaskRequest
         └── service.scrape_xxx()
-              ├── 普通模式：单 WebScraperApp 批量抓取
+              ├── 普通模式：单 TripCliScraper 批量抓取
               └── Excel模式：scrape_vendor_batches()
                     ├── load_excel_items()
                     ├── 按厂商分组
                     ├── multiprocessing 启动 worker
+                    ├── 每个 worker 创建独立 TripCliScraper 和 Chrome
                     └── 每厂商独立导出 Excel
 ```
 
@@ -479,7 +622,7 @@ pyinstaller trip_get_scoreandprice.spec
 静态检查：
 
 ```bash
-python3 -m py_compile main.py cli.py service.py models.py trip_get_scoreandprice.pyw
+python3 -m py_compile main.py cli.py service.py models.py trip_cli_scraper.py session_store.py xlsx_export.py
 ```
 
 参数检查：
@@ -505,6 +648,9 @@ failed: At least one URL is required via --input, --urls-file, or --excel-input.
 浏览器启动失败：
 
 - 确认已安装 Google Chrome。
+- 新 Mac 或官方 Python 运行时若出现 `CERTIFICATE_VERIFY_FAILED`，执行 `/Applications/Python\ 3.13/Install\ Certificates.command` 后重试。
+- 如果安装了 `certifi`，CLI 会自动设置 `SSL_CERT_FILE` 并在 `driver_prepare_done` 中记录证书来源。
+- 首次运行会下载/patch chromedriver，之后复用 `~/Library/Application Support/undetected_chromedriver/` 下的缓存。
 - 如果使用 `--headless`，先去掉该参数验证。
 - 查看 `--log-file` 中 ChromeDriver / undetected-chromedriver 相关错误。
 
