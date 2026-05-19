@@ -23,6 +23,10 @@ from models import ScrapeItem, TaskRequest
 from session_store import SessionStore
 
 EventSink = Callable[[dict[str, Any]], None]
+try:
+    import psutil
+except Exception:
+    psutil = None
 
 
 class StopRequested(Exception):
@@ -40,7 +44,8 @@ class TripCliScraper:
         global_total: int,
     ) -> None:
         self.request = request
-        self.emit = emit
+        self._emit_raw = emit
+        self.emit = self._emit_event
         self.vendor = vendor
         self.worker_id = worker_id
         self.global_total = global_total
@@ -48,6 +53,12 @@ class TripCliScraper:
         self.user_data_dir: str | None = None
         self.session = SessionStore(request.browser_options.session_file)
         self.max_sku_layers = 0
+        self._processed_since_browser_restart = 0
+
+    def _emit_event(self, event: dict[str, Any]) -> None:
+        if event.get("event") == "log" and event.get("stage") == "sku":
+            return
+        self._emit_raw(event)
 
     def prepare_environment(self) -> None:
         self.emit({"event": "worker_ready", "message": "worker ready"})
@@ -97,20 +108,30 @@ class TripCliScraper:
         options.add_argument("--disable-default-apps")
         options.add_argument("--disable-sync")
         options.add_argument("--disable-translate")
+        options.add_argument("--disable-background-timer-throttling")
+        options.add_argument("--disable-backgrounding-occluded-windows")
         options.add_argument("--disable-extensions")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--disable-gpu")
         options.add_argument("--disable-component-update")
         options.add_argument("--disable-crash-reporter")
         options.add_argument("--disable-domain-reliability")
-        options.add_argument("--disable-features=MediaRouter,OptimizationHints,Translate,AutofillServerCommunication")
+        options.add_argument("--disable-features=MediaRouter,OptimizationHints,Translate,AutofillServerCommunication,TranslateUI,BackForwardCache")
         options.add_argument("--disable-hang-monitor")
         options.add_argument("--disable-ipc-flooding-protection")
+        options.add_argument("--disable-client-side-phishing-detection")
         options.add_argument("--disable-notifications")
         options.add_argument("--disable-popup-blocking")
         options.add_argument("--disable-renderer-backgrounding")
+        options.add_argument("--disable-prompt-on-repost")
+        options.add_argument("--disable-application-cache")
         options.add_argument("--metrics-recording-only")
         options.add_argument("--no-report-upload")
+        options.add_argument("--safebrowsing-disable-auto-update")
+        options.add_argument("--aggressive-cache-discard")
+        options.add_argument("--disk-cache-size=104857600")
+        options.add_argument("--media-cache-size=52428800")
+        options.add_argument("--js-flags=--max-old-space-size=512")
         options.add_argument("--disable-blink-features=AutomationControlled")
         options.add_argument("--window-size=1920,1080")
         if self.request.browser_options.headless:
@@ -187,6 +208,10 @@ class TripCliScraper:
             except StopRequested:
                 self._stop_browser_load()
                 break
+            finally:
+                self._cleanup_after_url()
+                if index < len(items):
+                    self._maybe_restart_browser_for_memory_guard()
         try:
             self.session.save(self.driver)
         except Exception as exc:
@@ -238,6 +263,76 @@ class TripCliScraper:
         if self.user_data_dir:
             shutil.rmtree(self.user_data_dir, ignore_errors=True)
             self.user_data_dir = None
+
+    def _cleanup_after_url(self) -> None:
+        if not self.driver:
+            return
+        self._close_extra_tabs()
+        try:
+            self.driver.execute_script("window.stop();")
+        except Exception:
+            pass
+        for command in ("Memory.forciblyPurgeJavaScriptMemory", "Network.clearBrowserCache", "HeapProfiler.collectGarbage"):
+            try:
+                self.driver.execute_cdp_cmd(command, {})
+            except Exception:
+                pass
+
+    def _close_extra_tabs(self) -> None:
+        if not self.driver:
+            return
+        try:
+            handles = list(self.driver.window_handles)
+        except Exception:
+            return
+        if not handles:
+            return
+        keep_handle = handles[0]
+        for handle in handles[1:]:
+            try:
+                self.driver.switch_to.window(handle)
+                self.driver.close()
+            except Exception:
+                pass
+        try:
+            self.driver.switch_to.window(keep_handle)
+        except Exception:
+            pass
+
+    def _managed_browser_rss_mb(self) -> float | None:
+        if not psutil or not self.user_data_dir:
+            return None
+        total = 0
+        for proc in psutil.process_iter(["cmdline", "memory_info"]):
+            try:
+                cmdline = " ".join(proc.info.get("cmdline") or [])
+                if self.user_data_dir in cmdline:
+                    total += proc.memory_info().rss
+            except Exception:
+                continue
+        return total / (1024 * 1024) if total else None
+
+    def _maybe_restart_browser_for_memory_guard(self) -> None:
+        options = self.request.browser_options
+        if not options.memory_guard_enabled or not self.driver:
+            return
+        self._processed_since_browser_restart += 1
+        rss_mb = self._managed_browser_rss_mb()
+        reason = None
+        if rss_mb is not None and options.memory_limit_mb > 0 and rss_mb >= options.memory_limit_mb:
+            reason = f"Chrome memory {rss_mb:.0f}MB exceeded {options.memory_limit_mb}MB"
+        if not reason and options.restart_every > 0 and self._processed_since_browser_restart >= options.restart_every:
+            reason = f"processed {self._processed_since_browser_restart} URLs"
+        if not reason:
+            return
+        self.emit({"event": "log", "stage": "browser_restart", "message": f"restarting Chrome: {reason}"})
+        try:
+            self.session.save(self.driver)
+        except Exception as exc:
+            self.emit({"event": "warning", "stage": "browser_restart", "message": f"session save before restart failed: {exc}"})
+        self.close()
+        self.start_browser()
+        self._processed_since_browser_restart = 0
 
     def _extract_rows(self, item: ScrapeItem, stop_event=None) -> list[dict]:
         base_row = self._extract_base_row(item)
@@ -659,26 +754,20 @@ class TripCliScraper:
             self._raise_if_stopped(stop_event)
             try:
                 time.sleep(0.15)
-                display_price_text = self._get_current_price_robust(stop_event=stop_event)
+                price_bundle = self._get_current_price_bundle(stop_event=stop_event)
+                display_price_text = price_bundle.get("display_price") or ""
+                if not display_price_text:
+                    display_price_text = self._get_current_price_robust(max_attempts=1, stop_event=stop_event)
                 display_currency, display_price = self._split_price(display_price_text)
 
                 real_currency, real_price = "N/A", "N/A"
                 if self.request.extract_real_price:
-                    real_currency, real_price = self._extract_real_price()
+                    real_currency, real_price = self._split_price(price_bundle.get("real_price") or "")
+                    if real_price == "N/A":
+                        real_currency, real_price = "N/A", ""
 
-                promo_tag = self._extract_sku_promotional_tag()
+                promo_tag = price_bundle.get("promo_tag") or ""
                 if display_price and display_price != "价格未找到":
-                    self.emit(
-                        {
-                            "event": "log",
-                            "stage": "sku",
-                            "message": (
-                                f"combination price: {combination_text} = "
-                                f"display:{display_currency}{display_price}, "
-                                f"real:{real_currency}{real_price}, promo:{promo_tag}"
-                            ),
-                        }
-                    )
                     return {
                         "combination": combination_text,
                         "currency": display_currency,
@@ -688,13 +777,11 @@ class TripCliScraper:
                         "promo_tag": promo_tag,
                     }
                 if retry < max_retries - 1:
-                    self.emit({"event": "log", "stage": "sku", "message": f"price capture failed; retry {retry + 1}/{max_retries}"})
                     time.sleep(0.2)
             except StopRequested:
                 raise
             except Exception as exc:
                 if retry < max_retries - 1:
-                    self.emit({"event": "log", "stage": "sku", "message": f"price capture error; retry {retry + 1}/{max_retries}: {exc}"})
                     time.sleep(0.2)
                 else:
                     self.emit({"event": "warning", "stage": "sku", "message": f"price capture failed: {exc}"})
@@ -707,6 +794,88 @@ class TripCliScraper:
             "real_price": "N/A",
             "promo_tag": "",
         }
+
+    def _get_current_price_bundle(self, stop_event=None) -> dict[str, str]:
+        self._raise_if_stopped(stop_event)
+        display_selectors = [
+            '#select_quantity div[class*="style_m_select_quantity_container__"] div div[class*="style_m_select_choice_option_wrapper__"] div[class*="style_m_people_price__"] div div span span',
+            "#select_quantity > div.xtaro-xview > div > div.xtaro-xview > div.xtaro-xview > div > div > span > span",
+            'div[class*="default_new_title_foot_warp"] div[class*="default_new_title_foot_warp_right"] div div div span',
+            'span[currency="HKD"][testid*="price"]',
+            "span.price_m_price_price__VrAgh",
+            'div.price_m_price__FmWsJ span[currency="HKD"]',
+            'span[testid="undefined-price"]',
+            'span[currency="HKD"]',
+        ]
+        real_selector = 'div[class*="price-comp_m_footer_left_total"] div div div span span'
+        promo_selector = 'div[class*="price-comp_m_footer_left"] div span'
+        try:
+            result = self.driver.execute_script(
+                """
+                const displaySelectors = arguments[0];
+                const realSelector = arguments[1];
+                const promoSelector = arguments[2];
+                const includeReal = arguments[3];
+                const isVisible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    if (!style || style.display === 'none' || style.visibility === 'hidden') return false;
+                    return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                };
+                const textOf = (el) => (el && (el.innerText || el.textContent || '').trim().replace(/\\s+/g, ' ')) || '';
+                const validPrice = (text) => text && text.includes('HK$') && /^HK\\$\\s*[0-9,]+(?:\\.\\d+)?/.test(text);
+                let displayPrice = '';
+                for (const selector of displaySelectors) {
+                    for (const el of document.querySelectorAll(selector)) {
+                        if (!isVisible(el)) continue;
+                        const text = textOf(el);
+                        if (validPrice(text)) {
+                            displayPrice = text;
+                            break;
+                        }
+                    }
+                    if (displayPrice) break;
+                }
+                if (!displayPrice) {
+                    for (const el of document.querySelectorAll('span,div')) {
+                        if (!isVisible(el)) continue;
+                        const text = textOf(el);
+                        if (validPrice(text)) {
+                            displayPrice = text;
+                            break;
+                        }
+                    }
+                }
+                let realPrice = '';
+                if (includeReal) {
+                    for (const el of document.querySelectorAll(realSelector)) {
+                        if (!isVisible(el)) continue;
+                        const text = textOf(el);
+                        if (text) {
+                            realPrice = text;
+                            break;
+                        }
+                    }
+                }
+                let promoTag = '';
+                for (const el of document.querySelectorAll(promoSelector)) {
+                    if (!isVisible(el)) continue;
+                    const text = textOf(el);
+                    if (text && !text.includes('HK$') && (text.includes('減') || text.includes('%') || text.includes('折'))) {
+                        promoTag = text;
+                        break;
+                    }
+                }
+                return {display_price: displayPrice, real_price: realPrice, promo_tag: promoTag};
+                """,
+                display_selectors,
+                real_selector,
+                promo_selector,
+                bool(self.request.extract_real_price),
+            )
+            return result if isinstance(result, dict) else {}
+        except Exception:
+            return {}
 
     def _get_current_price_robust(self, max_attempts: int = 3, stop_event=None) -> str:
         price_selectors = [

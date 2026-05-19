@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from models import BrowserOptions, TaskRequest
-from service import scrape_xxx
+from service import run_vendor_worker_from_files, scrape_xxx
 
 RUN_MODE_DEFAULTS = {
     "mode1": {
@@ -33,6 +33,20 @@ BASE_RUN_OPTIONS = {
 }
 
 LOG_LEVELS = ("quiet", "normal", "verbose")
+LOG_FILE_EVENTS = {
+    "run_started",
+    "run_done",
+    "worker_spawn_started",
+    "vendor_started",
+    "vendor_done",
+    "worker_failed",
+    "driver_prepare_failed",
+    "startup_preflight_failed",
+    "browser_start_failed",
+    "chrome_detect_failed",
+    "warning",
+    "error",
+}
 
 
 class Parser(argparse.ArgumentParser):
@@ -49,7 +63,7 @@ def build_parser() -> Parser:
     parser.add_argument("--output", help="Excel output path.")
     parser.add_argument("--output-dir", help="Directory for vendor Excel outputs.")
     parser.add_argument("--workers", type=int, help="Concurrent browser workers, 1-5. Defaults to min(vendor count, 5).")
-    parser.add_argument("--startup-stagger", type=float, default=0.5, help="Seconds to wait between starting vendor browser workers. Use 0 to disable staggering.")
+    parser.add_argument("--startup-stagger", type=float, default=0, help="Seconds to wait between starting vendor browser workers. Defaults to 0.")
     parser.add_argument("--stop-grace-seconds", type=int, default=30, help="Seconds to wait for partial exports after SIGINT/SIGTERM before terminating workers.")
     parser.add_argument("--run-mode", choices=("mode1", "mode2"), help="Preset run mode. mode1=headless full scrape; mode2=headed rating-only scrape.")
     parser.add_argument("--browser", choices=("chrome",), default="chrome")
@@ -70,6 +84,14 @@ def build_parser() -> Parser:
     parser.add_argument("--no-real-price", dest="extract_real_price", action="store_false", help="Skip dynamic real-price extraction.")
     parser.add_argument("--product-info", dest="extract_product_info", action="store_true", default=None, help="Scrape product information fields.")
     parser.add_argument("--no-product-info", dest="extract_product_info", action="store_false", help="Skip product info extraction.")
+    parser.add_argument("--worker-items-file", help=argparse.SUPPRESS)
+    parser.add_argument("--worker-output", help=argparse.SUPPRESS)
+    parser.add_argument("--worker-result-file", help=argparse.SUPPRESS)
+    parser.add_argument("--worker-vendor", help=argparse.SUPPRESS)
+    parser.add_argument("--worker-log-file", help=argparse.SUPPRESS)
+    parser.add_argument("--worker-chrome-path", help=argparse.SUPPRESS)
+    parser.add_argument("--worker-chrome-version-main", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--worker-driver-executable-path", help=argparse.SUPPRESS)
     return parser
 
 
@@ -101,8 +123,6 @@ class CliRenderer:
 
     def emit(self, event: dict[str, Any] | str) -> None:
         normalized = self._normalize(event)
-        if not self.log_path and normalized.get("log_file"):
-            self.log_path = Path(str(normalized["log_file"])).expanduser()
         self._write_log(normalized)
         if self.json_lines:
             self._write_json(normalized)
@@ -120,6 +140,8 @@ class CliRenderer:
 
     def _write_log(self, event: dict[str, Any]) -> None:
         if not self.log_path:
+            return
+        if event.get("event") not in LOG_FILE_EVENTS:
             return
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         with self.log_path.open("a", encoding="utf-8") as handle:
@@ -376,6 +398,26 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
             restart_every=args.browser_restart_every,
         ),
     )
+    if args.worker_items_file:
+        if not args.worker_output or not args.worker_result_file or not args.worker_vendor:
+            print("argument error: worker mode requires output, result file, and vendor", file=sys.stderr)
+            return 2
+        request.output_path = args.worker_output
+        request.log_file = args.log_file
+        request.excel_input = None
+        request.input_paths = []
+        request.urls_file = None
+        request.workers = 1
+        request.browser_options.chrome_path = args.worker_chrome_path
+        request.browser_options.chrome_version_main = args.worker_chrome_version_main
+        request.browser_options.driver_executable_path = args.worker_driver_executable_path
+        return run_vendor_worker_from_files(
+            items_file=args.worker_items_file,
+            output_path=args.worker_output,
+            result_file=args.worker_result_file,
+            vendor=args.worker_vendor,
+            request=request,
+        )
     result = scrape_xxx(request, renderer.emit, run_mode=args.run_mode)
     renderer.emit(
         {

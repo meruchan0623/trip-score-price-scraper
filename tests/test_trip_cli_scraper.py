@@ -82,6 +82,49 @@ class TripCliScraperSkuRowsTest(unittest.TestCase):
 
         self.assertEqual(scraper._split_price("HK$1,234.50"), ("HKD", "1234.50"))
 
+    def test_price_bundle_js_reads_display_real_and_promo(self):
+        class FakeDriver:
+            def __init__(self):
+                self.include_real = None
+
+            def execute_script(self, _script, _display_selectors, _real_selector, _promo_selector, include_real):
+                self.include_real = include_real
+                return {
+                    "display_price": "HK$100",
+                    "real_price": "HK$88",
+                    "promo_tag": "減 HK$12",
+                }
+
+        request = TaskRequest(extract_real_price=True)
+        scraper = FakeTripCliScraper(request)
+        scraper.driver = FakeDriver()
+
+        bundle = scraper._get_current_price_bundle()
+
+        self.assertTrue(scraper.driver.include_real)
+        self.assertEqual(bundle["display_price"], "HK$100")
+        self.assertEqual(bundle["real_price"], "HK$88")
+        self.assertEqual(bundle["promo_tag"], "減 HK$12")
+
+    def test_price_bundle_js_skips_real_price_when_disabled(self):
+        class FakeDriver:
+            def __init__(self):
+                self.include_real = None
+
+            def execute_script(self, _script, _display_selectors, _real_selector, _promo_selector, include_real):
+                self.include_real = include_real
+                return {"display_price": "HK$100", "real_price": "", "promo_tag": ""}
+
+        request = TaskRequest(extract_real_price=False)
+        scraper = FakeTripCliScraper(request)
+        scraper.driver = FakeDriver()
+
+        bundle = scraper._get_current_price_bundle()
+
+        self.assertFalse(scraper.driver.include_real)
+        self.assertEqual(bundle["display_price"], "HK$100")
+        self.assertEqual(bundle["real_price"], "")
+
 
 if __name__ == "__main__":
     unittest.main()
