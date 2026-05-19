@@ -235,14 +235,9 @@ CLI 的输出分为三层：
 
 - stdout：任务开始、进度、结果路径、简短 warning。
 - stderr：参数错误、最终失败摘要、厂商失败摘要。
-- `--log-file`：完整诊断事件、worker 细节、traceback 和浏览器启动噪声。未指定时 CLI 会自动生成默认日志。
+- `--log-file`：可选摘要日志，只记录启动、完成、失败和 warning；不会记录 SKU 点击、价格读取、worker 细节或浏览器噪声。未指定时不写文本日志。
 
-默认日志路径：
-
-- 厂商 Excel 模式：`~/Documents/trip_vendor_results/YYMMDD-HHMM/run.log`。
-- 普通单文件模式：输出文件同目录下的 `trip_cli_YYMMDD-HHMM.log`。
-
-需要指定日志路径时使用：
+确实需要摘要日志时使用：
 
 ```bash
 python3 main.py \
@@ -250,7 +245,7 @@ python3 main.py \
   --log-file "$HOME/Documents/trip_scrape.log"
 ```
 
-日志文件目录不存在时会自动创建。终端失败摘要会带上日志路径，便于直接定位完整 traceback。
+日志文件目录不存在时会自动创建。只有显式传入 `--log-file` 时，终端失败摘要才会带上日志路径。
 
 ### 7.1 终端输出模式
 
@@ -260,7 +255,7 @@ CLI 默认使用 `normal` 输出，适合人工看进度，也适合 Agent 抓�
 | --- | --- | --- |
 | `--log-level quiet` | 否 | 只输出开始和最终结果，适合 cron/nohup。 |
 | `--log-level normal` | 是 | 输出任务总览、厂商进度、warning 和结果路径。 |
-| `--log-level verbose` | 否 | 额外输出 URL/浏览器阶段日志；traceback 仍只进 `--log-file`。 |
+| `--log-level verbose` | 否 | 额外输出 URL/浏览器阶段日志；SKU 逐项调试日志默认不输出。 |
 | `--json-lines` | 关闭 | 每行输出一个 JSON event，适合 Agent/脚本解析。 |
 | `--no-color` | 关闭 | 禁用 ANSI 颜色；当前默认也不主动输出颜色。 |
 
@@ -316,7 +311,7 @@ python3 main.py \
 - `run_done.exit_code` 与进程退出码一致。
 - 输出路径使用绝对路径。
 - 多进程 worker 不直接向终端输出；主进程统一渲染。
-- 终端不直接打印 traceback；需要排查时查看 `--log-file`。
+- 终端不直接打印 traceback；worker 失败摘要会写入轻量 `result.json`，显式传入 `--log-file` 时也会写入摘要日志。
 - CLI worker 不初始化 Tk，因此 macOS 程序坞不会因为 worker 出现 Python 小火箭图标。
 
 ## 8. 结果预览与导出
@@ -451,13 +446,13 @@ CLI 不提供“打开浏览器后等待人工登录”的流程。需要登录�
 | `--output OUTPUT` | path | 自动生成 | 导出到Excel | 普通模式输出文件。 |
 | `--output-dir OUTPUT_DIR` | path | 自动生成 | 厂商模式导出目录 | 厂商多文件输出目录。 |
 | `--workers WORKERS` | int, `1..5` | `min(厂商数, 5)` | 并发浏览器数 | 厂商模式并发数量。 |
-| `--startup-stagger STARTUP_STAGGER` | float | `0.5` | 并发浏览器数 | 多 worker 启动错峰秒数，`0` 表示关闭。 |
+| `--startup-stagger STARTUP_STAGGER` | float | `0` | 并发浏览器数 | 多 worker 启动错峰秒数，默认不启用错峰。 |
 | `--stop-grace-seconds STOP_GRACE_SECONDS` | int | `30` | 停止执行 | 收到停止信号后等待 worker 导出部分结果的秒数。 |
 | `--run-mode {mode1,mode2}` | enum | `None` | 抓取选项预设 | 打包常用抓取参数。 |
 | `--browser {chrome}` | enum | `chrome` | 打开浏览器 | 当前只支持 Chrome。 |
 | `--headless` / `--no-headless` | flag | 关闭 | 无 | 开启或关闭无头模式。 |
 | `--session-file SESSION_FILE` | path | 旧版默认路径 | 自动加载/保存登录状态 | 指定 session 文件。 |
-| `--log-file LOG_FILE` | path | 自动生成 | 日志区 | 同步写入日志文件；显式传入时覆盖默认日志路径。 |
+| `--log-file LOG_FILE` | path | `None` | 日志区 | 可选摘要日志；不写 SKU 逐项日志或 worker 噪声。 |
 | `--log-level {quiet,normal,verbose}` | enum | `normal` | 日志区 | 控制终端输出详细程度。 |
 | `--json-lines` | flag | 关闭 | 日志区 | 输出机器可解析 JSON event。 |
 | `--no-color` | flag | 关闭 | 日志区 | 关闭颜色输出，便于日志系统消费。 |
@@ -548,10 +543,10 @@ captured <rows> rows -> <n> files
 失败输出示例：
 
 ```text
-[FR] chrome detect failed stage=chrome_detect error="Google Chrome not found" log=/Users/example/Documents/trip_vendor_results/260519-1538/run.log
-[FR] worker failed stage=chrome_detect exitcode=None error="Google Chrome not found" log=/Users/example/Documents/trip_vendor_results/260519-1538/run.log
-[FR] failed urls=0/95 rows=0 output=/Users/example/Documents/trip_vendor_results/260519-1538/FR_260519-1538.xlsx reason="Google Chrome not found" log=/Users/example/Documents/trip_vendor_results/260519-1538/run.log
-failed: FR: Google Chrome not found; log=/Users/example/Documents/trip_vendor_results/260519-1538/run.log
+[FR] chrome detect failed stage=chrome_detect error="Google Chrome not found"
+[FR] worker failed stage=chrome_detect exitcode=4 error="Google Chrome not found"
+[FR] failed urls=0/95 rows=0 output=/Users/example/Documents/trip_vendor_results/260519-1538/FR_260519-1538.xlsx reason="Google Chrome not found"
+failed: FR: Google Chrome not found
 ```
 
 如果 worker 进程退出但没有发出 `vendor_done`，主进程会按失败处理，不会再输出 `captured 0 rows -> ...` 的假成功。
@@ -652,7 +647,7 @@ failed: At least one URL is required via --input, --urls-file, or --excel-input.
 - 如果安装了 `certifi`，CLI 会自动设置 `SSL_CERT_FILE` 并在 `driver_prepare_done` 中记录证书来源。
 - 首次运行会下载/patch chromedriver，之后复用 `~/Library/Application Support/undetected_chromedriver/` 下的缓存。
 - 如果使用 `--headless`，先去掉该参数验证。
-- 查看 `--log-file` 中 ChromeDriver / undetected-chromedriver 相关错误。
+- 使用 `--json-lines` 或显式 `--log-file` 查看 ChromeDriver / undetected-chromedriver 相关失败摘要。
 
 抓取结果为空：
 

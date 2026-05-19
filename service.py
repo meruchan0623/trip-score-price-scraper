@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import multiprocessing
 import os
 import platform
@@ -8,6 +9,7 @@ import queue
 import re
 import shutil
 import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -114,11 +116,6 @@ def default_vendor_output_dir(base_dir: Path | None = None, timestamp: str | Non
     return str((base_dir or (Path.home() / "Documents")) / "trip_vendor_results" / timestamp)
 
 
-def default_single_log_file(output_path: str, timestamp: str | None = None) -> str:
-    timestamp = timestamp or datetime.now().strftime("%y%m%d-%H%M")
-    return str(Path(output_path).expanduser().parent / f"trip_cli_{timestamp}.log")
-
-
 def default_session_path() -> str:
     if platform.system() == "Windows":
         config_dir = Path(os.environ.get("PROGRAMDATA", "C:\\ProgramData")) / "TripDetailFilling"
@@ -173,6 +170,185 @@ def _copy_session_to_temp(base_session: str, temp_dir: str, index: int) -> str:
         temp_session.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(base_path, temp_session)
     return str(temp_session)
+
+
+def _scrape_item_to_dict(item: ScrapeItem) -> dict[str, Any]:
+    return {
+        "url": item.url,
+        "vendor": item.vendor,
+        "source_column": item.source_column,
+        "source_row": item.source_row,
+        "input_order": item.input_order,
+    }
+
+
+def _scrape_item_from_dict(data: dict[str, Any]) -> ScrapeItem:
+    return ScrapeItem(
+        url=str(data.get("url") or ""),
+        vendor=str(data.get("vendor") or DEFAULT_VENDOR),
+        source_column=data.get("source_column"),
+        source_row=data.get("source_row"),
+        input_order=int(data.get("input_order") or 0),
+    )
+
+
+def _write_json(path: str | Path, data: Any) -> None:
+    target = Path(path).expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(data, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+
+
+def _read_json(path: str | Path) -> Any:
+    return json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+
+
+def _worker_items_path(group: dict[str, Any], state_dir: str, index: int) -> str:
+    return str(Path(state_dir).expanduser() / f"{index:02d}_{_safe_filename(group['file_vendor'])}_items.json")
+
+
+def _worker_result_path(group: dict[str, Any], state_dir: str, index: int) -> str:
+    return str(Path(state_dir).expanduser() / f"{index:02d}_{_safe_filename(group['file_vendor'])}_result.json")
+
+
+def _build_worker_command(
+    *,
+    request: TaskRequest,
+    vendor: str,
+    items_file: str,
+    output_path: str,
+    result_file: str,
+    session_file: str,
+) -> list[str]:
+    main_path = Path(__file__).with_name("main.py")
+    command = [
+        sys.executable,
+        str(main_path),
+        "--worker-items-file",
+        items_file,
+        "--worker-output",
+        output_path,
+        "--worker-result-file",
+        result_file,
+        "--worker-vendor",
+        vendor,
+        "--session-file",
+        session_file,
+        "--browser",
+        request.browser_options.browser,
+        "--timeout",
+        str(request.browser_options.timeout),
+        "--browser-memory-limit-mb",
+        str(request.browser_options.memory_limit_mb),
+        "--browser-restart-every",
+        str(request.browser_options.restart_every),
+    ]
+    command.append("--headless" if request.browser_options.headless else "--no-headless")
+    command.append("--rating-only" if request.rating_only else "--no-rating-only")
+    command.append("--real-price" if request.extract_real_price else "--no-real-price")
+    command.append("--product-info" if request.extract_product_info else "--no-product-info")
+    if not request.browser_options.memory_guard_enabled:
+        command.append("--disable-browser-memory-guard")
+    if request.browser_options.chrome_path:
+        command.extend(["--worker-chrome-path", request.browser_options.chrome_path])
+    if request.browser_options.chrome_version_main:
+        command.extend(["--worker-chrome-version-main", str(request.browser_options.chrome_version_main)])
+    if request.browser_options.driver_executable_path:
+        command.extend(["--worker-driver-executable-path", request.browser_options.driver_executable_path])
+    return command
+
+
+def run_vendor_worker_from_files(
+    *,
+    items_file: str,
+    output_path: str,
+    result_file: str,
+    vendor: str,
+    request: TaskRequest,
+) -> int:
+    started_at = time.monotonic()
+    rows: list[dict] = []
+    saved_path: str | None = None
+    error: str | None = None
+    error_type: str | None = None
+    error_stage = "runtime_init"
+    error_traceback: str | None = None
+    items: list[ScrapeItem] = []
+    request.output_path = output_path
+    request.excel_input = None
+    request.input_paths = []
+    request.urls_file = None
+    request.workers = 1
+    if not request.browser_options.session_file:
+        request.browser_options.session_file = default_session_path()
+
+    def reporter(event: dict[str, Any] | str) -> None:
+        return None
+
+    scraper = None
+    try:
+        raw_items = _read_json(items_file)
+        items = [_scrape_item_from_dict(item) for item in raw_items]
+        reporter({"event": "process_started", "stage": "process_started", "message": "independent worker process started", "url_count": len(items)})
+        if not request.browser_options.driver_executable_path:
+            error_stage = "driver_prepare"
+            _prepare_browser_runtime(request, reporter)
+        error_stage = "chrome_detect"
+        scraper = TripCliScraper(request, reporter, vendor=vendor, worker_id=1, global_total=len(items))
+        scraper.prepare_environment()
+        error_stage = "browser_start"
+        scraper.start_browser()
+        error_stage = "scrape"
+        rows = scraper.scrape_items(items, rows=rows)
+        if rows:
+            error_stage = "export"
+            saved_path = export_rows(
+                rows,
+                output_path,
+                rating_only=request.rating_only,
+                extract_real_price=request.extract_real_price,
+                extract_product_info=request.extract_product_info,
+                include_vendor_column=True,
+            )
+            reporter({"event": "export_done", "rows": len(rows), "output_path": str(Path(saved_path).expanduser().resolve())})
+    except Exception as exc:
+        error = str(exc)
+        error_type = type(exc).__name__
+        error_traceback = traceback.format_exc()
+        reporter(
+            {
+                "event": "worker_failed",
+                "stage": error_stage,
+                "error": error,
+                "error_type": error_type,
+                "traceback": error_traceback,
+                "rows": len(rows),
+                "url_count": len(items),
+            }
+        )
+    finally:
+        if scraper:
+            scraper.close()
+
+    success = error is None and bool(rows)
+    result = {
+        "event": "vendor_done",
+        "vendor": vendor,
+        "worker_id": 1,
+        "success": success,
+        "stopped": False,
+        "rows": len(rows),
+        "output_path": saved_path or output_path,
+        "session_file": request.browser_options.session_file,
+        "error": error if error else (None if rows else "no rows captured"),
+        "error_type": error_type,
+        "stage": error_stage if error else "done",
+        "traceback": error_traceback,
+        "url_count": len(items),
+        "urls_done": len(items) if rows else 0,
+        "elapsed_ms": int((time.monotonic() - started_at) * 1000),
+    }
+    _write_json(result_file, result)
+    return 0 if success else 4
 
 
 def _worker_request(request: TaskRequest, output_path: str, session_file: str) -> TaskRequest:
@@ -312,7 +488,6 @@ def _scrape_vendor_worker(
                     "success": not stopped and error is None,
                     "stopped": stopped,
                     "rows": len(rows),
-                    "rows_data": rows,
                     "output_path": saved_path or output_path,
                     "session_file": session_file,
                     "error": "stopped by signal" if stopped and error is None else error,
@@ -411,6 +586,249 @@ def _prepare_browser_runtime(request: TaskRequest, reporter: Reporter) -> Browse
     return info
 
 
+def _scrape_vendor_batches_subprocess(
+    request: TaskRequest,
+    reporter: Reporter,
+    run_mode: str | None = None,
+    output_base_dir: str | None = None,
+    should_stop: Callable[[], bool] | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
+    rows_callback: Callable[[list[dict]], None] | None = None,
+) -> TaskResult:
+    try:
+        items = load_items(request)
+        groups = _vendor_groups(items)
+        workers = _resolve_worker_count(request.workers, len(groups))
+    except Exception as exc:
+        return TaskResult(success=False, error=str(exc), exit_code=2)
+
+    warnings = load_excel_items(request.excel_input)[1] if request.excel_input else []
+    for warning in warnings:
+        reporter({"event": "warning", "message": warning})
+
+    timestamp = datetime.now().strftime("%y%m%d-%H%M")
+    if request.output_dir:
+        output_dir = _expand_output_path(request.output_dir)
+    elif output_base_dir:
+        output_dir = str(Path(output_base_dir).expanduser() / "trip_vendor_results" / timestamp)
+    else:
+        output_dir = default_vendor_output_dir(timestamp=timestamp)
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    if request.log_file:
+        Path(request.log_file).expanduser().parent.mkdir(parents=True, exist_ok=True)
+
+    total_urls = sum(len(group["items"]) for group in groups)
+    reporter(
+        {
+            "event": "run_started",
+            "mode": "excel",
+            "run_mode": run_mode,
+            "vendor_count": len(groups),
+            "url_count": total_urls,
+            "workers": workers,
+            "headless": request.browser_options.headless,
+            "rating_only": request.rating_only,
+            "extract_real_price": request.extract_real_price,
+            "extract_product_info": request.extract_product_info,
+            "output_dir": str(Path(output_dir).expanduser().resolve()),
+            "log_file": str(Path(request.log_file).expanduser().resolve()) if request.log_file else None,
+        }
+    )
+    _preflight(request, reporter)
+    try:
+        _prepare_browser_runtime(request, reporter)
+    except BrowserStartupError as exc:
+        failed_vendors = [str(group["vendor"]) for group in groups]
+        error = str(exc)
+        if exc.suggestion:
+            error = f"{error}; suggestion: {exc.suggestion}"
+        return TaskResult(False, output_dir, [], 0, warnings, failed_vendors, request.log_file, error, 4)
+
+    base_session = str(Path(request.browser_options.session_file or default_session_path()).expanduser())
+    state_dir = tempfile.mkdtemp(prefix="trip_vendor_workers_")
+    session_temp_dir = tempfile.mkdtemp(prefix="trip_vendor_sessions_")
+    pending = list(groups)
+    active: list[dict[str, Any]] = []
+    active_states: dict[str, dict[str, Any]] = {}
+    results: list[dict[str, Any]] = []
+    output_paths: list[str] = []
+    completed_groups = 0
+    urls_done = 0
+    stop_requested = {"value": False}
+    stop_started_at = {"value": None}
+    force_terminate_sent = {"value": False}
+    old_handlers = {}
+    next_worker_id = {"value": 0}
+
+    def terminate_active_workers() -> None:
+        for entry in active:
+            process = entry["process"]
+            if process.poll() is None:
+                try:
+                    process.terminate()
+                except Exception:
+                    pass
+
+    def stop_all(signum, _frame) -> None:
+        if not stop_requested["value"]:
+            stop_started_at["value"] = time.monotonic()
+        stop_requested["value"] = True
+        reporter(
+            {
+                "event": "stop_requested",
+                "message": f"received signal {signum}; graceful stop requested",
+                "grace_seconds": request.stop_grace_seconds,
+            }
+        )
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        old_handlers[sig] = signal.getsignal(sig)
+        signal.signal(sig, stop_all)
+
+    def start_next(group: dict[str, Any]) -> dict[str, Any]:
+        next_worker_id["value"] += 1
+        worker_id = next_worker_id["value"]
+        output_path = request.output_path if len(groups) == 1 and request.output_path else _vendor_output_path(group, output_dir, timestamp)
+        output_path = _expand_output_path(output_path)
+        session_file = _copy_session_to_temp(base_session, session_temp_dir, worker_id)
+        items_file = _worker_items_path(group, state_dir, worker_id)
+        result_file = _worker_result_path(group, state_dir, worker_id)
+        _write_json(items_file, [_scrape_item_to_dict(item) for item in group["items"]])
+        command = _build_worker_command(
+            request=request,
+            vendor=group["vendor"],
+            items_file=items_file,
+            output_path=output_path,
+            result_file=result_file,
+            session_file=session_file,
+        )
+        reporter({"event": "worker_spawn_started", "vendor": group["vendor"], "worker_id": worker_id, "message": "spawning independent worker"})
+        process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        reporter(
+            {
+                "event": "vendor_started",
+                "vendor": group["vendor"],
+                "worker_id": worker_id,
+                "url_count": len(group["items"]),
+            }
+        )
+        active_states[group["vendor"]] = {"total": len(group["items"]), "current_index": 0, "stage": "running"}
+        if request.startup_stagger > 0:
+            time.sleep(request.startup_stagger)
+        return {
+            "process": process,
+            "group": group,
+            "worker_id": worker_id,
+            "output_path": output_path,
+            "result_file": result_file,
+            "session_file": session_file,
+            "started_at": time.monotonic(),
+        }
+
+    try:
+        while pending and len(active) < workers:
+            active.append(start_next(pending.pop(0)))
+
+        while active:
+            if should_stop and should_stop():
+                if not stop_requested["value"]:
+                    stop_started_at["value"] = time.monotonic()
+                    reporter({"event": "stop_requested", "message": "stop requested", "grace_seconds": request.stop_grace_seconds})
+                stop_requested["value"] = True
+            if stop_requested["value"] and stop_started_at["value"] is not None:
+                if (
+                    not force_terminate_sent["value"]
+                    and request.stop_grace_seconds >= 0
+                    and time.monotonic() - stop_started_at["value"] > request.stop_grace_seconds
+                ):
+                    force_terminate_sent["value"] = True
+                    reporter({"event": "warning", "message": "stop grace period exceeded; terminating remaining workers"})
+                    terminate_active_workers()
+
+            still_active = []
+            for entry in active:
+                process = entry["process"]
+                if process.poll() is None:
+                    still_active.append(entry)
+                    continue
+
+                vendor = entry["group"]["vendor"]
+                active_states.pop(vendor, None)
+                completed_groups += 1
+                result_file = Path(entry["result_file"]).expanduser()
+                if result_file.exists():
+                    result = _read_json(result_file)
+                    result["worker_id"] = entry["worker_id"]
+                    result.setdefault("vendor", vendor)
+                    result.setdefault("output_path", entry["output_path"])
+                    result.setdefault("session_file", entry["session_file"])
+                    result.setdefault("url_count", len(entry["group"]["items"]))
+                    result.setdefault("exitcode", process.returncode)
+                else:
+                    result = {
+                        "event": "vendor_done",
+                        "vendor": vendor,
+                        "worker_id": entry["worker_id"],
+                        "success": False,
+                        "rows": 0,
+                        "output_path": entry["output_path"],
+                        "session_file": entry["session_file"],
+                        "error": f"worker exited with code {process.returncode} without result file",
+                        "error_type": "MissingWorkerResult",
+                        "stage": "worker_exit",
+                        "url_count": len(entry["group"]["items"]),
+                        "urls_done": 0,
+                        "exitcode": process.returncode,
+                    }
+                results.append(result)
+                urls_done += int(result.get("url_count") or 0) if result.get("success") else int(result.get("urls_done") or 0)
+                if progress_callback:
+                    progress_callback(completed_groups, len(groups))
+                if result.get("output_path") and (result.get("success") or int(result.get("rows") or 0) > 0):
+                    output_paths.append(result["output_path"])
+                reporter(result)
+                _emit_progress(
+                    reporter,
+                    states=active_states,
+                    completed_groups=completed_groups,
+                    vendor_count=len(groups),
+                    urls_done=urls_done,
+                    url_count=total_urls,
+                    failed=len([current for current in results if not current.get("success")]),
+                )
+                if pending and not stop_requested["value"]:
+                    still_active.append(start_next(pending.pop(0)))
+            active = still_active
+            if active:
+                time.sleep(0.5)
+
+        successful_session = next((result.get("session_file") for result in results if result.get("success") and result.get("session_file")), None)
+        if successful_session and Path(successful_session).exists():
+            base_path = Path(base_session)
+            base_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(successful_session, base_path)
+
+        rows = sum(int(result.get("rows") or 0) for result in results)
+        failures = [result for result in results if not result.get("success")]
+        failed_vendors = [str(result.get("vendor")) for result in failures if result.get("vendor")]
+        if stop_requested["value"]:
+            return TaskResult(False, output_dir, output_paths, rows, warnings, failed_vendors, request.log_file, "stopped by signal", 130)
+        if failures:
+            error = "; ".join(f"{failure.get('vendor')}: {failure.get('error')}" for failure in failures)
+            return TaskResult(False, output_dir, output_paths, rows, warnings, failed_vendors, request.log_file, error, 4)
+        if rows == 0 and groups:
+            failed_vendors = [str(group["vendor"]) for group in groups]
+            error = "no rows captured and no successful worker output"
+            return TaskResult(False, output_dir, output_paths, rows, warnings, failed_vendors, request.log_file, error, 4)
+        return TaskResult(True, output_dir, output_paths, rows, warnings, [], request.log_file, None, 0)
+    finally:
+        for sig, handler in old_handlers.items():
+            signal.signal(sig, handler)
+        terminate_active_workers()
+        shutil.rmtree(state_dir, ignore_errors=True)
+        shutil.rmtree(session_temp_dir, ignore_errors=True)
+
+
 def scrape_vendor_batches(
     request: TaskRequest,
     reporter: Reporter,
@@ -420,6 +838,15 @@ def scrape_vendor_batches(
     progress_callback: Callable[[int, int], None] | None = None,
     rows_callback: Callable[[list[dict]], None] | None = None,
 ) -> TaskResult:
+    return _scrape_vendor_batches_subprocess(
+        request,
+        reporter,
+        run_mode=run_mode,
+        output_base_dir=output_base_dir,
+        should_stop=should_stop,
+        progress_callback=progress_callback,
+        rows_callback=rows_callback,
+    )
     multiprocessing.freeze_support()
     try:
         items = load_items(request)
@@ -440,9 +867,8 @@ def scrape_vendor_batches(
     else:
         output_dir = default_vendor_output_dir(timestamp=timestamp)
     Path(output_dir).mkdir(parents=True, exist_ok=True)
-    if not request.log_file:
-        request.log_file = str(Path(output_dir).expanduser() / "run.log")
-    Path(request.log_file).expanduser().parent.mkdir(parents=True, exist_ok=True)
+    if request.log_file:
+        Path(request.log_file).expanduser().parent.mkdir(parents=True, exist_ok=True)
 
     session_temp_dir: str | None = None
     stop_event = multiprocessing.Event()
@@ -505,7 +931,7 @@ def scrape_vendor_batches(
             "extract_real_price": request.extract_real_price,
             "extract_product_info": request.extract_product_info,
             "output_dir": str(Path(output_dir).expanduser().resolve()),
-            "log_file": str(Path(request.log_file).expanduser().resolve()),
+            "log_file": str(Path(request.log_file).expanduser().resolve()) if request.log_file else None,
         }
     )
     _preflight(request, reporter)
@@ -628,8 +1054,6 @@ def scrape_vendor_batches(
                     active_states.pop(vendor, None)
                     if progress_callback:
                         progress_callback(completed_groups, len(groups))
-                    if rows_callback and message.get("rows_data"):
-                        rows_callback(message["rows_data"])
                     if message.get("output_path") and (message.get("success") or int(message.get("rows") or 0) > 0):
                         output_paths.append(message["output_path"])
                     reporter(message)
@@ -747,9 +1171,8 @@ def scrape_xxx(request: TaskRequest, reporter: Reporter, run_mode: str | None = 
         return TaskResult(success=False, error=str(exc), exit_code=2)
 
     output_path = _expand_output_path(request.output_path or default_output_path(request))
-    if not request.log_file:
-        request.log_file = default_single_log_file(output_path)
-    Path(request.log_file).expanduser().parent.mkdir(parents=True, exist_ok=True)
+    if request.log_file:
+        Path(request.log_file).expanduser().parent.mkdir(parents=True, exist_ok=True)
     if not request.browser_options.session_file:
         request.browser_options.session_file = default_session_path()
     reporter(
@@ -765,7 +1188,7 @@ def scrape_xxx(request: TaskRequest, reporter: Reporter, run_mode: str | None = 
             "extract_real_price": request.extract_real_price,
             "extract_product_info": request.extract_product_info,
             "output": str(Path(output_path).expanduser().resolve()),
-            "log_file": str(Path(request.log_file).expanduser().resolve()),
+            "log_file": str(Path(request.log_file).expanduser().resolve()) if request.log_file else None,
         }
     )
     _preflight(request, reporter)
