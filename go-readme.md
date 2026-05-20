@@ -6,49 +6,100 @@
 
 ## 1. 快速启动
 
-建议先做一个短 smoke test，只验证浏览器、HK 首跳、session 和导出链路：
+以下命令均使用有头 Chrome、JSON lines 输出、命令行 verbose 日志、不写 `run.log` / `--log-file`，并使用默认输出目录 `~/Documents/trip_vendor_results/YYMMDD-HHMM/`。
 
-```bash
-go run ./cmd/trip-score-cdp \
-  --rating-only \
-  --no-real-price \
-  --no-product-info \
-  --input "https://hk.trip.com/things-to-do/detail/92237157/" \
-  --delay-profile fast \
-  --no-headless \
-  --json-lines \
-  --output /tmp/trip-score-cdp-smoke.xlsx
-```
+### 场景 1：导入单厂商或多厂商 Excel，抓实价和商品资讯，写入 mode1
 
-真实 SKU、外显价、实价和促销标签验证，建议使用 `safe` 档位：
+`mode1` 等价于：有头完整抓取、抓 SKU/外显价/实价/促销标签/商品资讯，默认延迟 `normal`。Excel 厂商模式建议直接使用最大 worker 数 `5`，程序会按厂商列并发并保持 worker profile/session 隔离。
 
 ```bash
 go build -o /tmp/trip-score-cdp ./cmd/trip-score-cdp
 
 /tmp/trip-score-cdp \
-  --real-price \
-  --product-info \
-  --input "https://hk.trip.com/things-to-do/detail/92237157/" \
-  --delay-profile safe \
-  --no-headless \
+  --run-mode mode1 \
+  --excel-input /Users/example/Downloads/scrape.xlsx \
+  --workers 5 \
   --json-lines \
-  --output /tmp/trip-score-cdp-92237157.xlsx
+  --log-level verbose
 ```
 
-Excel 多厂商常规批量：
+显式展开写法：
 
 ```bash
 /tmp/trip-score-cdp \
+  --no-headless \
+  --no-rating-only \
   --real-price \
   --product-info \
+  --delay-profile normal \
   --excel-input /Users/example/Downloads/scrape.xlsx \
-  --workers 2 \
-  --delay-profile safe \
-  --no-headless \
-  --json-lines
+  --workers 5 \
+  --json-lines \
+  --log-level verbose
 ```
 
-如果页面已经稳定、样本较小、且没有出现验证码或价格错位，可以把 `--workers 2` 调高到 `--workers 3`。遇到风控或实价/促销标签不稳定时，优先降并发并改用 `--delay-profile slow`。
+### 场景 2：导入单厂商或多厂商 Excel，只抓评分和商品资讯，写入 mode2
+
+`mode2` 等价于：有头、仅评分/评价/商品资讯、不抓 SKU 和价格、不抓实价，默认延迟 `fast`。
+
+```bash
+/tmp/trip-score-cdp \
+  --run-mode mode2 \
+  --excel-input /Users/example/Downloads/scrape.xlsx \
+  --workers 5 \
+  --json-lines \
+  --log-level verbose
+```
+
+显式展开写法：
+
+```bash
+/tmp/trip-score-cdp \
+  --no-headless \
+  --rating-only \
+  --no-real-price \
+  --product-info \
+  --delay-profile fast \
+  --excel-input /Users/example/Downloads/scrape.xlsx \
+  --workers 5 \
+  --json-lines \
+  --log-level verbose
+```
+
+### 场景 3：导入单条或多条 Trip 产品 URL，延迟 normal
+
+单条 URL 的 mode1 等价命令：
+
+```bash
+/tmp/trip-score-cdp \
+  --run-mode mode1 \
+  --input "https://hk.trip.com/things-to-do/detail/92237157/" \
+  --json-lines \
+  --log-level verbose
+```
+
+单条 URL 的 mode2 等价命令：
+
+```bash
+/tmp/trip-score-cdp \
+  --run-mode mode2 \
+  --delay-profile normal \
+  --input "https://hk.trip.com/things-to-do/detail/92237157/" \
+  --json-lines \
+  --log-level verbose
+```
+
+多条 URL 可重复传入 `--input`，或使用 `--urls-file`：
+
+```bash
+/tmp/trip-score-cdp \
+  --run-mode mode1 \
+  --urls-file /Users/example/Downloads/trip_urls.txt \
+  --json-lines \
+  --log-level verbose
+```
+
+普通 URL 输入模式当前使用单浏览器顺序执行；`--workers 5` 只适用于 `--excel-input` 厂商列并发。若需要多 URL 并发，请把 URL 放入 Excel 的多个厂商列后使用场景 1 或场景 2。
 
 HK 商品页会在浏览器实际导航前自动补齐 `locale=zh-hk&curr=HKD`。日志中 `url` 保留原始输入，`first_trip_navigation_url` 和 `final_url` 记录真实打开的 HK URL；正常情况下不应再出现 `www.trip.com -> sg.trip.com -> hk.trip.com` 的首跳链路。
 
@@ -56,17 +107,16 @@ HK 商品页会在浏览器实际导航前自动补齐 `locale=zh-hk&curr=HKD`�
 
 | 场景 | 推荐命令核心参数 | 说明 |
 | --- | --- | --- |
-| 启动 smoke test | `--rating-only --no-real-price --no-product-info --delay-profile fast --no-headless --json-lines` | 用于确认浏览器能启动、HK 首跳正确、session 能加载、XLSX 能导出。 |
-| 单 URL 全量验证 | `--real-price --product-info --delay-profile safe --no-headless --json-lines` | 推荐用于核对 SKU 遍历、外显价、实价、促销标签。 |
-| 常规批量 Excel | `--real-price --product-info --delay-profile safe --workers 2 --no-headless --json-lines` | 默认更稳；确认无风控后再提高到 `--workers 3`。 |
-| 风控或页面异步不稳 | `--delay-profile slow --workers 1 --no-headless --json-lines` | 降低页面打开、滚动、SKU 点击和取价频率。 |
-| 只抓评分 | `--rating-only --no-real-price --delay-profile fast` | 不遍历 SKU，不输出价格相关字段，适合检查页面和登录态。 |
-| 机器解析日志 | `--json-lines --no-color --log-level normal` | 每行一个 JSON event，最后一行为 `run_done`。 |
-| 更快启动 worker | `--startup-stagger 0` | 仅在小样本、本机 profile/driver 已稳定且无风控时使用；批量建议保留默认错峰。 |
+| Excel 完整抓取 | `--run-mode mode1 --excel-input FILE --workers 5 --json-lines --log-level verbose` | 抓 SKU、外显价、实价、促销标签和商品资讯；mode1 默认有头、`normal` 延迟。 |
+| Excel 评分资讯 | `--run-mode mode2 --excel-input FILE --workers 5 --json-lines --log-level verbose` | 只抓评分、评价维度和商品资讯；mode2 默认有头、`fast` 延迟。 |
+| URL 完整抓取 | `--run-mode mode1 --input URL --json-lines --log-level verbose` | 单条或多条 URL 顺序抓取，默认输出到当次 run folder。 |
+| URL 评分资讯 | `--run-mode mode2 --delay-profile normal --input URL --json-lines --log-level verbose` | URL 场景如需按本节要求使用 normal 延迟，可显式覆盖 mode2 的 fast 默认。 |
+| 风控或页面异步不稳 | `--delay-profile slow --workers 1 --json-lines --log-level verbose` | 降低页面打开、滚动、SKU 点击和取价频率。 |
+| 机器解析日志 | `--json-lines --no-color --log-level verbose` | 每行一个 JSON event，最后一行为 `run_done`；默认不写日志文件。 |
 
-遇到 Trip 页面弹验证、空结果、SKU 容器不存在但页面肉眼可见 SKU 时，优先用 `--no-headless`、`--delay-profile safe` 或 `--delay-profile slow` 复测。
+遇到 Trip 页面弹验证、空结果、SKU 容器不存在但页面肉眼可见 SKU 时，优先降低并发并改用 `--delay-profile safe` 或 `--delay-profile slow` 复测。
 
-不建议把 `fast` 作为大批量或实价/促销标签校验的默认档位。`fast` 适合短 smoke test；SKU 实价读取要优先使用 `safe`，风控明显时用 `slow`。
+不建议把 `fast` 作为大批量 SKU 实价/促销标签校验的默认档位。`fast` 适合 mode2 评分资讯抓取；SKU 实价读取要优先使用 `normal/safe`，风控明显时用 `slow`。
 
 ## 3. 延迟档位
 
@@ -224,8 +274,8 @@ profile 和 session：
 | `--rating-only` / `--no-rating-only` | 关闭 | 开启或关闭仅评分模式。 |
 | `--real-price` / `--no-real-price` | 开启 | 开启或关闭动态实价抓取。 |
 | `--product-info` / `--no-product-info` | 开启 | 开启或关闭商品资讯抓取。 |
-| `--run-mode mode1` | 空 | 无头完整抓取：headless、非仅评分、抓实价、抓商品资讯。 |
-| `--run-mode mode2` | 空 | 有头仅评分：不抓实价、抓商品资讯。 |
+| `--run-mode mode1` | 空 | 有头完整抓取：非仅评分、抓实价、抓商品资讯；默认 `normal` 延迟。 |
+| `--run-mode mode2` | 空 | 有头评分资讯抓取：仅评分、不抓实价、抓商品资讯；未显式传 `--delay-profile` 时默认 `fast` 延迟。 |
 
 显式开关优先级最高：先应用默认值，再应用 `--run-mode`，最后应用 `--headless`、`--rating-only`、`--real-price`、`--product-info` 等显式开关。
 
@@ -370,13 +420,11 @@ python3 -m py_compile main.py cli.py service.py models.py trip_cli_scraper.py se
 
 ```bash
 /tmp/trip-score-cdp \
-  --rating-only \
-  --no-real-price \
-  --no-product-info \
-  --delay-profile fast \
-  --no-headless \
+  --run-mode mode2 \
+  --delay-profile normal \
   --input "https://hk.trip.com/things-to-do/detail/92237157/" \
   --json-lines \
+  --log-level verbose \
   --output /tmp/trip-score-cdp-smoke.xlsx
 ```
 
@@ -384,12 +432,10 @@ SKU/价格验证：
 
 ```bash
 /tmp/trip-score-cdp \
-  --real-price \
-  --product-info \
-  --delay-profile safe \
-  --no-headless \
+  --run-mode mode1 \
   --input "https://hk.trip.com/things-to-do/detail/92237157/" \
   --json-lines \
+  --log-level verbose \
   --output /tmp/trip-score-cdp-92237157.xlsx
 ```
 

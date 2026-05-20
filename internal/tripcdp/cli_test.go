@@ -7,6 +7,14 @@ import (
 )
 
 func TestResolveRunOptionsAppliesModeThenExplicitFlags(t *testing.T) {
+	mode1 := resolveRunOptions("mode1", triState{}, triState{}, triState{}, triState{})
+	if mode1.headless {
+		t.Fatal("mode1 should be headed by default")
+	}
+	if mode1.ratingOnly || !mode1.realPrice || !mode1.productInfo {
+		t.Fatalf("mode1 should be full scrape with real price and product info: %+v", mode1)
+	}
+
 	options := resolveRunOptions(
 		"mode2",
 		triState{},
@@ -26,6 +34,44 @@ func TestResolveRunOptionsAppliesModeThenExplicitFlags(t *testing.T) {
 	}
 	if !options.productInfo {
 		t.Fatal("mode2 should keep product info enabled")
+	}
+}
+
+func TestParseRunModeDelayDefaults(t *testing.T) {
+	mode1, runMode, _, _, _, err := parseArgs([]string{"--run-mode", "mode1", "--input", "https://www.trip.com/detail/12345"}, &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("mode1 parse failed: %v", err)
+	}
+	if runMode != "mode1" {
+		t.Fatalf("run mode = %q, want mode1", runMode)
+	}
+	if mode1.BrowserOptions.Headless || mode1.RatingOnly || !mode1.ExtractRealPrice || !mode1.ExtractProductInfo {
+		t.Fatalf("unexpected mode1 request: %+v", mode1)
+	}
+	if mode1.DelayOptions.Profile != "normal" {
+		t.Fatalf("mode1 delay profile = %q, want normal", mode1.DelayOptions.Profile)
+	}
+
+	mode2, runMode, _, _, _, err := parseArgs([]string{"--run-mode", "mode2", "--input", "https://www.trip.com/detail/12345"}, &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("mode2 parse failed: %v", err)
+	}
+	if runMode != "mode2" {
+		t.Fatalf("run mode = %q, want mode2", runMode)
+	}
+	if mode2.BrowserOptions.Headless || !mode2.RatingOnly || mode2.ExtractRealPrice || !mode2.ExtractProductInfo {
+		t.Fatalf("unexpected mode2 request: %+v", mode2)
+	}
+	if mode2.DelayOptions.Profile != "fast" {
+		t.Fatalf("mode2 delay profile = %q, want fast", mode2.DelayOptions.Profile)
+	}
+
+	overridden, _, _, _, _, err := parseArgs([]string{"--run-mode", "mode2", "--delay-profile", "slow", "--input", "https://www.trip.com/detail/12345"}, &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("mode2 override parse failed: %v", err)
+	}
+	if overridden.DelayOptions.Profile != "slow" {
+		t.Fatalf("explicit delay profile should override mode2 default, got %q", overridden.DelayOptions.Profile)
 	}
 }
 
