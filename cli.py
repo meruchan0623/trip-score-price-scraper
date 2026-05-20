@@ -92,6 +92,8 @@ def build_parser() -> Parser:
     parser.add_argument("--worker-chrome-path", help=argparse.SUPPRESS)
     parser.add_argument("--worker-chrome-version-main", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--worker-driver-executable-path", help=argparse.SUPPRESS)
+    parser.add_argument("--worker-profile-dir", help=argparse.SUPPRESS)
+    parser.add_argument("--worker-stop-file", help=argparse.SUPPRESS)
     return parser
 
 
@@ -382,6 +384,7 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
         output_path=args.output,
         output_dir=args.output_dir,
         log_file=args.log_file,
+        stop_file=None,
         workers=args.workers,
         startup_stagger=max(args.startup_stagger, 0),
         stop_grace_seconds=max(args.stop_grace_seconds, 0),
@@ -404,6 +407,7 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
             return 2
         request.output_path = args.worker_output
         request.log_file = args.log_file
+        request.stop_file = args.worker_stop_file
         request.excel_input = None
         request.input_paths = []
         request.urls_file = None
@@ -411,6 +415,7 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
         request.browser_options.chrome_path = args.worker_chrome_path
         request.browser_options.chrome_version_main = args.worker_chrome_version_main
         request.browser_options.driver_executable_path = args.worker_driver_executable_path
+        request.browser_options.user_data_dir = args.worker_profile_dir
         return run_vendor_worker_from_files(
             items_file=args.worker_items_file,
             output_path=args.worker_output,

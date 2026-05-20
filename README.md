@@ -124,7 +124,8 @@ CLI 自动完成浏览器生命周期：
 - 任务结束后自动关闭 Chrome。
 - 普通模式默认单浏览器。
 - 厂商 Excel 模式按厂商并发，多进程启动多个独立 Chrome，最多 5 个。
-- CLI 会在启动 worker 前预热 `undetected_chromedriver`，driver 下载/patch 只执行一次，随后所有 worker 复用同一个已准备好的 driver。
+- CLI 会在启动 worker 前预热 `undetected_chromedriver`，随后把 chromedriver 复制到每个 worker 目录，避免并发 worker 触碰同一个 driver 文件。
+- 每个厂商 worker 都有独立 `_workers/<厂商>/items.json`、`result.json`、`session.json`、`profile/`、`driver/` 和 `stop.request`。
 - CLI 会自动优先使用 `certifi` 配置 `SSL_CERT_FILE`，避免 Python 新机证书链缺失导致 driver 下载失败。
 
 CLI 参数：
@@ -215,17 +216,16 @@ kill -TERM <pid>
 
 停止时程序会尽量：
 
-- 设置停止标记。
-- 对浏览器执行 `window.stop()`。
+- 写入 worker 自己的 `stop.request` 文件。
 - 导出已抓取结果。
 - 保存 session。
 - 关闭浏览器。
 
 CLI 中断采用两段式退出：
 
-- 第一次 `Ctrl+C` / `SIGINT` / `SIGTERM`：进入优雅停止，只通知 worker 停止，等待已完成 URL 导出和浏览器自行关闭。
-- 第二次 `Ctrl+C` / `SIGINT` / `SIGTERM`：升级为强制停止，立即终止剩余 worker 或关闭当前浏览器。
-- 如果第一次中断后超过 `--stop-grace-seconds`，程序会自动升级为强制终止剩余 worker。
+- 第一次 `Ctrl+C` / `SIGINT` / `SIGTERM`：写入每个活跃 worker 的 `stop.request`，等待 worker 自行停止、导出和关闭浏览器。
+- 第二次 `Ctrl+C` / `SIGINT` / `SIGTERM`：升级为强制停止，终止剩余 worker 进程树。
+- 如果第一次中断后超过 `--stop-grace-seconds`，程序会自动升级为强制终止剩余 worker 进程树。
 
 ## 7. 日志区
 
@@ -431,7 +431,7 @@ python3 main.py \
   --session-file "$HOME/Documents/trip_session.json"
 ```
 
-厂商并发模式中，每个 worker 使用临时 session 文件，避免多个进程同时写同一个 session。任务结束后，会把第一个成功 worker 的 session 复制回指定或默认 session 文件。
+厂商并发模式中，每个 worker 使用自己目录下的 `session.json` 和 Chrome `profile/`，避免多个进程同时写同一个 session 或 profile。任务结束后，会把第一个成功 worker 的 session 复制回指定或默认 session 文件。
 
 CLI 不提供“打开浏览器后等待人工登录”的流程。需要登录态时，先通过 GUI 或已有 session 文件准备登录状态。
 
@@ -595,7 +595,8 @@ main.py
               └── Excel模式：scrape_vendor_batches()
                     ├── load_excel_items()
                     ├── 按厂商分组
-                    ├── multiprocessing 启动 worker
+                    ├── subprocess 启动独立 worker
+                    ├── 每个 worker 使用独立 session/profile/driver/stop 文件
                     ├── 每个 worker 创建独立 TripCliScraper 和 Chrome
                     └── 每厂商独立导出 Excel
 ```
@@ -665,3 +666,32 @@ failed: At least one URL is required via --input, --urls-file, or --excel-input.
 
 - 确认 `--output` 或 `--output-dir` 有写入权限。
 - 确认目标 Excel 文件没有被 Excel/WPS 打开占用。
+
+## 18. Go + CDP 独立 CLI：trip-score-cdp
+
+仓库额外提供一个独立 Go 命令 `trip-score-cdp`。它不替换 `python3 main.py`，也不影响 GUI；Python CLI/GUI 仍按本文前面章节使用。
+
+Go CLI 当前用于验证和运行 Go-native 抓取链路：patched chromedriver + Chrome subprocess + WebDriver attach 负责浏览器启动与生命周期，Rod/CDP 继续负责 Trip 页面、SKU 遍历、价格、实价和促销标签读取。它也提供 `--json-lines`、Excel 多厂商 worker、可取消中断、延迟档位等面向批量运行的能力。
+
+Go CLI 默认结果统一写入 `~/Documents/trip_vendor_results/YYMMDD-HHMM/`，默认不写 `run.log`；长期 session 与 profile 统一维护在 `~/Documents/trip_vendor_results/_state/`，第二次运行会自动复用。
+
+快速运行：
+
+```bash
+go run ./cmd/trip-score-cdp \
+  --real-price \
+  --product-info \
+  --input "https://hk.trip.com/things-to-do/detail/92237157/" \
+  --delay-profile fast \
+  --no-headless \
+  --json-lines
+```
+
+构建成独立二进制：
+
+```bash
+go build -o /tmp/trip-score-cdp ./cmd/trip-score-cdp
+/tmp/trip-score-cdp --help
+```
+
+完整 Go CLI 操作文档、推荐参数、延迟档位、UC/profile/session 说明和故障排查见 [go-readme.md](go-readme.md)。

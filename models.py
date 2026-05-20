@@ -20,6 +20,7 @@ class BrowserOptions:
     chrome_path: str | None = None
     chrome_version_main: int | None = None
     driver_executable_path: str | None = None
+    user_data_dir: str | None = None
     wait_login: bool = False
     timeout: int = 300
     memory_guard_enabled: bool = True
@@ -35,8 +36,9 @@ class TaskRequest:
     output_path: str | None = None
     output_dir: str | None = None
     log_file: str | None = None
+    stop_file: str | None = None
     workers: int | None = None
-    startup_stagger: float = 0.5
+    startup_stagger: float = 0
     stop_grace_seconds: int = 30
     rating_only: bool = False
     extract_real_price: bool = True
