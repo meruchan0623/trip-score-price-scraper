@@ -51,6 +51,7 @@ class TripCliScraper:
         self.global_total = global_total
         self.driver = None
         self.user_data_dir: str | None = None
+        self._remove_user_data_dir_on_close = True
         self.session = SessionStore(request.browser_options.session_file)
         self.max_sku_layers = 0
         self._processed_since_browser_restart = 0
@@ -94,7 +95,13 @@ class TripCliScraper:
     def start_browser(self) -> None:
         self.emit({"event": "browser_start_started", "message": "starting Chrome"})
         started = time.monotonic()
-        self.user_data_dir = os.path.join(tempfile.gettempdir(), f"trip_cli_chrome_{uuid.uuid4().hex[:12]}")
+        configured_user_data_dir = self.request.browser_options.user_data_dir
+        if configured_user_data_dir:
+            self.user_data_dir = str(Path(configured_user_data_dir).expanduser())
+            self._remove_user_data_dir_on_close = False
+        else:
+            self.user_data_dir = os.path.join(tempfile.gettempdir(), f"trip_cli_chrome_{uuid.uuid4().hex[:12]}")
+            self._remove_user_data_dir_on_close = True
         os.makedirs(self.user_data_dir, exist_ok=True)
 
         options = uc.ChromeOptions()
@@ -260,9 +267,10 @@ class TripCliScraper:
             except Exception:
                 pass
             self.driver = None
-        if self.user_data_dir:
+        if self.user_data_dir and self._remove_user_data_dir_on_close:
             shutil.rmtree(self.user_data_dir, ignore_errors=True)
-            self.user_data_dir = None
+        self.user_data_dir = None
+        self._remove_user_data_dir_on_close = True
 
     def _cleanup_after_url(self) -> None:
         if not self.driver:

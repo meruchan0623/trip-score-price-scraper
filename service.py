@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-import contextlib
 import json
 import multiprocessing
 import os
 import platform
-import queue
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -28,6 +27,10 @@ from xlsx_export import export_rows
 Reporter = Callable[[dict[str, Any] | str], None]
 DEFAULT_VENDOR = "手动输入"
 MAX_WORKERS = 5
+try:
+    import psutil
+except Exception:
+    psutil = None
 
 
 def load_inputs(request: TaskRequest) -> list[str]:
@@ -163,15 +166,6 @@ def _vendor_output_path(group: dict[str, Any], output_dir: str, timestamp: str) 
     return str(Path(output_dir).expanduser() / f"{_safe_filename(group['file_vendor'])}_{timestamp}.xlsx")
 
 
-def _copy_session_to_temp(base_session: str, temp_dir: str, index: int) -> str:
-    temp_session = Path(temp_dir) / f"session_worker_{index}.json"
-    base_path = Path(base_session).expanduser()
-    if base_path.exists():
-        temp_session.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(base_path, temp_session)
-    return str(temp_session)
-
-
 def _scrape_item_to_dict(item: ScrapeItem) -> dict[str, Any]:
     return {
         "url": item.url,
@@ -202,12 +196,85 @@ def _read_json(path: str | Path) -> Any:
     return json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
 
 
-def _worker_items_path(group: dict[str, Any], state_dir: str, index: int) -> str:
-    return str(Path(state_dir).expanduser() / f"{index:02d}_{_safe_filename(group['file_vendor'])}_items.json")
+class FileStopEvent:
+    def __init__(self, path: str | Path | None) -> None:
+        self.path = Path(path).expanduser() if path else None
+
+    def is_set(self) -> bool:
+        return bool(self.path and self.path.exists())
 
 
-def _worker_result_path(group: dict[str, Any], state_dir: str, index: int) -> str:
-    return str(Path(state_dir).expanduser() / f"{index:02d}_{_safe_filename(group['file_vendor'])}_result.json")
+def _worker_dir_path(group: dict[str, Any], workers_dir: str | Path, index: int) -> Path:
+    return Path(workers_dir).expanduser() / f"{index:02d}_{_safe_filename(group['file_vendor'])}"
+
+
+def _copy_driver_to_worker(driver_path: str | None, worker_dir: str | Path) -> str | None:
+    if not driver_path:
+        return None
+    source = Path(driver_path).expanduser()
+    target_dir = Path(worker_dir).expanduser() / "driver"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / source.name
+    shutil.copy2(source, target)
+    try:
+        target.chmod(target.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    except Exception:
+        pass
+    return str(target)
+
+
+def _write_stop_request(stop_file: str | Path | None) -> None:
+    if not stop_file:
+        return
+    target = Path(stop_file).expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(datetime.now().isoformat(timespec="seconds"), encoding="utf-8")
+
+
+def _worker_popen_kwargs() -> dict[str, Any]:
+    kwargs: dict[str, Any] = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+    if platform.system() == "Windows":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        kwargs["start_new_session"] = True
+    return kwargs
+
+
+def _terminate_process_tree(process: subprocess.Popen) -> None:
+    if process.poll() is not None:
+        return
+    if psutil:
+        try:
+            parent = psutil.Process(process.pid)
+            children = parent.children(recursive=True)
+            for child in children:
+                try:
+                    child.terminate()
+                except Exception:
+                    pass
+            try:
+                parent.terminate()
+            except Exception:
+                pass
+            _, alive = psutil.wait_procs([parent, *children], timeout=3)
+            for proc in alive:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            return
+        except Exception:
+            pass
+    if platform.system() != "Windows":
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+            return
+        except Exception:
+            pass
+    try:
+        process.terminate()
+    except Exception:
+        pass
 
 
 def _build_worker_command(
@@ -254,7 +321,65 @@ def _build_worker_command(
         command.extend(["--worker-chrome-version-main", str(request.browser_options.chrome_version_main)])
     if request.browser_options.driver_executable_path:
         command.extend(["--worker-driver-executable-path", request.browser_options.driver_executable_path])
+    if request.browser_options.user_data_dir:
+        command.extend(["--worker-profile-dir", request.browser_options.user_data_dir])
+    if request.stop_file:
+        command.extend(["--worker-stop-file", request.stop_file])
     return command
+
+
+def _create_worker_spec(
+    *,
+    request: TaskRequest,
+    group: dict[str, Any],
+    worker_id: int,
+    workers_dir: str | Path,
+    output_path: str,
+    base_session: str,
+) -> dict[str, Any]:
+    worker_dir = _worker_dir_path(group, workers_dir, worker_id)
+    worker_dir.mkdir(parents=True, exist_ok=True)
+    items_file = worker_dir / "items.json"
+    result_file = worker_dir / "result.json"
+    session_file = worker_dir / "session.json"
+    profile_dir = worker_dir / "profile"
+    stop_file = worker_dir / "stop.request"
+    output_path = _expand_output_path(output_path)
+
+    if stop_file.exists():
+        stop_file.unlink()
+    _write_json(items_file, [_scrape_item_to_dict(item) for item in group["items"]])
+    base_path = Path(base_session).expanduser()
+    session_file.parent.mkdir(parents=True, exist_ok=True)
+    if base_path.exists():
+        shutil.copy2(base_path, session_file)
+    driver_path = _copy_driver_to_worker(request.browser_options.driver_executable_path, worker_dir)
+
+    worker_request = _worker_request(request, output_path, str(session_file))
+    worker_request.stop_file = str(stop_file)
+    worker_request.browser_options.driver_executable_path = driver_path
+    worker_request.browser_options.user_data_dir = str(profile_dir)
+    command = _build_worker_command(
+        request=worker_request,
+        vendor=group["vendor"],
+        items_file=str(items_file),
+        output_path=output_path,
+        result_file=str(result_file),
+        session_file=str(session_file),
+    )
+    return {
+        "command": command,
+        "group": group,
+        "worker_id": worker_id,
+        "worker_dir": str(worker_dir),
+        "items_file": str(items_file),
+        "result_file": str(result_file),
+        "session_file": str(session_file),
+        "profile_dir": str(profile_dir),
+        "stop_file": str(stop_file),
+        "driver_executable_path": driver_path,
+        "output_path": output_path,
+    }
 
 
 def run_vendor_worker_from_files(
@@ -280,25 +405,32 @@ def run_vendor_worker_from_files(
     request.workers = 1
     if not request.browser_options.session_file:
         request.browser_options.session_file = default_session_path()
+    stop_event = FileStopEvent(request.stop_file)
 
     def reporter(event: dict[str, Any] | str) -> None:
         return None
 
     scraper = None
+    stopped = False
     try:
         raw_items = _read_json(items_file)
         items = [_scrape_item_from_dict(item) for item in raw_items]
         reporter({"event": "process_started", "stage": "process_started", "message": "independent worker process started", "url_count": len(items)})
-        if not request.browser_options.driver_executable_path:
+        if stop_event.is_set():
+            stopped = True
+        elif not request.browser_options.driver_executable_path:
             error_stage = "driver_prepare"
             _prepare_browser_runtime(request, reporter)
-        error_stage = "chrome_detect"
-        scraper = TripCliScraper(request, reporter, vendor=vendor, worker_id=1, global_total=len(items))
-        scraper.prepare_environment()
-        error_stage = "browser_start"
-        scraper.start_browser()
-        error_stage = "scrape"
-        rows = scraper.scrape_items(items, rows=rows)
+            stopped = stop_event.is_set()
+        if not stopped:
+            error_stage = "chrome_detect"
+            scraper = TripCliScraper(request, reporter, vendor=vendor, worker_id=1, global_total=len(items))
+            scraper.prepare_environment()
+            error_stage = "browser_start"
+            scraper.start_browser()
+            error_stage = "scrape"
+            rows = scraper.scrape_items(items, stop_event=stop_event, rows=rows)
+            stopped = stop_event.is_set()
         if rows:
             error_stage = "export"
             saved_path = export_rows(
@@ -329,23 +461,28 @@ def run_vendor_worker_from_files(
         if scraper:
             scraper.close()
 
-    success = error is None and bool(rows)
+    stopped = stopped or stop_event.is_set()
+    success = error is None and bool(rows) and not stopped
     result = {
         "event": "vendor_done",
         "vendor": vendor,
         "worker_id": 1,
         "success": success,
-        "stopped": False,
+        "stopped": stopped,
         "rows": len(rows),
         "output_path": saved_path or output_path,
         "session_file": request.browser_options.session_file,
-        "error": error if error else (None if rows else "no rows captured"),
+        "error": "stopped by request" if stopped and error is None else (error if error else (None if rows else "no rows captured")),
         "error_type": error_type,
-        "stage": error_stage if error else "done",
+        "stage": "stopped" if stopped else (error_stage if error else "done"),
         "traceback": error_traceback,
         "url_count": len(items),
         "urls_done": len(items) if rows else 0,
         "elapsed_ms": int((time.monotonic() - started_at) * 1000),
+        "worker_dir": str(Path(result_file).expanduser().parent),
+        "profile_dir": request.browser_options.user_data_dir,
+        "driver_executable_path": request.browser_options.driver_executable_path,
+        "stop_file": request.stop_file,
     }
     _write_json(result_file, result)
     return 0 if success else 4
@@ -359,6 +496,7 @@ def _worker_request(request: TaskRequest, output_path: str, session_file: str) -
         output_path=output_path,
         output_dir=None,
         log_file=request.log_file,
+        stop_file=request.stop_file,
         workers=1,
         startup_stagger=request.startup_stagger,
         stop_grace_seconds=request.stop_grace_seconds,
@@ -372,135 +510,13 @@ def _worker_request(request: TaskRequest, output_path: str, session_file: str) -
             chrome_path=request.browser_options.chrome_path,
             chrome_version_main=request.browser_options.chrome_version_main,
             driver_executable_path=request.browser_options.driver_executable_path,
+            user_data_dir=request.browser_options.user_data_dir,
             timeout=request.browser_options.timeout,
             memory_guard_enabled=request.browser_options.memory_guard_enabled,
             memory_limit_mb=request.browser_options.memory_limit_mb,
             restart_every=request.browser_options.restart_every,
         ),
     )
-
-
-@contextlib.contextmanager
-def _redirect_worker_output(log_file: str | None):
-    target = None
-    try:
-        if log_file:
-            log_path = Path(log_file).expanduser()
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            target = log_path.open("a", encoding="utf-8")
-        else:
-            target = open(os.devnull, "w", encoding="utf-8")
-        with contextlib.redirect_stdout(target), contextlib.redirect_stderr(target):
-            yield
-    finally:
-        if target:
-            target.close()
-
-
-def _scrape_vendor_worker(
-    worker_id: int,
-    vendor: str,
-    items: list[ScrapeItem],
-    request: TaskRequest,
-    output_path: str,
-    session_file: str,
-    result_queue,
-    global_total: int,
-    stop_event,
-) -> None:
-    def emit(event: dict[str, Any]) -> None:
-        payload = dict(event)
-        payload.setdefault("vendor", vendor)
-        payload.setdefault("worker_id", worker_id)
-        payload.setdefault("output_path", output_path)
-        payload.setdefault("log_file", request.log_file)
-        result_queue.put(payload)
-
-    scraper = None
-    rows: list[dict] = []
-    saved_path: str | None = None
-    error: str | None = None
-    error_type: str | None = None
-    error_stage: str | None = None
-    error_traceback: str | None = None
-    current_stage = "process_started"
-    with _redirect_worker_output(request.log_file):
-        try:
-            emit({"event": "process_started", "stage": "process_started", "message": "worker process started"})
-            current_stage = "runtime_init"
-            emit({"event": "runtime_init_started", "stage": "runtime_init", "message": "initializing worker runtime"})
-            emit({"event": "worker_ready", "message": "worker process ready"})
-            scraper = TripCliScraper(request, emit, vendor=vendor, worker_id=worker_id, global_total=global_total)
-            current_stage = "chrome_detect"
-            scraper.prepare_environment()
-            current_stage = "browser_start"
-            scraper.start_browser()
-            current_stage = "scrape"
-            rows = scraper.scrape_items(items, stop_event=stop_event, rows=rows)
-        except Exception as exc:
-            error = str(exc)
-            error_type = type(exc).__name__
-            error_stage = current_stage
-            error_traceback = traceback.format_exc()
-            emit(
-                {
-                    "event": "worker_failed",
-                    "stage": error_stage,
-                    "exitcode": None,
-                    "error": error,
-                    "error_type": error_type,
-                    "traceback": error_traceback,
-                    "rows": len(rows),
-                    "url_count": len(items),
-                    "urls_done": len(rows),
-                }
-            )
-        finally:
-            stopped = bool(stop_event and stop_event.is_set())
-            if rows:
-                try:
-                    saved_path = export_rows(
-                        rows,
-                        output_path,
-                        rating_only=request.rating_only,
-                        extract_real_price=request.extract_real_price,
-                        extract_product_info=request.extract_product_info,
-                        include_vendor_column=True,
-                    )
-                    event_name = "partial_export_done" if stopped or error else "export_done"
-                    emit(
-                        {
-                            "event": event_name,
-                            "rows": len(rows),
-                            "output_path": str(Path(saved_path).expanduser().resolve()),
-                        }
-                    )
-                except Exception as exc:
-                    error = f"export failed: {exc}"
-                    error_type = type(exc).__name__
-                    error_stage = "export"
-                    error_traceback = traceback.format_exc()
-            result_queue.put(
-                {
-                    "event": "vendor_done",
-                    "vendor": vendor,
-                    "worker_id": worker_id,
-                    "success": not stopped and error is None,
-                    "stopped": stopped,
-                    "rows": len(rows),
-                    "output_path": saved_path or output_path,
-                    "session_file": session_file,
-                    "error": "stopped by signal" if stopped and error is None else error,
-                    "error_type": error_type,
-                    "stage": "stopped" if stopped else (error_stage or "done"),
-                    "traceback": error_traceback,
-                    "log_file": request.log_file,
-                    "url_count": len(items),
-                    "urls_done": len(rows),
-                }
-            )
-            if scraper:
-                scraper.close()
 
 
 def _active_summary(states: dict[str, dict[str, Any]]) -> list[str]:
@@ -645,8 +661,8 @@ def _scrape_vendor_batches_subprocess(
         return TaskResult(False, output_dir, [], 0, warnings, failed_vendors, request.log_file, error, 4)
 
     base_session = str(Path(request.browser_options.session_file or default_session_path()).expanduser())
-    state_dir = tempfile.mkdtemp(prefix="trip_vendor_workers_")
-    session_temp_dir = tempfile.mkdtemp(prefix="trip_vendor_sessions_")
+    workers_dir = Path(output_dir).expanduser() / "_workers"
+    workers_dir.mkdir(parents=True, exist_ok=True)
     pending = list(groups)
     active: list[dict[str, Any]] = []
     active_states: dict[str, dict[str, Any]] = {}
@@ -659,27 +675,36 @@ def _scrape_vendor_batches_subprocess(
     force_terminate_sent = {"value": False}
     old_handlers = {}
     next_worker_id = {"value": 0}
+    stop_attempts = {"value": 0}
+
+    def request_active_workers_stop() -> None:
+        for entry in active:
+            _write_stop_request(entry.get("stop_file"))
 
     def terminate_active_workers() -> None:
         for entry in active:
             process = entry["process"]
-            if process.poll() is None:
-                try:
-                    process.terminate()
-                except Exception:
-                    pass
+            _terminate_process_tree(process)
 
     def stop_all(signum, _frame) -> None:
+        stop_attempts["value"] += 1
         if not stop_requested["value"]:
             stop_started_at["value"] = time.monotonic()
         stop_requested["value"] = True
-        reporter(
-            {
-                "event": "stop_requested",
-                "message": f"received signal {signum}; graceful stop requested",
-                "grace_seconds": request.stop_grace_seconds,
-            }
-        )
+        if stop_attempts["value"] == 1:
+            request_active_workers_stop()
+            reporter(
+                {
+                    "event": "stop_requested",
+                    "message": f"received signal {signum}; stop files written",
+                    "grace_seconds": request.stop_grace_seconds,
+                    "mode": "file",
+                }
+            )
+            return
+        force_terminate_sent["value"] = True
+        reporter({"event": "warning", "message": f"received signal {signum}; terminating worker process trees"})
+        terminate_active_workers()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         old_handlers[sig] = signal.getsignal(sig)
@@ -689,51 +714,42 @@ def _scrape_vendor_batches_subprocess(
         next_worker_id["value"] += 1
         worker_id = next_worker_id["value"]
         output_path = request.output_path if len(groups) == 1 and request.output_path else _vendor_output_path(group, output_dir, timestamp)
-        output_path = _expand_output_path(output_path)
-        session_file = _copy_session_to_temp(base_session, session_temp_dir, worker_id)
-        items_file = _worker_items_path(group, state_dir, worker_id)
-        result_file = _worker_result_path(group, state_dir, worker_id)
-        _write_json(items_file, [_scrape_item_to_dict(item) for item in group["items"]])
-        command = _build_worker_command(
+        spec = _create_worker_spec(
             request=request,
-            vendor=group["vendor"],
-            items_file=items_file,
             output_path=output_path,
-            result_file=result_file,
-            session_file=session_file,
+            group=group,
+            worker_id=worker_id,
+            workers_dir=workers_dir,
+            base_session=base_session,
         )
         reporter({"event": "worker_spawn_started", "vendor": group["vendor"], "worker_id": worker_id, "message": "spawning independent worker"})
-        process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        process = subprocess.Popen(spec["command"], **_worker_popen_kwargs())
         reporter(
             {
                 "event": "vendor_started",
                 "vendor": group["vendor"],
                 "worker_id": worker_id,
                 "url_count": len(group["items"]),
+                "worker_dir": spec["worker_dir"],
             }
         )
         active_states[group["vendor"]] = {"total": len(group["items"]), "current_index": 0, "stage": "running"}
         if request.startup_stagger > 0:
             time.sleep(request.startup_stagger)
-        return {
-            "process": process,
-            "group": group,
-            "worker_id": worker_id,
-            "output_path": output_path,
-            "result_file": result_file,
-            "session_file": session_file,
-            "started_at": time.monotonic(),
-        }
+        spec["process"] = process
+        spec["started_at"] = time.monotonic()
+        return spec
 
     try:
-        while pending and len(active) < workers:
+        while pending and len(active) < workers and not stop_requested["value"]:
             active.append(start_next(pending.pop(0)))
 
         while active:
             if should_stop and should_stop():
                 if not stop_requested["value"]:
                     stop_started_at["value"] = time.monotonic()
-                    reporter({"event": "stop_requested", "message": "stop requested", "grace_seconds": request.stop_grace_seconds})
+                    request_active_workers_stop()
+                    reporter({"event": "stop_requested", "message": "stop files written", "grace_seconds": request.stop_grace_seconds, "mode": "file"})
                 stop_requested["value"] = True
             if stop_requested["value"] and stop_started_at["value"] is not None:
                 if (
@@ -742,7 +758,7 @@ def _scrape_vendor_batches_subprocess(
                     and time.monotonic() - stop_started_at["value"] > request.stop_grace_seconds
                 ):
                     force_terminate_sent["value"] = True
-                    reporter({"event": "warning", "message": "stop grace period exceeded; terminating remaining workers"})
+                    reporter({"event": "warning", "message": "stop grace period exceeded; terminating worker process trees"})
                     terminate_active_workers()
 
             still_active = []
@@ -762,6 +778,10 @@ def _scrape_vendor_batches_subprocess(
                     result.setdefault("vendor", vendor)
                     result.setdefault("output_path", entry["output_path"])
                     result.setdefault("session_file", entry["session_file"])
+                    result.setdefault("worker_dir", entry["worker_dir"])
+                    result.setdefault("profile_dir", entry["profile_dir"])
+                    result.setdefault("driver_executable_path", entry["driver_executable_path"])
+                    result.setdefault("stop_file", entry["stop_file"])
                     result.setdefault("url_count", len(entry["group"]["items"]))
                     result.setdefault("exitcode", process.returncode)
                 else:
@@ -773,6 +793,10 @@ def _scrape_vendor_batches_subprocess(
                         "rows": 0,
                         "output_path": entry["output_path"],
                         "session_file": entry["session_file"],
+                        "worker_dir": entry["worker_dir"],
+                        "profile_dir": entry["profile_dir"],
+                        "driver_executable_path": entry["driver_executable_path"],
+                        "stop_file": entry["stop_file"],
                         "error": f"worker exited with code {process.returncode} without result file",
                         "error_type": "MissingWorkerResult",
                         "stage": "worker_exit",
@@ -825,8 +849,6 @@ def _scrape_vendor_batches_subprocess(
         for sig, handler in old_handlers.items():
             signal.signal(sig, handler)
         terminate_active_workers()
-        shutil.rmtree(state_dir, ignore_errors=True)
-        shutil.rmtree(session_temp_dir, ignore_errors=True)
 
 
 def scrape_vendor_batches(
@@ -847,318 +869,6 @@ def scrape_vendor_batches(
         progress_callback=progress_callback,
         rows_callback=rows_callback,
     )
-    multiprocessing.freeze_support()
-    try:
-        items = load_items(request)
-        groups = _vendor_groups(items)
-        workers = _resolve_worker_count(request.workers, len(groups))
-    except Exception as exc:
-        return TaskResult(success=False, error=str(exc), exit_code=2)
-
-    warnings = load_excel_items(request.excel_input)[1] if request.excel_input else []
-    for warning in warnings:
-        reporter({"event": "warning", "message": warning})
-
-    timestamp = datetime.now().strftime("%y%m%d-%H%M")
-    if request.output_dir:
-        output_dir = _expand_output_path(request.output_dir)
-    elif output_base_dir:
-        output_dir = str(Path(output_base_dir).expanduser() / "trip_vendor_results" / timestamp)
-    else:
-        output_dir = default_vendor_output_dir(timestamp=timestamp)
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-    if request.log_file:
-        Path(request.log_file).expanduser().parent.mkdir(parents=True, exist_ok=True)
-
-    session_temp_dir: str | None = None
-    stop_event = multiprocessing.Event()
-    active: list[dict[str, Any]] = []
-    stop_requested = {"value": False}
-    stop_started_at = {"value": None}
-    stop_attempts = {"value": 0}
-    force_terminate_sent = {"value": False}
-    old_handlers = {}
-
-    def terminate_active_workers() -> None:
-        for entry in active:
-            process = entry["process"]
-            if process.is_alive():
-                process.terminate()
-
-    def stop_all(signum, _frame) -> None:
-        stop_attempts["value"] += 1
-        if stop_attempts["value"] == 1:
-            if not stop_requested["value"]:
-                stop_started_at["value"] = time.monotonic()
-            stop_requested["value"] = True
-            stop_event.set()
-            reporter(
-                {
-                    "event": "stop_requested",
-                    "message": f"received signal {signum}; graceful stop requested",
-                    "grace_seconds": request.stop_grace_seconds,
-                    "attempt": 1,
-                    "mode": "graceful",
-                }
-            )
-            return
-        force_terminate_sent["value"] = True
-        reporter(
-            {
-                "event": "force_stop_requested",
-                "message": f"received signal {signum}; forcing remaining workers to terminate",
-                "attempt": stop_attempts["value"],
-                "mode": "force",
-            }
-        )
-        terminate_active_workers()
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        old_handlers[sig] = signal.getsignal(sig)
-        signal.signal(sig, stop_all)
-
-    total_urls = sum(len(group["items"]) for group in groups)
-    reporter(
-        {
-            "event": "run_started",
-            "mode": "excel",
-            "run_mode": run_mode,
-            "vendor_count": len(groups),
-            "url_count": total_urls,
-            "workers": workers,
-            "headless": request.browser_options.headless,
-            "rating_only": request.rating_only,
-            "extract_real_price": request.extract_real_price,
-            "extract_product_info": request.extract_product_info,
-            "output_dir": str(Path(output_dir).expanduser().resolve()),
-            "log_file": str(Path(request.log_file).expanduser().resolve()) if request.log_file else None,
-        }
-    )
-    _preflight(request, reporter)
-    try:
-        _prepare_browser_runtime(request, reporter)
-    except BrowserStartupError as exc:
-        failed_vendors = [str(group["vendor"]) for group in groups]
-        error = str(exc)
-        if exc.suggestion:
-            error = f"{error}; suggestion: {exc.suggestion}"
-        return TaskResult(False, output_dir, [], 0, warnings, failed_vendors, request.log_file, error, 4)
-    if stop_requested["value"]:
-        return TaskResult(False, output_dir, [], 0, warnings, [], request.log_file, "stopped by signal", 130)
-
-    base_session = str(Path(request.browser_options.session_file or default_session_path()).expanduser())
-    session_temp_dir = tempfile.mkdtemp(prefix="trip_vendor_sessions_")
-    result_queue = multiprocessing.Queue()
-    pending = list(groups)
-    active_states: dict[str, dict[str, Any]] = {}
-    results: list[dict[str, Any]] = []
-    output_paths: list[str] = []
-    completed_groups = 0
-    urls_done = 0
-    failed_urls = 0
-    worker_results: dict[int, dict[str, Any]] = {}
-
-    def start_next(index: int, group: dict[str, Any]) -> dict[str, Any]:
-        output_path = request.output_path if len(groups) == 1 and request.output_path else _vendor_output_path(group, output_dir, timestamp)
-        output_path = _expand_output_path(output_path)
-        session_file = _copy_session_to_temp(base_session, session_temp_dir, index)
-        worker_request = _worker_request(request, output_path, session_file)
-        reporter({"event": "worker_spawn_started", "vendor": group["vendor"], "worker_id": index, "message": "spawning worker"})
-        process = multiprocessing.Process(
-            target=_scrape_vendor_worker,
-            args=(index, group["vendor"], group["items"], worker_request, output_path, session_file, result_queue, total_urls, stop_event),
-            daemon=False,
-        )
-        process.start()
-        reporter({"event": "vendor_started", "vendor": group["vendor"], "worker_id": index, "url_count": len(group["items"])})
-        active_states[group["vendor"]] = {"total": len(group["items"]), "current_index": 0, "stage": "spawned"}
-        if request.startup_stagger > 0:
-            time.sleep(request.startup_stagger)
-        return {"process": process, "group": group, "output_path": output_path, "session_file": session_file, "worker_id": index, "started_at": time.monotonic()}
-
-    try:
-        index = 0
-        while pending and len(active) < workers:
-            index += 1
-            active.append(start_next(index, pending.pop(0)))
-
-        while active:
-            if should_stop and should_stop():
-                if not stop_requested["value"]:
-                    stop_started_at["value"] = time.monotonic()
-                    reporter(
-                        {
-                            "event": "stop_requested",
-                            "message": "stop requested",
-                            "grace_seconds": request.stop_grace_seconds,
-                        }
-                    )
-                stop_requested["value"] = True
-                stop_event.set()
-            if stop_requested["value"] and stop_started_at["value"] is not None:
-                if (
-                    not force_terminate_sent["value"]
-                    and request.stop_grace_seconds >= 0
-                    and time.monotonic() - stop_started_at["value"] > request.stop_grace_seconds
-                ):
-                    force_terminate_sent["value"] = True
-                    reporter({"event": "warning", "message": "stop grace period exceeded; terminating remaining workers"})
-                    terminate_active_workers()
-
-            try:
-                message = result_queue.get(timeout=0.5)
-            except queue.Empty:
-                message = None
-
-            if message:
-                event = message.get("event")
-                vendor = message.get("vendor")
-                if vendor in active_states:
-                    if event == "url_started":
-                        active_states[vendor]["current_index"] = message.get("url_index")
-                        active_states[vendor]["stage"] = "open"
-                        message["global_done"] = urls_done
-                        message["global_total"] = total_urls
-                    elif event == "url_done":
-                        active_states[vendor]["current_index"] = message.get("url_index")
-                        active_states[vendor]["stage"] = "done"
-                        urls_done += 1
-                        message["global_done"] = urls_done
-                        message["global_total"] = total_urls
-                    elif event == "url_failed":
-                        active_states[vendor]["current_index"] = message.get("url_index")
-                        active_states[vendor]["stage"] = "failed"
-                        urls_done += 1
-                        failed_urls += 1
-                        message["global_done"] = urls_done
-                        message["global_total"] = total_urls
-                    elif event == "log" and message.get("stage"):
-                        active_states[vendor]["stage"] = message.get("stage")
-                    elif event in {
-                        "worker_ready",
-                        "runtime_init_started",
-                        "chrome_detect_started",
-                        "chrome_detect_done",
-                        "chrome_detect_failed",
-                        "browser_start_started",
-                        "browser_start_done",
-                        "browser_start_failed",
-                        "worker_failed",
-                    }:
-                        active_states[vendor]["stage"] = message.get("stage") or event
-
-                if event == "vendor_done":
-                    worker_results[message.get("worker_id")] = message
-                    results.append(message)
-                    completed_groups += 1
-                    active_states.pop(vendor, None)
-                    if progress_callback:
-                        progress_callback(completed_groups, len(groups))
-                    if message.get("output_path") and (message.get("success") or int(message.get("rows") or 0) > 0):
-                        output_paths.append(message["output_path"])
-                    reporter(message)
-                else:
-                    reporter(message)
-
-                _emit_progress(
-                    reporter,
-                    states=active_states,
-                    completed_groups=completed_groups,
-                    vendor_count=len(groups),
-                    urls_done=urls_done,
-                    url_count=total_urls,
-                    failed=failed_urls + len([result for result in results if not result.get("success")]),
-                )
-
-            still_active = []
-            for entry in active:
-                process = entry["process"]
-                if process.is_alive():
-                    still_active.append(entry)
-                    continue
-                process.join(timeout=0)
-                vendor = entry["group"]["vendor"]
-                has_result = entry["worker_id"] in worker_results
-                if not has_result:
-                    ended_at = entry.setdefault("ended_at", time.monotonic())
-                    if time.monotonic() - ended_at < 1.0:
-                        still_active.append(entry)
-                        continue
-                    exitcode = process.exitcode
-                    stage = active_states.get(vendor, {}).get("stage") or "worker_exit"
-                    reason = (
-                        f"missing vendor_done from worker after exitcode {exitcode}"
-                        if exitcode in (0, None)
-                        else f"worker exited with code {exitcode}"
-                    )
-                    worker_failed = {
-                        "event": "worker_failed",
-                        "vendor": vendor,
-                        "worker_id": entry["worker_id"],
-                        "stage": stage,
-                        "exitcode": exitcode,
-                        "success": False,
-                        "rows": 0,
-                        "output_path": entry["output_path"],
-                        "session_file": entry["session_file"],
-                        "log_file": request.log_file,
-                        "error": reason,
-                        "error_type": "MissingVendorDone" if exitcode in (0, None) else "WorkerProcessExited",
-                        "url_count": len(entry["group"]["items"]),
-                        "urls_done": 0,
-                    }
-                    reporter(worker_failed)
-                    failure = {
-                        "event": "vendor_done",
-                        "vendor": vendor,
-                        "worker_id": entry["worker_id"],
-                        "success": False,
-                        "rows": 0,
-                        "output_path": entry["output_path"],
-                        "session_file": entry["session_file"],
-                        "log_file": request.log_file,
-                        "error": reason,
-                        "error_type": worker_failed["error_type"],
-                        "stage": stage,
-                        "exitcode": exitcode,
-                        "url_count": len(entry["group"]["items"]),
-                        "urls_done": 0,
-                    }
-                    worker_results[entry["worker_id"]] = failure
-                    results.append(failure)
-                    completed_groups += 1
-                    active_states.pop(vendor, None)
-                    reporter(failure)
-                if pending and not stop_requested["value"]:
-                    index += 1
-                    still_active.append(start_next(index, pending.pop(0)))
-            active = still_active
-
-        successful_session = next((result.get("session_file") for result in results if result.get("success") and result.get("session_file")), None)
-        if successful_session and Path(successful_session).exists():
-            base_path = Path(base_session)
-            base_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(successful_session, base_path)
-
-        rows = sum(int(result.get("rows") or 0) for result in results)
-        failures = [result for result in results if not result.get("success")]
-        failed_vendors = [str(result.get("vendor")) for result in failures if result.get("vendor")]
-        if stop_requested["value"]:
-            return TaskResult(False, output_dir, output_paths, rows, warnings, failed_vendors, request.log_file, "stopped by signal", 130)
-        if failures:
-            error = "; ".join(f"{failure.get('vendor')}: {failure.get('error')}" for failure in failures)
-            return TaskResult(False, output_dir, output_paths, rows, warnings, failed_vendors, request.log_file, error, 4)
-        if rows == 0 and groups:
-            failed_vendors = [str(group["vendor"]) for group in groups]
-            error = "no rows captured and no successful worker output"
-            return TaskResult(False, output_dir, output_paths, rows, warnings, failed_vendors, request.log_file, error, 4)
-        return TaskResult(True, output_dir, output_paths, rows, warnings, [], request.log_file, None, 0)
-    finally:
-        for sig, handler in old_handlers.items():
-            signal.signal(sig, handler)
-        terminate_active_workers()
-        if session_temp_dir:
-            shutil.rmtree(session_temp_dir, ignore_errors=True)
 
 
 def scrape_xxx(request: TaskRequest, reporter: Reporter, run_mode: str | None = None) -> TaskResult:

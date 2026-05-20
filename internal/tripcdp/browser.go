@@ -1,0 +1,2070 @@
+package tripcdp
+
+import (
+	"bufio"
+	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/go-rod/rod"
+	"github.com/go-rod/rod/lib/proto"
+)
+
+type tripScraper struct {
+	request           TaskRequest
+	emit              Reporter
+	vendor            string
+	workerID          int
+	globalTotal       int
+	browser           *rod.Browser
+	page              *rod.Page
+	userDataDir       string
+	removeUserDataDir bool
+	maxSKULayers      int
+	processed         int
+	driverRuntime     *chromeDriverRuntime
+	directChrome      *exec.Cmd
+	storageApplied    map[string]bool
+	restartAfterURL   bool
+	restartReason     string
+	riskProtection    bool
+}
+
+type skuLayerInfo struct {
+	Index int
+	Title string
+}
+
+type skuOption struct {
+	Text  string `json:"text"`
+	Layer int    `json:"layer"`
+	ID    string `json:"id"`
+}
+
+type priceBundle struct {
+	DisplayPrice    string `json:"display_price"`
+	RealPrice       string `json:"real_price"`
+	PromoTag        string `json:"promo_tag"`
+	FooterText      string `json:"footer_text"`
+	FooterSignature string `json:"footer_signature"`
+	SampleAtMS      int    `json:"sample_at_ms"`
+}
+
+type baseRatingBundle struct {
+	BookingCount   string `json:"booking_count"`
+	ReviewCount    string `json:"review_count"`
+	Score          string `json:"score"`
+	Customer       string `json:"customer"`
+	Convenience    string `json:"convenience"`
+	Signal         string `json:"signal"`
+	BadReviewCount string `json:"bad_review_count"`
+	ProductInfo    string `json:"product_info"`
+	Signature      string `json:"signature"`
+	SampleAtMS     int    `json:"sample_at_ms"`
+}
+
+type pageSnapshot struct {
+	URL             string `json:"url"`
+	ReadyState      string `json:"ready_state"`
+	BodyTextLength  int    `json:"body_text_length"`
+	Title           string `json:"title"`
+	HasProductTitle bool   `json:"has_product_title"`
+	HasSKU          bool   `json:"has_sku"`
+	HasPrice        bool   `json:"has_price"`
+	HasScore        bool   `json:"has_score"`
+	RiskChallenge   bool   `json:"risk_challenge"`
+	RiskKind        string `json:"risk_kind"`
+	HTTPStatus      int    `json:"http_status"`
+	ResponseURL     string `json:"response_url"`
+	BodyPreview     string `json:"body_preview"`
+	EvalError       string `json:"eval_error"`
+}
+
+type navigationMonitor struct {
+	mu             sync.Mutex
+	mainStatus     int
+	mainURL        string
+	mainStatusText string
+	stop           func()
+	cancel         context.CancelFunc
+}
+
+const currentPriceBundleJS = `(displaySelectors, includeReal) => {
+	const realSelector = 'div[class*="price-comp_m_footer_left_total"] div div div span span';
+	const footerSelector = 'div[class*="price-comp_m_footer_left"]';
+	const promoSelector = footerSelector + ' div span';
+	const isVisible = (el) => {
+		if (!el) return false;
+		const style = window.getComputedStyle(el);
+		if (!style || style.display === 'none' || style.visibility === 'hidden') return false;
+		return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+	};
+	const textOf = (el) => (el && (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ')) || '';
+	const validPrice = (text) => text && text.includes('HK$') && /^HK\$\s*[0-9,]+(?:\.\d+)?/.test(text);
+	let displayPrice = '';
+	for (const selector of displaySelectors) {
+		for (const el of document.querySelectorAll(selector)) {
+			if (!isVisible(el)) continue;
+			const text = textOf(el);
+			if (validPrice(text)) {
+				displayPrice = text;
+				break;
+			}
+		}
+		if (displayPrice) break;
+	}
+	if (!displayPrice) {
+		for (const el of document.querySelectorAll('span,div')) {
+			if (!isVisible(el)) continue;
+			const text = textOf(el);
+			if (validPrice(text)) {
+				displayPrice = text;
+				break;
+			}
+		}
+	}
+	let realPrice = '';
+	if (includeReal) {
+		for (const el of document.querySelectorAll(realSelector)) {
+			if (!isVisible(el)) continue;
+			const text = textOf(el);
+			if (text) {
+				realPrice = text;
+				break;
+			}
+		}
+	}
+	let footerText = '';
+	for (const el of document.querySelectorAll(footerSelector)) {
+		if (!isVisible(el)) continue;
+		const text = textOf(el);
+		if (text) {
+			footerText = footerText ? footerText + ' | ' + text : text;
+		}
+	}
+	let promoTag = '';
+	for (const el of document.querySelectorAll(promoSelector)) {
+		if (!isVisible(el)) continue;
+		const text = textOf(el);
+		if (text && !text.includes('HK$') && (text.includes('減') || text.includes('%') || text.includes('折'))) {
+			promoTag = text;
+			break;
+		}
+	}
+	return {display_price: displayPrice, real_price: realPrice, promo_tag: promoTag, footer_text: footerText, footer_signature: [displayPrice, realPrice, promoTag, footerText].join('||')};
+}`
+
+const baseRatingBundleJS = `(includeProductInfo) => {
+	const isVisible = (el) => {
+		if (!el) return false;
+		const style = window.getComputedStyle(el);
+		if (!style || style.display === 'none' || style.visibility === 'hidden') return false;
+		return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+	};
+	const textOf = (el) => (el && (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ')) || '';
+	const firstText = (selectors) => {
+		for (const selector of selectors) {
+			for (const el of document.querySelectorAll(selector)) {
+				if (!isVisible(el)) continue;
+				const text = textOf(el);
+				if (text) return text;
+			}
+		}
+		return '';
+	};
+	const numberText = (text) => {
+		const match = (text || '').match(/([0-9,]+(?:\.\d+)?)/);
+		return match ? match[1].replace(/,/g, '') : '';
+	};
+	const scoreFromText = (text) => {
+		const match = (text || '').match(/(\d+(?:\.\d+)?)/);
+		return match ? match[1] : '';
+	};
+	const scoreForLabels = (labels) => {
+		const exactElements = Array.from(document.querySelectorAll('div,span')).filter((el) => {
+			if (!isVisible(el)) return false;
+			return labels.includes(textOf(el));
+		});
+		for (const labelEl of exactElements) {
+			const sibling = labelEl.nextElementSibling;
+			const siblingScore = scoreFromText(textOf(sibling));
+			if (siblingScore) return siblingScore;
+			const parent = labelEl.parentElement;
+			if (!parent) continue;
+			const scoreEl = parent.querySelector('[class*="socre"], [class*="score"], span');
+			if (scoreEl && scoreEl !== labelEl) {
+				const score = scoreFromText(textOf(scoreEl));
+				if (score) return score;
+			}
+			const label = textOf(labelEl);
+			const pattern = new RegExp(label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\\\s+(\\\\d+(?:\\\\.\\\\d+)?)');
+			const match = textOf(parent).match(pattern);
+			if (match) return match[1];
+		}
+		for (const row of document.querySelectorAll('div[class*="ct-review-list-subitem-title"]')) {
+			if (!isVisible(row)) continue;
+			const rowText = textOf(row);
+			if (!labels.some((label) => rowText.includes(label))) continue;
+			const score = scoreFromText(rowText);
+			if (score) return score;
+		}
+		return '';
+	};
+	const bookingText = firstText(['span[testid="saleInfoId"]']);
+	const reviewText = firstText(['span[testid="productdetail-productInfo-commentCountDesc"]']);
+	const score = scoreFromText(firstText(['span[testid="productdetail-productInfo-commentScore"]', '[class*="commentScore"]']));
+	let badReviewCount = '';
+	for (const el of document.querySelectorAll('div[class*="ct-review-list-filiter-label-item"]')) {
+		if (!isVisible(el)) continue;
+		const text = textOf(el);
+		if (text.includes('中性評價及負面評價') || text.includes('中性评价及负面评价') || text.toLowerCase().includes('negative') || text.toLowerCase().includes('bad')) {
+			badReviewCount = numberText(text);
+			if (badReviewCount) break;
+		}
+	}
+	let productInfo = '';
+	if (includeProductInfo) {
+		for (const selector of ['#group_1001 > div > div > div[class*="style_content_box"] > div > div', 'div[class*="activity_product_detail_html_box"]', '#group_1001']) {
+			for (const el of document.querySelectorAll(selector)) {
+				if (!isVisible(el)) continue;
+				let text = textOf(el);
+				if (!text) {
+					text = Array.from(el.querySelectorAll('p')).map((p) => textOf(p)).filter(Boolean).join('\n');
+				}
+				if (text) {
+					productInfo = text;
+					break;
+				}
+			}
+			if (productInfo) break;
+		}
+	}
+	const out = {
+		booking_count: numberText(bookingText),
+		review_count: numberText(reviewText),
+		score,
+		customer: scoreForLabels(['客戶服務', '客户服务', 'Customer Service']),
+		convenience: scoreForLabels(['方便程度', 'Convenience']),
+		signal: scoreForLabels(['訊號狀態', '讯号状态', 'Signal']),
+		bad_review_count: badReviewCount,
+		product_info: productInfo,
+	};
+	out.signature = [out.score, out.customer, out.convenience, out.signal, out.bad_review_count, out.product_info].join('||');
+	return out;
+}`
+
+func newTripScraper(request TaskRequest, emit Reporter, vendor string, workerID int, globalTotal int) *tripScraper {
+	return &tripScraper{request: request, emit: emit, vendor: vendor, workerID: workerID, globalTotal: globalTotal, storageApplied: map[string]bool{}}
+}
+
+func (s *tripScraper) start(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if s.request.BrowserOptions.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.request.BrowserOptions.Timeout)
+		defer cancel()
+	}
+	s.emit(Event{"event": "worker_ready", "message": "worker ready"})
+	s.emit(Event{"event": "chrome_detect_started", "stage": "chrome_detect", "message": "detecting Chrome"})
+	started := time.Now()
+	driverInfo, err := prepareUndetectedChromeDriver(ctx, s.request.BrowserOptions)
+	if err != nil {
+		s.emit(Event{"event": "chrome_detect_failed", "stage": "chrome_detect", "error_type": fmt.Sprintf("%T", err), "error": err.Error()})
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.emit(Event{"event": "chrome_detect_done", "stage": "chrome_detect", "message": fmt.Sprintf("chrome=%s version_main=%s", driverInfo.ChromePath, valueOr(driverInfo.VersionMain, "unknown")), "chrome_path": driverInfo.ChromePath, "version_main": driverInfo.VersionMain})
+	s.emit(Event{"event": "browser_prepare", "stage": "driver_prepare", "message": fmt.Sprintf("chromedriver=%s reused=%v", driverInfo.DriverPath, driverInfo.DriverReused), "driver_path": driverInfo.DriverPath, "driver_cache_dir": driverInfo.CacheDir, "driver_reused": driverInfo.DriverReused, "driver_version": driverInfo.VersionFull, "elapsed_ms": driverInfo.PrepareMS})
+	s.emit(Event{"event": "browser_start_started", "message": "starting Chrome"})
+	profileSourceDir := resolveChromeUserDataDir(s.request.BrowserOptions.UserDataDir)
+	userDataDir := profileSourceDir
+	profileMode := "configured_profile"
+	removeUserDataDir := false
+	if isDefaultChromeUserDataDir(s.request.BrowserOptions.UserDataDir) {
+		userDataDir, err = os.MkdirTemp("", "trip_cdp_chrome_profile_*")
+		if err != nil {
+			return err
+		}
+		profileMode = "copied_local_profile"
+		removeUserDataDir = true
+		s.emit(Event{"event": "browser_prepare", "stage": "profile_copy", "message": "copying local Chrome profile for remote debugging", "source_profile_dir": profileSourceDir, "runtime_profile_dir": userDataDir, "profile_dir": userDataDir, "profile_mode": profileMode})
+		if err := copyChromeProfile(profileSourceDir, userDataDir); err != nil {
+			s.close()
+			return err
+		}
+	} else {
+		if err := os.MkdirAll(userDataDir, 0o755); err != nil {
+			return err
+		}
+		if chromeProfileLocked(userDataDir) {
+			return fmt.Errorf("Chrome profile is already in use: %s; close Chrome or use a copied worker profile", userDataDir)
+		}
+	}
+	if err := fixChromeExitType(userDataDir); err != nil {
+		s.emit(Event{"event": "warning", "stage": "browser_start", "message": "failed to fix Chrome profile exit_type", "error": err.Error(), "profile_dir": userDataDir})
+	}
+	s.userDataDir = userDataDir
+	s.removeUserDataDir = removeUserDataDir
+	debuggerPort, err := freeTCPPort()
+	if err != nil {
+		s.close()
+		return err
+	}
+	args := chromeArguments(userDataDir, s.request.BrowserOptions.Headless, debuggerPort, s.request.BrowserOptions.Language)
+	cmd := exec.Command(driverInfo.ChromePath, args...)
+	setProcessGroup(cmd)
+	if err := cmd.Start(); err != nil {
+		s.emit(Event{"event": "browser_start_failed", "message": "Chrome subprocess failed", "stage": "browser_start", "error_type": fmt.Sprintf("%T", err), "error": err.Error(), "elapsed_ms": elapsedMS(started)})
+		s.close()
+		return err
+	}
+	s.directChrome = cmd
+	go func() { _ = cmd.Wait() }()
+	debuggerAddress := fmt.Sprintf("127.0.0.1:%d", debuggerPort)
+	controlURL, err := waitChromeDebugger(ctx, debuggerAddress)
+	if err != nil {
+		s.emit(Event{"event": "browser_start_failed", "message": "Chrome debugger failed", "stage": "browser_start", "error_type": fmt.Sprintf("%T", err), "error": err.Error(), "elapsed_ms": elapsedMS(started)})
+		s.close()
+		return err
+	}
+	s.emit(Event{"event": "browser_prepare", "stage": "browser_start", "message": "profile=" + userDataDir, "source_profile_dir": profileSourceDir, "runtime_profile_dir": userDataDir, "profile_dir": userDataDir, "profile_mode": profileMode, "debugger_address": debuggerAddress})
+	runtime, err := startChromeDriver(ctx, driverInfo.DriverPath)
+	if err != nil {
+		s.emit(Event{"event": "browser_start_failed", "message": "chromedriver start failed", "stage": "browser_start", "error_type": fmt.Sprintf("%T", err), "error": err.Error(), "elapsed_ms": elapsedMS(started)})
+		s.close()
+		return err
+	}
+	s.driverRuntime = runtime
+	if err := ctx.Err(); err != nil {
+		s.close()
+		return err
+	}
+	if err := runtime.attachSession(ctx, debuggerAddress); err != nil {
+		s.emit(Event{"event": "browser_start_failed", "message": "chromedriver attach failed", "stage": "browser_start", "error_type": fmt.Sprintf("%T", err), "error": err.Error(), "elapsed_ms": elapsedMS(started)})
+		s.close()
+		return err
+	}
+	s.emit(Event{"event": "browser_prepare", "stage": "browser_start", "message": "chromedriver attached to debugger", "debugger_address": runtime.debuggerAddress})
+	browser := rod.New().ControlURL(controlURL)
+	if s.request.BrowserOptions.Timeout > 0 {
+		browser = browser.Timeout(s.request.BrowserOptions.Timeout)
+	}
+	if err := connectRodBrowser(ctx, browser, runtime); err != nil {
+		s.emit(Event{"event": "browser_start_failed", "message": "Chrome connect failed", "stage": "browser_start", "error_type": fmt.Sprintf("%T", err), "error": err.Error(), "elapsed_ms": elapsedMS(started)})
+		s.close()
+		return err
+	}
+	s.browser = browser
+	s.emit(Event{"event": "browser_prepare", "stage": "browser_start", "message": "rod connected"})
+	page, err := createRodPage(ctx, browser, runtime, s.request.BrowserOptions.Language)
+	if err != nil {
+		s.emit(Event{"event": "browser_start_failed", "message": "Chrome page failed", "stage": "browser_start", "error_type": fmt.Sprintf("%T", err), "error": err.Error(), "elapsed_ms": elapsedMS(started)})
+		s.close()
+		return err
+	}
+	s.page = page
+	if err := ctx.Err(); err != nil {
+		s.close()
+		return err
+	}
+	s.emit(Event{"event": "log", "stage": "session_load", "message": "session load deferred until target navigation", "session_nav_skipped": true})
+	s.emit(Event{"event": "browser_start_done", "message": "Chrome started", "elapsed_ms": elapsedMS(started)})
+	return nil
+}
+
+func connectRodBrowser(ctx context.Context, browser *rod.Browser, runtime *chromeDriverRuntime) error {
+	errCh := make(chan error, 1)
+	go func() { errCh <- browser.Connect() }()
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+		if runtime != nil {
+			runtime.stop(context.Background())
+		}
+		_ = browser.Close()
+		return ctx.Err()
+	}
+}
+
+func createRodPage(ctx context.Context, browser *rod.Browser, runtime *chromeDriverRuntime, acceptLanguage string) (*rod.Page, error) {
+	pageCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	type result struct {
+		page *rod.Page
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		page, err := reusableRodPage(browser)
+		if err != nil || page == nil {
+			page, err = browser.Page(proto.TargetCreateTarget{})
+		}
+		ch <- result{page: page, err: err}
+	}()
+	select {
+	case result := <-ch:
+		if result.err == nil && result.page != nil {
+			_ = applyUCStealth(pageCtx, result.page, acceptLanguage)
+			closeUnusedBlankPages(browser, result.page)
+		}
+		return result.page, result.err
+	case <-pageCtx.Done():
+		go func() {
+			if runtime != nil {
+				runtime.stop(context.Background())
+			}
+			_ = browser.Close()
+		}()
+		return nil, pageCtx.Err()
+	}
+}
+
+func reusableRodPage(browser *rod.Browser) (*rod.Page, error) {
+	pages, err := browser.Pages()
+	if err != nil {
+		return nil, err
+	}
+	for _, page := range pages {
+		info, err := page.Info()
+		if err != nil {
+			continue
+		}
+		if isBlankPageURL(info.URL) {
+			return page, nil
+		}
+	}
+	return nil, nil
+}
+
+func closeUnusedBlankPages(browser *rod.Browser, keep *rod.Page) {
+	pages, err := browser.Pages()
+	if err != nil {
+		return
+	}
+	for _, page := range pages {
+		if keep != nil && page.TargetID == keep.TargetID {
+			continue
+		}
+		info, err := page.Info()
+		if err != nil || !isBlankPageURL(info.URL) {
+			continue
+		}
+		_ = page.Close()
+	}
+}
+
+func isBlankPageURL(pageURL string) bool {
+	pageURL = strings.TrimSpace(strings.ToLower(pageURL))
+	return pageURL == "" || pageURL == "about:blank" || strings.HasPrefix(pageURL, "chrome://newtab")
+}
+
+func (s *tripScraper) scrapeOne(ctx context.Context, item ScrapeItem, index int, total int) []map[string]string {
+	started := time.Now()
+	base := Event{"vendor": s.vendor, "worker_id": s.workerID, "url_index": index, "url_total": total, "url": item.URL, "global_total": s.globalTotal}
+	target := newNavigationTarget(item.URL)
+	s.restartAfterURL = false
+	s.restartReason = ""
+	s.emit(mergeEvent(Event{"event": "url_started", "first_trip_navigation_url": target.NavigateURL, "navigation_locale": target.Locale, "navigation_currency": target.Currency, "accept_language": target.AcceptLanguage, "session_nav_skipped": true}, base))
+	var lastSnapshot pageSnapshot
+	for attempt := 1; attempt <= 2; attempt++ {
+		if ctx.Err() != nil {
+			return nil
+		}
+		rows, snapshot, retry, err := s.scrapeOneAttempt(ctx, item, target, base, attempt)
+		lastSnapshot = snapshot
+		if err != nil {
+			return s.errorRows(item, err, started, base)
+		}
+		if !retry {
+			restartAfterURL := s.restartAfterURL
+			restartReason := s.restartReason
+			s.emit(mergeEvent(Event{"event": "url_done", "rows": len(rows), "elapsed_ms": elapsedMS(started), "final_url": snapshot.URL, "page_valid": isProductPageReady(snapshot), "page_retry_count": attempt - 1, "restart_after_url": restartAfterURL}, base))
+			if restartAfterURL {
+				_ = s.restartBrowser(ctx, restartReason)
+			}
+			return rows
+		}
+		if isWhaleguardSnapshot(snapshot) {
+			if attempt >= 2 {
+				break
+			}
+			cooldown := riskCooldownDelay(s.request.DelayOptions.Profile)
+			s.emit(mergeEvent(Event{"event": "risk_challenge_detected", "stage": "risk", "message": "whaleguard block; cooling down and retrying URL", "risk_kind": snapshot.RiskKind, "http_status": snapshot.HTTPStatus, "body_preview": snapshot.BodyPreview, "cooldown_ms": cooldown.Milliseconds(), "retry_after_risk": true, "risk_retry_count": attempt, "final_url": snapshot.URL}, base))
+			s.cleanupAfterURL()
+			if err := s.restartBrowserNoSessionSave(ctx, "whaleguard block"); err != nil {
+				return s.errorRows(item, err, started, base)
+			}
+			s.enableRiskProtection()
+			if !sleepFixed(ctx, cooldown) {
+				return nil
+			}
+			continue
+		}
+		s.emit(mergeEvent(Event{"event": "page_retry", "stage": "page_open", "message": "page did not load valid product content; restarting browser and retrying URL", "attempt": attempt, "max_attempts": 2, "snapshot": snapshot}, base))
+		if err := s.restartBrowser(ctx, "page unhealthy before extraction"); err != nil {
+			return s.errorRows(item, err, started, base)
+		}
+	}
+	if isWhaleguardSnapshot(lastSnapshot) {
+		s.emit(mergeEvent(Event{"event": "risk_challenge_detected", "stage": "risk", "message": "whaleguard block after retry", "risk_kind": lastSnapshot.RiskKind, "http_status": lastSnapshot.HTTPStatus, "body_preview": lastSnapshot.BodyPreview, "retry_after_risk": false, "risk_retry_count": 1, "final_url": lastSnapshot.URL}, base))
+		rows := []map[string]string{s.errorRow(item, "whaleguard block")}
+		s.emit(mergeEvent(Event{"event": "url_done", "rows": len(rows), "elapsed_ms": elapsedMS(started), "final_url": lastSnapshot.URL, "page_valid": false, "page_retry_count": 1, "restart_after_url": false, "risk_kind": lastSnapshot.RiskKind, "http_status": lastSnapshot.HTTPStatus}, base))
+		s.cleanupAfterURL()
+		_ = s.restartBrowserNoSessionSave(ctx, "whaleguard block after retry")
+		return rows
+	}
+	s.emit(mergeEvent(Event{"event": "page_unhealthy", "stage": "extract", "message": "页面未加载有效商品内容", "snapshot": lastSnapshot}, base))
+	rows := []map[string]string{s.errorRow(item, "页面未加载有效商品内容")}
+	s.emit(mergeEvent(Event{"event": "url_done", "rows": len(rows), "elapsed_ms": elapsedMS(started), "final_url": lastSnapshot.URL, "page_valid": false, "page_retry_count": 2, "restart_after_url": false}, base))
+	return rows
+}
+
+func (s *tripScraper) scrapeOneAttempt(ctx context.Context, item ScrapeItem, target navigationTarget, base Event, attempt int) ([]map[string]string, pageSnapshot, bool, error) {
+	s.emit(mergeEvent(Event{"event": "log", "stage": "page_open", "message": "opening URL", "attempt": attempt}, base))
+	sessionResult, err := loadSession(ctx, s.page, s.request.BrowserOptions.SessionFile, target.NavigateURL)
+	if err != nil {
+		s.emit(mergeEvent(Event{"event": "warning", "stage": "session_load", "message": "session load failed", "error": err.Error(), "session_nav_skipped": true}, base))
+	} else if sessionResult.Loaded {
+		s.emit(mergeEvent(Event{"event": "log", "stage": "session_load", "message": "session cookies loaded", "session_cookie_count": sessionResult.CookieCount, "session_nav_skipped": true}, base))
+	} else {
+		s.emit(mergeEvent(Event{"event": "log", "stage": "session_load", "message": "session not loaded or unavailable", "session_nav_skipped": true}, base))
+	}
+	if err := applyUCStealth(ctx, s.page, target.AcceptLanguage); err != nil && ctx.Err() != nil {
+		return nil, pageSnapshot{}, false, err
+	}
+	monitor := s.startNavigationMonitor(ctx)
+	if monitor != nil {
+		defer monitor.close()
+	}
+	if err := s.page.Context(ctx).Navigate(target.NavigateURL); err != nil {
+		return nil, pageSnapshot{}, false, err
+	}
+	_ = s.page.WaitLoad()
+	_ = s.waitReady(ctx)
+	navStatus, navURL, _ := monitor.snapshot()
+	if sessionResult.HasStorage && s.shouldApplySessionStorage(target.NavigateURL) {
+		if loaded, err := applySessionStorage(ctx, s.page, sessionResult.Data); err != nil {
+			s.emit(mergeEvent(Event{"event": "warning", "stage": "session_load", "message": "session storage load failed", "error": err.Error(), "session_nav_skipped": true}, base))
+		} else if loaded {
+			s.emit(mergeEvent(Event{"event": "log", "stage": "session_load", "message": "session storage loaded", "session_nav_skipped": true}, base))
+		}
+	}
+	if ctx.Err() != nil {
+		return nil, pageSnapshot{}, false, ctx.Err()
+	}
+	snapshot, waitMS := s.waitProductPageReady(ctx, 12*time.Second)
+	snapshot.withNavigationStatus(navStatus, navURL)
+	if isWhaleguardSnapshot(snapshot) {
+		s.emit(mergeEvent(Event{"event": "risk_challenge_detected", "stage": "page_open", "message": "whaleguard block detected during navigation", "risk_kind": snapshot.RiskKind, "http_status": snapshot.HTTPStatus, "body_preview": snapshot.BodyPreview, "final_url": snapshot.URL}, base))
+		return nil, snapshot, true, nil
+	}
+	if !isProductPageReady(snapshot) {
+		s.emit(mergeEvent(Event{"event": "page_unhealthy", "stage": "page_open", "message": "product DOM not ready after navigation", "wait_ms": waitMS, "snapshot": snapshot}, base))
+		return nil, snapshot, true, nil
+	}
+	if !sleepDelay(ctx, s.emit, "page_open", "page", s.request.DelayOptions.Page) {
+		return nil, snapshot, false, ctx.Err()
+	}
+	risk := s.detectRiskChallenge()
+	if len(risk.Scripts) > 0 {
+		s.emit(mergeEvent(Event{"event": "log", "stage": "risk", "message": "risk scripts detected", "risk_scripts_detected": risk.Scripts}, base))
+	}
+	if risk.Challenge {
+		snapshot = s.currentPageSnapshot()
+		snapshot.applyRisk(risk)
+		snapshot.withNavigationStatus(navStatus, navURL)
+		s.emit(mergeEvent(Event{"event": "risk_challenge_detected", "stage": "risk", "message": risk.Reason, "risk_kind": risk.Kind, "http_status": snapshot.HTTPStatus, "body_preview": risk.BodyPreview, "risk_scripts_detected": risk.Scripts, "final_url": snapshot.URL}, base))
+		if risk.Kind == "whaleguard" {
+			return nil, snapshot, true, nil
+		}
+		return []map[string]string{s.errorRow(item, risk.Reason)}, snapshot, false, nil
+	}
+	s.emit(mergeEvent(Event{"event": "log", "stage": "lazy_load", "message": "scrolling page"}, base))
+	s.scrollPage(ctx)
+	snapshot, waitMS = s.waitProductPageExtractable(ctx, 12*time.Second, s.request.RatingOnly)
+	snapshot.withNavigationStatus(navStatus, navURL)
+	if snapshot.RiskChallenge {
+		risk := s.detectRiskChallenge()
+		if risk.Challenge {
+			reason := firstNonEmpty(risk.Reason, "risk challenge detected after lazy-load scrolling")
+			snapshot.applyRisk(risk)
+			snapshot.withNavigationStatus(navStatus, navURL)
+			s.emit(mergeEvent(Event{"event": "risk_challenge_detected", "stage": "risk", "message": reason, "risk_kind": risk.Kind, "http_status": snapshot.HTTPStatus, "body_preview": risk.BodyPreview, "risk_scripts_detected": risk.Scripts, "final_url": snapshot.URL}, base))
+			if risk.Kind == "whaleguard" {
+				return nil, snapshot, true, nil
+			}
+			return []map[string]string{s.errorRow(item, reason)}, snapshot, false, nil
+		}
+		snapshot.RiskChallenge = false
+		snapshot.RiskKind = ""
+	}
+	if !isProductPageExtractable(snapshot, s.request.RatingOnly) {
+		s.emit(mergeEvent(Event{"event": "page_unhealthy", "stage": "lazy_load", "message": "product DOM is not extractable after lazy-load scrolling", "wait_ms": waitMS, "snapshot": snapshot}, base))
+		return nil, snapshot, true, nil
+	}
+	s.emit(mergeEvent(Event{"event": "log", "stage": "extract", "message": "extracting page"}, base))
+	rows, valid := s.extractRows(ctx, item, snapshot)
+	if !valid {
+		snapshot = s.currentPageSnapshot()
+		s.emit(mergeEvent(Event{"event": "page_unhealthy", "stage": "extract", "message": "product DOM unavailable during extraction", "snapshot": snapshot}, base))
+		return nil, snapshot, true, nil
+	}
+	return rows, snapshot, false, nil
+}
+
+func (s *tripScraper) errorRows(item ScrapeItem, err error, started time.Time, base Event) []map[string]string {
+	s.emit(mergeEvent(Event{"event": "url_failed", "error": err.Error(), "elapsed_ms": elapsedMS(started)}, base))
+	return []map[string]string{s.errorRow(item, err.Error())}
+}
+
+func (s *tripScraper) extractRows(ctx context.Context, item ScrapeItem, snapshot pageSnapshot) ([]map[string]string, bool) {
+	baseRow := s.extractBaseRow(ctx, item)
+	if s.request.RatingOnly {
+		s.emit(Event{"event": "log", "stage": "sku", "message": "rating-only mode; skipping SKU price extraction"})
+		return []map[string]string{baseRow}, isProductPageExtractable(snapshot, true)
+	}
+	oldMax := s.maxSKULayers
+	combinations := s.extractAllSKUPrices(ctx)
+	if s.maxSKULayers > oldMax {
+		s.emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("SKU layers increased to %d", s.maxSKULayers)})
+	}
+	if len(combinations) == 0 {
+		if !allowNoSKUFallback(baseRow, snapshot) {
+			return nil, false
+		}
+		currency, price := splitPrice(s.currentPrice(ctx, 3))
+		row := cloneRow(baseRow)
+		row["货币"] = currency
+		row["外显价格"] = price
+		row["促销标签"] = s.promoText()
+		if s.request.ExtractRealPrice {
+			row["实价"] = price
+		}
+		layerCount := max(s.maxSKULayers, 1)
+		for i := 0; i < layerCount; i++ {
+			if i == 0 {
+				row["SKU层级1"] = "无SKU选项"
+			} else {
+				row[fmt.Sprintf("SKU层级%d", i+1)] = ""
+			}
+		}
+		s.ensurePriceFields(row)
+		return []map[string]string{row}, true
+	}
+	rows := make([]map[string]string, 0, len(combinations))
+	for index, combo := range combinations {
+		row := cloneRow(baseRow)
+		if index > 0 {
+			for _, key := range []string{"厂商", "商品ID", "URL", "商品名称", "评分", "评价数", "预定数", "客户服务", "方便程度", "讯号状态", "中差评价数", "货币"} {
+				row[key] = ""
+			}
+			if s.request.ExtractProductInfo {
+				row["商品资讯"] = ""
+			}
+		}
+		row["货币"] = combo["currency"]
+		row["外显价格"] = combo["price"]
+		if s.request.ExtractRealPrice {
+			row["实价"] = combo["real_price"]
+		}
+		row["促销标签"] = combo["promo_tag"]
+		parts := []string{}
+		if combo["combination"] != "" {
+			parts = strings.Split(combo["combination"], " | ")
+		}
+		layerCount := max(s.maxSKULayers, len(parts), 1)
+		for i := 0; i < layerCount; i++ {
+			if i < len(parts) {
+				row[fmt.Sprintf("SKU层级%d", i+1)] = parts[i]
+			} else {
+				row[fmt.Sprintf("SKU层级%d", i+1)] = ""
+			}
+		}
+		s.ensurePriceFields(row)
+		rows = append(rows, row)
+	}
+	return rows, true
+}
+
+func (s *tripScraper) extractBaseRow(ctx context.Context, item ScrapeItem) map[string]string {
+	text := s.pageText()
+	bundle, waitMS := s.waitBaseRatingBundleStable(ctx, 2500*time.Millisecond)
+	if waitMS > 1000 {
+		s.emit(Event{"event": "log", "stage": "base_fields", "message": fmt.Sprintf("base fields settled slowly wait_ms=%d score=%q customer=%q convenience=%q signal=%q bad_reviews=%q", waitMS, bundle.Score, bundle.Customer, bundle.Convenience, bundle.Signal, bundle.BadReviewCount)})
+	}
+	if bundle.Score == "" || (bundle.Score != "" && (bundle.Customer == "" || bundle.Convenience == "" || bundle.Signal == "")) {
+		s.emit(Event{"event": "log", "stage": "base_fields", "message": fmt.Sprintf("base fields incomplete score=%q customer=%q convenience=%q signal=%q bad_reviews=%q", bundle.Score, bundle.Customer, bundle.Convenience, bundle.Signal, bundle.BadReviewCount)})
+	}
+	if bundle.Score == "" {
+		bundle.Score = s.firstText([]string{`span[testid="productdetail-productInfo-commentScore"]`, `[class*="commentScore"]`})
+	}
+	title := firstNonEmpty(s.firstText([]string{"h1", `[data-testid="product-title"]`, `[class*="title"]`}), s.titleFromDocument())
+	return baseRowFromBundle(item, title, text, bundle, s.request.ExtractProductInfo)
+}
+
+func baseRowFromBundle(item ScrapeItem, title string, pageText string, bundle baseRatingBundle, extractProductInfo bool) map[string]string {
+	bundle = normalizeBaseRatingBundle(bundle)
+	score := bundle.Score
+	customer := ""
+	convenience := ""
+	signal := ""
+	badReviews := ""
+	if score != "" {
+		customer = firstNonEmpty(bundle.Customer, scoreNear(pageText, "Customer Service"), scoreNear(pageText, "客户服务"), scoreNear(pageText, "客戶服務"))
+		convenience = firstNonEmpty(bundle.Convenience, scoreNear(pageText, "Convenience"), scoreNear(pageText, "方便程度"), scoreNear(pageText, "方便"))
+		signal = firstNonEmpty(bundle.Signal, scoreNear(pageText, "Signal"), scoreNear(pageText, "讯号状态"), scoreNear(pageText, "訊號狀態"), scoreNear(pageText, "讯号"))
+		badReviews = firstNonEmpty(bundle.BadReviewCount, badReviewCount(pageText))
+	}
+	row := map[string]string{
+		"厂商":    item.Vendor,
+		"商品ID":  productID(item.URL),
+		"URL":   item.URL,
+		"商品名称":  title,
+		"预定数":   firstNonEmpty(bundle.BookingCount, bookingCount(pageText)),
+		"评价数":   firstNonEmpty(bundle.ReviewCount, reviewCount(pageText)),
+		"评分":    score,
+		"客户服务":  customer,
+		"方便程度":  convenience,
+		"讯号状态":  signal,
+		"中差评价数": badReviews,
+	}
+	if extractProductInfo {
+		row["商品资讯"] = firstNonEmpty(bundle.ProductInfo, productInfo(pageText))
+	}
+	return row
+}
+
+func (s *tripScraper) extractAllSKUPrices(ctx context.Context) []map[string]string {
+	s.emit(Event{"event": "log", "stage": "sku", "message": "starting SKU option and price extraction"})
+	count := s.skuLayerCount()
+	if count == 0 {
+		s.emit(Event{"event": "log", "stage": "sku", "message": "SKU container not found; product may have no SKU options"})
+		return nil
+	}
+	s.maxSKULayers = max(s.maxSKULayers, count)
+	s.emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("found %d SKU layers", count)})
+	layers := make([]skuLayerInfo, 0, count)
+	for i := 0; i < count; i++ {
+		title := s.layerTitle(i)
+		layers = append(layers, skuLayerInfo{Index: i, Title: title})
+		s.emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("layer %d: %s", i+1, title)})
+	}
+	results := traverseSKUCombinations(ctx, layers, s.layerOptions, func(option skuOption, deselect bool) bool {
+		return s.clickSKUOption(ctx, option, deselect)
+	}, func(selected []skuOption) map[string]string {
+		return s.currentCombinationPrice(ctx, selected)
+	}, s.emit)
+	s.emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("recursive SKU traversal complete; captured %d combinations", len(results))})
+	return results
+}
+
+func traverseSKUCombinations(ctx context.Context, layers []skuLayerInfo, getOptions func(int) []skuOption, click func(skuOption, bool) bool, currentPrice func([]skuOption) map[string]string, emit Reporter) []map[string]string {
+	results := []map[string]string{}
+	var walk func(int, []skuOption)
+	walk = func(layerIndex int, selected []skuOption) {
+		if ctx.Err() != nil {
+			return
+		}
+		if layerIndex >= len(layers) {
+			if result := currentPrice(selected); result != nil {
+				results = append(results, result)
+			}
+			return
+		}
+		layer := layers[layerIndex]
+		options := getOptions(layer.Index)
+		if len(options) == 0 {
+			emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("layer %d %s has no available options; skipping", layerIndex+1, layer.Title)})
+			return
+		}
+		emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("traversing layer %d %s: %d options", layerIndex+1, layer.Title, len(options))})
+		for _, option := range options {
+			if ctx.Err() != nil {
+				return
+			}
+			if !click(option, false) {
+				continue
+			}
+			walk(layerIndex+1, append(selected, option))
+			_ = click(option, true)
+		}
+	}
+	walk(0, nil)
+	return results
+}
+
+func (s *tripScraper) currentCombinationPrice(ctx context.Context, selected []skuOption) map[string]string {
+	if len(selected) == 0 {
+		return nil
+	}
+	if !sleepDelay(ctx, s.emit, "sku", "sku_price", s.request.DelayOptions.SKUPrice) {
+		return nil
+	}
+	bundle, waitMS := s.waitCurrentPriceBundleStable(ctx, 2*time.Second)
+	if ctx.Err() != nil {
+		return nil
+	}
+	fallbackPrice := ""
+	if bundle.DisplayPrice == "" {
+		fallbackPrice = s.currentPrice(ctx, 1)
+	}
+	result := currentCombinationPriceRow(selected, bundle, fallbackPrice, s.request.ExtractRealPrice)
+	if result["price"] != "价格获取失败" {
+		if waitMS > 1000 {
+			s.emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("price bundle settled slowly: %s wait_ms=%d footer_empty=%v", result["combination"], waitMS, strings.TrimSpace(bundle.FooterText) == "")})
+		}
+		s.emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("combination price: %s = display:%s%s, real:%s%s, promo:%s", result["combination"], result["currency"], result["price"], result["real_currency"], result["real_price"], result["promo_tag"])})
+		if !sleepDelay(ctx, s.emit, "sku", "sku_between", s.request.DelayOptions.SKUBetween) {
+			return nil
+		}
+		return result
+	}
+	return currentCombinationPriceRow(selected, priceBundle{}, "", s.request.ExtractRealPrice)
+}
+
+func (s *tripScraper) waitBaseRatingBundleStable(ctx context.Context, maxWait time.Duration) (baseRatingBundle, int) {
+	started := time.Now()
+	samples := []baseRatingBundle{}
+	deadline := started.Add(maxWait)
+	for {
+		if ctx.Err() != nil {
+			return selectBaseRatingBundle(samples), elapsedMS(started)
+		}
+		bundle := s.currentBaseRatingBundle()
+		bundle.SampleAtMS = elapsedMS(started)
+		samples = append(samples, bundle)
+		if stable, ok := stableBaseRatingBundle(samples); ok {
+			return stable, elapsedMS(started)
+		}
+		if time.Now().After(deadline) {
+			return selectBaseRatingBundle(samples), elapsedMS(started)
+		}
+		select {
+		case <-ctx.Done():
+			return selectBaseRatingBundle(samples), elapsedMS(started)
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
+func (s *tripScraper) currentBaseRatingBundle() baseRatingBundle {
+	var bundle baseRatingBundle
+	_ = s.evalJSON(&bundle, baseRatingBundleJS, s.request.ExtractProductInfo)
+	return normalizeBaseRatingBundle(bundle)
+}
+
+func stableBaseRatingBundle(samples []baseRatingBundle) (baseRatingBundle, bool) {
+	if len(samples) < 2 {
+		return baseRatingBundle{}, false
+	}
+	last := samples[len(samples)-1]
+	prev := samples[len(samples)-2]
+	if last.Score == "" {
+		return baseRatingBundle{}, false
+	}
+	if baseRatingSignature(last) == "" || baseRatingSignature(last) != baseRatingSignature(prev) {
+		return baseRatingBundle{}, false
+	}
+	return last, true
+}
+
+func selectBaseRatingBundle(samples []baseRatingBundle) baseRatingBundle {
+	if len(samples) == 0 {
+		return baseRatingBundle{}
+	}
+	if stable, ok := stableBaseRatingBundle(samples); ok {
+		return stable
+	}
+	best := samples[len(samples)-1]
+	bestScore := baseRatingCompleteness(best)
+	for _, sample := range samples {
+		score := baseRatingCompleteness(sample)
+		if score > bestScore || (score == bestScore && sample.SampleAtMS > best.SampleAtMS) {
+			best = sample
+			bestScore = score
+		}
+	}
+	return best
+}
+
+func baseRatingCompleteness(bundle baseRatingBundle) int {
+	score := 0
+	for _, value := range []string{bundle.Score, bundle.Customer, bundle.Convenience, bundle.Signal, bundle.BadReviewCount, bundle.ProductInfo, bundle.BookingCount, bundle.ReviewCount} {
+		if strings.TrimSpace(value) != "" {
+			score++
+		}
+	}
+	return score
+}
+
+func baseRatingSignature(bundle baseRatingBundle) string {
+	if strings.TrimSpace(bundle.Signature) != "" {
+		return strings.TrimSpace(bundle.Signature)
+	}
+	return strings.Join([]string{
+		strings.TrimSpace(bundle.Score),
+		strings.TrimSpace(bundle.Customer),
+		strings.TrimSpace(bundle.Convenience),
+		strings.TrimSpace(bundle.Signal),
+		strings.TrimSpace(bundle.BadReviewCount),
+		strings.TrimSpace(bundle.ProductInfo),
+	}, "||")
+}
+
+func normalizeBaseRatingBundle(bundle baseRatingBundle) baseRatingBundle {
+	bundle.BookingCount = numericText(bundle.BookingCount)
+	bundle.ReviewCount = numericText(bundle.ReviewCount)
+	bundle.Score = scoreText(bundle.Score)
+	bundle.Customer = scoreText(bundle.Customer)
+	bundle.Convenience = scoreText(bundle.Convenience)
+	bundle.Signal = scoreText(bundle.Signal)
+	bundle.BadReviewCount = numericText(bundle.BadReviewCount)
+	bundle.ProductInfo = compactText(bundle.ProductInfo)
+	bundle.Signature = baseRatingSignature(bundle)
+	return bundle
+}
+
+func (s *tripScraper) waitCurrentPriceBundleStable(ctx context.Context, maxWait time.Duration) (priceBundle, int) {
+	started := time.Now()
+	samples := []priceBundle{}
+	deadline := started.Add(maxWait)
+	for {
+		if ctx.Err() != nil {
+			return selectStablePriceBundle(samples, time.Since(started)), elapsedMS(started)
+		}
+		bundle := s.currentPriceBundle()
+		bundle.SampleAtMS = elapsedMS(started)
+		samples = append(samples, bundle)
+		if stable, ok := stablePriceBundle(samples, 350*time.Millisecond); ok {
+			return stable, elapsedMS(started)
+		}
+		if time.Now().After(deadline) {
+			return selectStablePriceBundle(samples, time.Since(started)), elapsedMS(started)
+		}
+		select {
+		case <-ctx.Done():
+			return selectStablePriceBundle(samples, time.Since(started)), elapsedMS(started)
+		case <-time.After(120 * time.Millisecond):
+		}
+	}
+}
+
+func stablePriceBundle(samples []priceBundle, minAge time.Duration) (priceBundle, bool) {
+	if len(samples) < 2 {
+		return priceBundle{}, false
+	}
+	last := samples[len(samples)-1]
+	prev := samples[len(samples)-2]
+	if time.Duration(last.SampleAtMS)*time.Millisecond < minAge {
+		return priceBundle{}, false
+	}
+	if !isValidDisplayPrice(last.DisplayPrice) {
+		return priceBundle{}, false
+	}
+	if bundleSignature(last) == "" || bundleSignature(last) != bundleSignature(prev) {
+		return priceBundle{}, false
+	}
+	return last, true
+}
+
+func selectStablePriceBundle(samples []priceBundle, elapsed time.Duration) priceBundle {
+	if len(samples) == 0 {
+		return priceBundle{}
+	}
+	if stable, ok := stablePriceBundle(samples, 0); ok {
+		return stable
+	}
+	for i := len(samples) - 1; i >= 0; i-- {
+		if isValidDisplayPrice(samples[i].DisplayPrice) && time.Duration(samples[i].SampleAtMS)*time.Millisecond >= min(elapsed, 350*time.Millisecond) {
+			return samples[i]
+		}
+	}
+	for i := len(samples) - 1; i >= 0; i-- {
+		if isValidDisplayPrice(samples[i].DisplayPrice) {
+			return samples[i]
+		}
+	}
+	return samples[len(samples)-1]
+}
+
+func bundleSignature(bundle priceBundle) string {
+	signature := strings.TrimSpace(bundle.FooterSignature)
+	if signature != "" {
+		return signature
+	}
+	return strings.Join([]string{
+		strings.TrimSpace(bundle.DisplayPrice),
+		strings.TrimSpace(bundle.RealPrice),
+		strings.TrimSpace(bundle.PromoTag),
+		strings.TrimSpace(bundle.FooterText),
+	}, "||")
+}
+
+func currentCombinationPriceRow(selected []skuOption, bundle priceBundle, fallbackDisplayPrice string, extractRealPrice bool) map[string]string {
+	if len(selected) == 0 {
+		return nil
+	}
+	parts := make([]string, 0, len(selected))
+	for _, option := range selected {
+		parts = append(parts, option.Text)
+	}
+	combination := strings.Join(parts, " | ")
+	displayPriceText := bundle.DisplayPrice
+	if displayPriceText == "" {
+		displayPriceText = fallbackDisplayPrice
+	}
+	currency, price := splitPrice(displayPriceText)
+	realCurrency, realPrice := "N/A", "N/A"
+	if extractRealPrice {
+		realCurrency, realPrice = splitPrice(bundle.RealPrice)
+		if realPrice == "N/A" {
+			realCurrency, realPrice = "N/A", ""
+		}
+	}
+	if price != "" && price != "价格未找到" {
+		return map[string]string{"combination": combination, "currency": currency, "price": price, "real_currency": realCurrency, "real_price": realPrice, "promo_tag": bundle.PromoTag}
+	}
+	return map[string]string{"combination": combination, "currency": "N/A", "price": "价格获取失败", "real_currency": "N/A", "real_price": "N/A", "promo_tag": ""}
+}
+
+func (s *tripScraper) waitReady(ctx context.Context) error {
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		state := s.evalString(`() => document.readyState || ""`)
+		if state == "interactive" || state == "complete" {
+			return nil
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return nil
+}
+
+func (s *tripScraper) startNavigationMonitor(ctx context.Context) *navigationMonitor {
+	if s.page == nil {
+		return nil
+	}
+	_ = proto.NetworkEnable{}.Call(s.page)
+	eventCtx, cancel := context.WithCancel(ctx)
+	monitor := &navigationMonitor{cancel: cancel}
+	wait := s.page.Context(eventCtx).EachEvent(func(e *proto.NetworkResponseReceived) {
+		if e == nil || e.Response == nil || e.Type != proto.NetworkResourceTypeDocument {
+			return
+		}
+		monitor.mu.Lock()
+		monitor.mainStatus = e.Response.Status
+		monitor.mainURL = e.Response.URL
+		monitor.mainStatusText = e.Response.StatusText
+		monitor.mu.Unlock()
+	})
+	monitor.stop = wait
+	go func() {
+		wait()
+	}()
+	return monitor
+}
+
+func (m *navigationMonitor) snapshot() (int, string, string) {
+	if m == nil {
+		return 0, "", ""
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.mainStatus, m.mainURL, m.mainStatusText
+}
+
+func (m *navigationMonitor) close() {
+	if m == nil {
+		return
+	}
+	if m.cancel != nil {
+		m.cancel()
+	}
+}
+
+func (s *tripScraper) waitProductPageReady(ctx context.Context, maxWait time.Duration) (pageSnapshot, int) {
+	started := time.Now()
+	deadline := started.Add(maxWait)
+	var last pageSnapshot
+	for {
+		if ctx.Err() != nil {
+			return last, elapsedMS(started)
+		}
+		last = s.currentPageSnapshot()
+		if isProductPageReady(last) || last.RiskChallenge {
+			return last, elapsedMS(started)
+		}
+		if time.Now().After(deadline) {
+			return last, elapsedMS(started)
+		}
+		select {
+		case <-ctx.Done():
+			return last, elapsedMS(started)
+		case <-time.After(300 * time.Millisecond):
+		}
+	}
+}
+
+func (s *tripScraper) waitProductPageExtractable(ctx context.Context, maxWait time.Duration, ratingOnly bool) (pageSnapshot, int) {
+	started := time.Now()
+	deadline := started.Add(maxWait)
+	var last pageSnapshot
+	for {
+		if ctx.Err() != nil {
+			return last, elapsedMS(started)
+		}
+		last = s.currentPageSnapshot()
+		if isProductPageExtractable(last, ratingOnly) || last.RiskChallenge {
+			return last, elapsedMS(started)
+		}
+		if time.Now().After(deadline) {
+			return last, elapsedMS(started)
+		}
+		select {
+		case <-ctx.Done():
+			return last, elapsedMS(started)
+		case <-time.After(300 * time.Millisecond):
+		}
+	}
+}
+
+func (s *tripScraper) currentPageSnapshot() pageSnapshot {
+	var snapshot pageSnapshot
+	err := s.evalJSON(&snapshot, `() => {
+		const visible = (el) => {
+			if (!el) return false;
+			const style = window.getComputedStyle(el);
+			if (!style || style.display === 'none' || style.visibility === 'hidden') return false;
+			return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+		};
+		const body = document.body;
+		const bodyText = body ? ((body.innerText || body.textContent || '').trim().replace(/\s+/g, ' ')) : '';
+		const lower = bodyText.toLowerCase();
+		const hasAny = (selectors) => selectors.some(selector => Array.from(document.querySelectorAll(selector)).some(visible));
+		const hasText = (patterns) => patterns.some(pattern => bodyText.includes(pattern));
+		const title = document.title || '';
+		const whaleguard = lower.includes('whaleguard');
+		const riskChallenge = whaleguard || lower.includes('verify you are human') || lower.includes('captcha') || lower.includes('security verification') || bodyText.includes('安全验证') || bodyText.includes('安全驗證') || bodyText.includes('人机验证') || bodyText.includes('人機驗證') || bodyText.includes('請完成驗證') || bodyText.includes('请完成验证');
+		return {
+			url: window.location.href || '',
+			ready_state: document.readyState || '',
+			body_text_length: bodyText.length,
+			title,
+			has_product_title: hasAny(['h1', '[data-testid="product-title"]']) || hasText(['套餐與價格', '套餐与价格', '商品詳情', '商品详情']),
+			has_sku: hasAny(['div[testid="act_sku_wrapper"]', 'div[class*="style_sku_wrapper_container"]', 'div[class*="sku_tab_ceil"]']) || hasText(['套餐與價格', '套餐与价格']),
+			has_price: hasAny(['span[currency="HKD"]', 'span[testid*="price"]', 'div[class*="price"]']) || /HK\$\s*[0-9,]+(?:\.\d+)?/.test(bodyText),
+			has_score: hasAny(['span[testid="productdetail-productInfo-commentScore"]', '[class*="commentScore"]']),
+			risk_challenge: riskChallenge,
+			risk_kind: whaleguard ? 'whaleguard' : (riskChallenge ? 'challenge' : ''),
+			body_preview: bodyText.slice(0, 200),
+		};
+	}`)
+	if err != nil {
+		snapshot.EvalError = err.Error()
+	}
+	return snapshot
+}
+
+func (snapshot *pageSnapshot) withNavigationStatus(status int, responseURL string) {
+	if snapshot == nil {
+		return
+	}
+	if status > 0 {
+		snapshot.HTTPStatus = status
+	}
+	if strings.TrimSpace(responseURL) != "" {
+		snapshot.ResponseURL = responseURL
+	}
+	if status == 432 && snapshot.RiskKind == "" {
+		snapshot.RiskKind = "whaleguard"
+		snapshot.RiskChallenge = true
+	}
+}
+
+func (snapshot *pageSnapshot) applyRisk(risk riskDiagnostics) {
+	if snapshot == nil {
+		return
+	}
+	if risk.Challenge {
+		snapshot.RiskChallenge = true
+	}
+	if risk.Kind != "" {
+		snapshot.RiskKind = risk.Kind
+	}
+	if risk.HTTPStatus > 0 {
+		snapshot.HTTPStatus = risk.HTTPStatus
+	}
+	if risk.BodyPreview != "" {
+		snapshot.BodyPreview = risk.BodyPreview
+	}
+}
+
+func isProductPageReady(snapshot pageSnapshot) bool {
+	if strings.TrimSpace(snapshot.EvalError) != "" {
+		return false
+	}
+	if strings.TrimSpace(snapshot.URL) == "" {
+		return false
+	}
+	if snapshot.BodyTextLength == 0 {
+		return false
+	}
+	if snapshot.RiskChallenge {
+		return true
+	}
+	if snapshot.HasProductTitle || snapshot.HasSKU || snapshot.HasPrice || snapshot.HasScore {
+		return true
+	}
+	return snapshot.BodyTextLength >= 1200 && strings.TrimSpace(snapshot.Title) != ""
+}
+
+func isProductPageExtractable(snapshot pageSnapshot, ratingOnly bool) bool {
+	if !isProductPageReady(snapshot) {
+		return false
+	}
+	if snapshot.RiskChallenge {
+		return false
+	}
+	if ratingOnly {
+		return snapshot.HasProductTitle || snapshot.HasScore || snapshot.HasPrice || snapshot.HasSKU
+	}
+	return snapshot.HasSKU || snapshot.HasPrice
+}
+
+func allowNoSKUFallback(row map[string]string, snapshot pageSnapshot) bool {
+	if !isProductPageExtractable(snapshot, false) {
+		return false
+	}
+	if !snapshot.HasPrice {
+		return false
+	}
+	for _, key := range []string{"商品名称", "评分", "评价数", "预定数"} {
+		if strings.TrimSpace(row[key]) != "" {
+			return true
+		}
+	}
+	return snapshot.HasProductTitle || snapshot.HasPrice
+}
+
+func isWhaleguardSnapshot(snapshot pageSnapshot) bool {
+	return snapshot.HTTPStatus == 432 || strings.EqualFold(strings.TrimSpace(snapshot.RiskKind), "whaleguard") || strings.Contains(strings.ToLower(snapshot.BodyPreview), "whaleguard block")
+}
+
+func (s *tripScraper) enableRiskProtection() {
+	if s.riskProtection {
+		return
+	}
+	current := s.request.DelayOptions.Profile
+	if current == "slow" || current == "safe" {
+		s.riskProtection = true
+		return
+	}
+	safeOptions, err := delayProfileOptions("safe")
+	if err != nil {
+		return
+	}
+	s.request.DelayOptions = safeOptions
+	s.riskProtection = true
+	s.emit(Event{"event": "log", "stage": "risk", "message": "risk protection enabled; delay profile raised to safe", "delay_profile": "safe"})
+}
+
+func riskCooldownDelay(profile string) time.Duration {
+	var delayRange DelayRange
+	switch profile {
+	case "safe":
+		delayRange = secondsRange(60, 120)
+	case "slow":
+		delayRange = secondsRange(120, 240)
+	default:
+		delayRange = secondsRange(30, 60)
+	}
+	return randomDelay(delayRange.Min, delayRange.Max)
+}
+
+func (s *tripScraper) scrollPage(ctx context.Context) {
+	for i := 0; i < 4; i++ {
+		if ctx.Err() != nil {
+			return
+		}
+		_, _ = s.page.Evaluate(rod.Eval(`() => window.scrollTo(0, document.body.scrollHeight)`))
+		if !sleepDelay(ctx, s.emit, "lazy_load", "scroll", s.request.DelayOptions.Scroll) {
+			return
+		}
+	}
+	_, _ = s.page.Evaluate(rod.Eval(`() => window.scrollTo(0, 0)`))
+}
+
+func (s *tripScraper) cleanupAfterURL() {
+	if s.page == nil {
+		return
+	}
+	_, _ = s.page.Evaluate(rod.Eval(`() => window.stop()`))
+	_ = proto.NetworkClearBrowserCache{}.Call(s.page)
+	_ = proto.HeapProfilerCollectGarbage{}.Call(s.page)
+}
+
+func (s *tripScraper) maybeRestart(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	options := s.request.BrowserOptions
+	if !options.MemoryGuardEnabled {
+		return nil
+	}
+	s.processed++
+	reason := ""
+	if options.MemoryLimitMB > 0 {
+		if rss := managedBrowserRSSMB(s.userDataDir); rss >= float64(options.MemoryLimitMB) {
+			reason = fmt.Sprintf("Chrome memory %.0fMB exceeded %dMB", rss, options.MemoryLimitMB)
+		}
+	}
+	if reason == "" && options.RestartEvery > 0 && s.processed >= options.RestartEvery {
+		reason = fmt.Sprintf("processed %d URLs", s.processed)
+	}
+	if reason == "" {
+		return nil
+	}
+	return s.restartBrowser(ctx, reason)
+}
+
+func (s *tripScraper) restartBrowser(ctx context.Context, reason string) error {
+	return s.restartBrowserWithSessionSave(ctx, reason, true)
+}
+
+func (s *tripScraper) restartBrowserNoSessionSave(ctx context.Context, reason string) error {
+	return s.restartBrowserWithSessionSave(ctx, reason, false)
+}
+
+func (s *tripScraper) restartBrowserWithSessionSave(ctx context.Context, reason string, saveSessionBeforeRestart bool) error {
+	if reason == "" {
+		reason = "runtime recovery"
+	}
+	s.emit(Event{"event": "log", "stage": "browser_restart", "message": "restarting Chrome: " + reason})
+	if saveSessionBeforeRestart && isProductPageReady(s.currentPageSnapshot()) {
+		s.saveSession()
+	} else {
+		message := "skip session save before restart because current page is unhealthy"
+		if !saveSessionBeforeRestart {
+			message = "skip session save before restart because current page hit risk challenge"
+		}
+		s.emit(Event{"event": "warning", "stage": "browser_restart", "message": message})
+	}
+	s.close()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.processed = 0
+	s.storageApplied = map[string]bool{}
+	s.restartAfterURL = false
+	s.restartReason = ""
+	return s.start(ctx)
+}
+
+func (s *tripScraper) saveSession() bool {
+	if s.page == nil {
+		return false
+	}
+	return saveSession(s.page, s.request.BrowserOptions.SessionFile)
+}
+
+func (s *tripScraper) close() {
+	if s.page != nil {
+		_, _ = s.page.Evaluate(rod.Eval(`() => window.stop()`))
+		s.page = nil
+	}
+	if s.browser != nil {
+		_ = s.browser.Close()
+		s.browser = nil
+	}
+	if s.driverRuntime != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		s.driverRuntime.stop(ctx)
+		cancel()
+		s.driverRuntime = nil
+	}
+	if s.directChrome != nil {
+		terminateProcessTree(s.directChrome)
+		s.directChrome = nil
+	}
+	if s.userDataDir != "" && (s.removeUserDataDir || strings.Contains(s.userDataDir, string(filepath.Separator)+"_workers"+string(filepath.Separator))) {
+		killChromeByUserDataDir(s.userDataDir)
+	}
+	if s.userDataDir != "" && s.removeUserDataDir {
+		_ = os.RemoveAll(s.userDataDir)
+	}
+	s.userDataDir = ""
+	s.removeUserDataDir = false
+}
+
+func (s *tripScraper) shouldApplySessionStorage(targetURL string) bool {
+	origin := targetOrigin(targetURL)
+	if origin == "" {
+		origin = targetURL
+	}
+	if s.storageApplied == nil {
+		s.storageApplied = map[string]bool{}
+	}
+	if s.storageApplied[origin] {
+		return false
+	}
+	s.storageApplied[origin] = true
+	return true
+}
+
+func (s *tripScraper) firstText(selectors []string) string {
+	for _, selector := range selectors {
+		text := s.evalString(`(selector) => {
+			for (const el of document.querySelectorAll(selector)) {
+				const text = (el.innerText || el.textContent || '').trim();
+				if (text) return text.replace(/\s+/g, ' ');
+			}
+			return '';
+		}`, selector)
+		if text != "" {
+			return text
+		}
+	}
+	return ""
+}
+
+func (s *tripScraper) titleFromDocument() string {
+	title := s.evalString(`() => document.title || ''`)
+	return strings.TrimSpace(strings.Split(title, "|")[0])
+}
+
+func (s *tripScraper) currentURL() string {
+	url := s.evalString(`() => window.location.href || ''`)
+	if url != "" || s.page == nil {
+		return url
+	}
+	if info, err := s.page.Info(); err == nil && info != nil {
+		return info.URL
+	}
+	return ""
+}
+
+func (s *tripScraper) pageText() string {
+	return s.evalString(`() => document.body ? document.body.innerText : ''`)
+}
+
+type riskDiagnostics struct {
+	Challenge   bool
+	Reason      string
+	Kind        string
+	HTTPStatus  int
+	BodyPreview string
+	Scripts     []string
+}
+
+func (s *tripScraper) detectRiskChallenge() riskDiagnostics {
+	var payload struct {
+		URL     string   `json:"url"`
+		Body    string   `json:"body"`
+		Scripts []string `json:"scripts"`
+		HasSKU  bool     `json:"has_sku"`
+	}
+	_ = s.evalJSON(&payload, `() => {
+		const riskPatterns = ['jigsaw-captcha', 'guestverify', 'ubtrms', '/rms', 'c-sec', 'whaleguard'];
+		const scripts = Array.from(document.scripts || [])
+			.map(script => script.src || '')
+			.filter(src => src && riskPatterns.some(pattern => src.toLowerCase().includes(pattern)));
+		const body = (document.body && (document.body.innerText || document.body.textContent) || '').trim().replace(/\s+/g, ' ');
+		const hasSKU = !!document.querySelector('div[testid="act_sku_wrapper"], div[class*="style_sku_wrapper_container"], div[class*="sku_tab_ceil"]') || body.includes('套餐與價格') || body.includes('套餐与价格');
+		return {url: window.location.href || '', body, scripts, has_sku: hasSKU};
+	}`)
+	return classifyRiskChallenge(payload.Body, payload.URL, payload.Scripts, payload.HasSKU, 0)
+}
+
+func classifyRiskChallenge(body string, pageURL string, scripts []string, hasSKU bool, httpStatus int) riskDiagnostics {
+	lowerBody := strings.ToLower(body)
+	lowerURL := strings.ToLower(pageURL)
+	reason := ""
+	kind := ""
+	if httpStatus == 432 || strings.Contains(lowerURL, "whaleguard") || strings.Contains(lowerBody, "whaleguard") {
+		reason = "risk challenge detected: whaleguard"
+		kind = "whaleguard"
+	}
+	challengeMarkers := []string{
+		"verify you are human",
+		"captcha",
+		"guestverify",
+		"security verification",
+		"安全验证",
+		"安全驗證",
+		"人机验证",
+		"人機驗證",
+		"滑块验证",
+		"滑塊驗證",
+		"访问异常",
+		"訪問異常",
+		"請完成驗證",
+		"请完成验证",
+	}
+	if reason == "" {
+		for _, marker := range challengeMarkers {
+			if strings.Contains(lowerBody, strings.ToLower(marker)) || strings.Contains(lowerURL, strings.ToLower(marker)) {
+				reason = "risk challenge detected: " + marker
+				kind = "challenge"
+				break
+			}
+		}
+	}
+	if reason != "" && !hasSKU {
+		return riskDiagnostics{Challenge: true, Reason: reason, Kind: kind, HTTPStatus: httpStatus, BodyPreview: previewText(body, 200), Scripts: scripts}
+	}
+	if strings.Contains(reason, "whaleguard") {
+		return riskDiagnostics{Challenge: true, Reason: reason, Kind: "whaleguard", HTTPStatus: httpStatus, BodyPreview: previewText(body, 200), Scripts: scripts}
+	}
+	return riskDiagnostics{Challenge: false, Reason: "", Kind: "", HTTPStatus: httpStatus, BodyPreview: previewText(body, 200), Scripts: scripts}
+}
+
+func (s *tripScraper) promoText() string {
+	text := s.pageText()
+	for _, line := range strings.Split(text, "\n") {
+		lowered := strings.ToLower(line)
+		if strings.Contains(lowered, "off") || strings.Contains(lowered, "save") || strings.Contains(line, "优惠") || strings.Contains(line, "折") || strings.Contains(line, "減") {
+			runes := []rune(strings.TrimSpace(line))
+			if len(runes) > 80 {
+				runes = runes[:80]
+			}
+			return string(runes)
+		}
+	}
+	return ""
+}
+
+func (s *tripScraper) skuLayerCount() int {
+	var count int
+	_ = s.evalJSON(&count, `() => {
+		const containerSelectors = ['div[testid="act_sku_wrapper"]', 'div.style_sku_wrapper_container__Lq9RG', 'div.style_m_container__ssZE4', 'div[class*="style_sku_wrapper_container"]'];
+		let container = null;
+		for (const selector of containerSelectors) {
+			container = document.querySelector(selector);
+			if (container) break;
+		}
+		if (!container) return 0;
+		for (const selector of ['div.sku_tab_ceil.style_m_sku_tab_ceil__D9OYQ', 'div.xtaro-xview.xt-xview.sku_tab_ceil', 'div[class*="sku_tab_ceil"]']) {
+			const elements = Array.from(container.querySelectorAll(selector)).filter(el => el.offsetParent !== null);
+			if (elements.length && elements.length <= 5) return elements.length;
+		}
+		return 0;
+	}`)
+	return count
+}
+
+func (s *tripScraper) layerTitle(index int) string {
+	title := s.evalString(`(index) => {
+		const layers = Array.from(document.querySelectorAll('div[class*="sku_tab_ceil"]')).filter(el => el.offsetParent !== null);
+		const layer = layers[index];
+		if (!layer) return '未知层级';
+		const title = layer.querySelector('span.style_m_tab_title_text__ldPLP');
+		return ((title && (title.innerText || title.textContent)) || '未知层级').trim();
+	}`, index)
+	if title == "" {
+		return "未知层级"
+	}
+	return title
+}
+
+func (s *tripScraper) layerOptions(index int) []skuOption {
+	var options []skuOption
+	_ = s.evalJSON(&options, `(index) => {
+		const layers = Array.from(document.querySelectorAll('div[class*="sku_tab_ceil"]')).filter(el => el.offsetParent !== null);
+		const layer = layers[index];
+		if (!layer) return [];
+		const optionElements = Array.from(layer.querySelectorAll('div.m_ceil.style_m_ceil__mUygk'));
+		const out = [];
+		const seen = new Set();
+		const isVisible = (el) => {
+			if (!el) return false;
+			const style = window.getComputedStyle(el);
+			if (!style || style.display === 'none' || style.visibility === 'hidden') return false;
+			return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+		};
+		for (const el of optionElements) {
+			const cls = el.getAttribute('class') || '';
+			if (!cls.includes('style_select_border__AaoE0')) continue;
+			if (!isVisible(el)) continue;
+			const textEl = el.querySelector('span[testid^="title_saleproperty_"]');
+			const text = ((textEl && (textEl.innerText || textEl.textContent)) || '').trim();
+			if (!text) continue;
+			const textColor = getComputedStyle(textEl || el).color;
+			if (textColor.includes('172, 180, 191') || textColor.includes('206, 210, 217')) continue;
+			const elementColor = getComputedStyle(el).color;
+			if (elementColor.includes('206, 210, 217')) continue;
+			if (seen.has(text)) continue;
+			seen.add(text);
+			out.push({text, layer: index + 1, id: el.id || ''});
+		}
+		return out;
+	}`, index)
+	return options
+}
+
+func (s *tripScraper) clickSKUOption(ctx context.Context, option skuOption, deselect bool) bool {
+	action := "选择"
+	if deselect {
+		action = "取消选择"
+	}
+	for retry := 0; retry < 3; retry++ {
+		if ctx.Err() != nil {
+			return false
+		}
+		var prepared bool
+		_ = s.evalJSON(&prepared, `(index, optionText, optionID, deselect) => {
+		const layers = Array.from(document.querySelectorAll('div[class*="sku_tab_ceil"]')).filter(el => el.offsetParent !== null);
+		const layer = layers[index];
+		if (!layer) return false;
+		const isVisible = (el) => {
+			if (!el) return false;
+			const style = window.getComputedStyle(el);
+			if (!style || style.display === 'none' || style.visibility === 'hidden') return false;
+			return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+		};
+		let optionElements = Array.from(layer.querySelectorAll('div.m_ceil.style_m_ceil__mUygk'));
+		if (optionID) {
+			const byID = document.getElementById(optionID);
+			if (byID) optionElements = [byID, ...optionElements.filter(el => el !== byID)];
+		}
+		for (const el of optionElements) {
+			const cls = el.getAttribute('class') || '';
+			if (!cls.includes('style_select_border__AaoE0')) continue;
+			if (!isVisible(el)) continue;
+			const textEl = el.querySelector('span[testid^="title_saleproperty_"]');
+			const text = ((textEl && (textEl.innerText || textEl.textContent)) || '').trim();
+			if (text !== optionText) continue;
+			const textColor = getComputedStyle(textEl || el).color;
+			if (textColor.includes('172, 180, 191') || textColor.includes('206, 210, 217')) continue;
+			const elementColor = getComputedStyle(el).color;
+			if (elementColor.includes('206, 210, 217')) continue;
+			const borderColor = getComputedStyle(el).borderColor || '';
+			const selected = borderColor.includes('44, 97, 254');
+			if (!deselect && selected) return true;
+			if (deselect && !selected) return true;
+			el.scrollIntoView({block: 'center'});
+			el.dataset.tripCdpPendingClick = '1';
+			return true;
+		}
+		return false;
+		}`, option.Layer-1, option.Text, option.ID, deselect)
+		if !prepared {
+			if retry < 2 {
+				if !sleepFixed(ctx, 200*time.Millisecond) {
+					return false
+				}
+				continue
+			}
+			s.emit(Event{"event": "warning", "stage": "sku", "message": fmt.Sprintf("click layer %d option %s failed", option.Layer, option.Text)})
+			s.markRestartAfterURLIfUnhealthy(fmt.Sprintf("SKU click failed while page is unhealthy: layer %d option %s", option.Layer, option.Text))
+			return false
+		}
+		if !sleepFixed(ctx, 50*time.Millisecond) {
+			return false
+		}
+		var clicked bool
+		_ = s.evalJSON(&clicked, `(index, optionText, optionID, deselect) => {
+			const layers = Array.from(document.querySelectorAll('div[class*="sku_tab_ceil"]')).filter(el => el.offsetParent !== null);
+			const layer = layers[index];
+			if (!layer) return false;
+			let optionElements = Array.from(layer.querySelectorAll('div.m_ceil.style_m_ceil__mUygk'));
+			if (optionID) {
+				const byID = document.getElementById(optionID);
+				if (byID) optionElements = [byID, ...optionElements.filter(el => el !== byID)];
+			}
+			for (const el of optionElements) {
+				const textEl = el.querySelector('span[testid^="title_saleproperty_"]');
+				const text = ((textEl && (textEl.innerText || textEl.textContent)) || '').trim();
+				if (text !== optionText) continue;
+				const borderColor = getComputedStyle(el).borderColor || '';
+				const selected = borderColor.includes('44, 97, 254');
+				if (!deselect && selected) return true;
+				if (deselect && !selected) return true;
+				el.click();
+				return true;
+			}
+			return false;
+		}`, option.Layer-1, option.Text, option.ID, deselect)
+		if clicked {
+			if deselect {
+				if !sleepFixed(ctx, 100*time.Millisecond) {
+					return false
+				}
+			} else if !sleepDelay(ctx, s.emit, "sku", "sku_click", s.request.DelayOptions.SKUClick) {
+				return false
+			}
+			s.emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("layer %d %s: %s", option.Layer, action, option.Text)})
+			return true
+		}
+		if retry < 2 {
+			s.emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("click layer %d option %s failed; retry %d/3", option.Layer, option.Text, retry+1)})
+			if !sleepFixed(ctx, 200*time.Millisecond) {
+				return false
+			}
+		}
+	}
+	s.emit(Event{"event": "warning", "stage": "sku", "message": fmt.Sprintf("click layer %d option %s failed", option.Layer, option.Text)})
+	s.markRestartAfterURLIfUnhealthy(fmt.Sprintf("SKU click failed while page is unhealthy: layer %d option %s", option.Layer, option.Text))
+	return false
+}
+
+func (s *tripScraper) markRestartAfterURLIfUnhealthy(reason string) {
+	if isProductPageReady(s.currentPageSnapshot()) {
+		return
+	}
+	s.restartAfterURL = true
+	s.restartReason = reason
+}
+
+func (s *tripScraper) currentPrice(ctx context.Context, maxAttempts int) string {
+	selectors := []string{
+		`#select_quantity div[class*="style_m_select_quantity_container__"] div div[class*="style_m_select_choice_option_wrapper__"] div[class*="style_m_people_price__"] div div span span`,
+		`#select_quantity > div.xtaro-xview > div > div.xtaro-xview > div.xtaro-xview > div > div > span > span`,
+		`div[class*="default_new_title_foot_warp"] div[class*="default_new_title_foot_warp_right"] div div div span`,
+		`span[currency="HKD"][testid*="price"]`,
+		`span.price_m_price_price__VrAgh`,
+		`div.price_m_price__FmWsJ span[currency="HKD"]`,
+		`span[testid="undefined-price"]`,
+		`span[currency="HKD"]`,
+	}
+	if maxAttempts <= 0 {
+		maxAttempts = 3
+	}
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if ctx.Err() != nil {
+			return "价格未找到"
+		}
+		for _, selector := range selectors {
+			text := s.evalString(`(selector) => {
+				for (const el of document.querySelectorAll(selector)) {
+					if (el.offsetParent === null) continue;
+					const text = (el.innerText || el.textContent || '').trim();
+					if (text && text.includes('HK$') && /^HK\$\s*[0-9,]+(?:\.\d+)?/.test(text)) return text;
+				}
+				return '';
+			}`, selector)
+			if text != "" {
+				return text
+			}
+		}
+		text := s.evalString(`() => {
+			const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+			let node;
+			while ((node = walker.nextNode())) {
+				const text = (node.nodeValue || '').trim();
+				if (text.startsWith('HK$') && /^HK\$\s*[0-9,]+(?:\.\d+)?/.test(text)) return text;
+			}
+			return '';
+		}`)
+		if text != "" {
+			return text
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return "价格未找到"
+}
+
+func (s *tripScraper) currentPriceBundle() priceBundle {
+	displaySelectors := []string{
+		`#select_quantity div[class*="style_m_select_quantity_container__"] div div[class*="style_m_select_choice_option_wrapper__"] div[class*="style_m_people_price__"] div div span span`,
+		`#select_quantity > div.xtaro-xview > div > div.xtaro-xview > div.xtaro-xview > div > div > span > span`,
+		`div[class*="default_new_title_foot_warp"] div[class*="default_new_title_foot_warp_right"] div div div span`,
+		`span[currency="HKD"][testid*="price"]`,
+		`span.price_m_price_price__VrAgh`,
+		`div.price_m_price__FmWsJ span[currency="HKD"]`,
+		`span[testid="undefined-price"]`,
+		`span[currency="HKD"]`,
+	}
+	var bundle priceBundle
+	_ = s.evalJSON(&bundle, currentPriceBundleJS, displaySelectors, s.request.ExtractRealPrice)
+	return bundle
+}
+
+func (s *tripScraper) ensurePriceFields(row map[string]string) {
+	if s.request.RatingOnly {
+		return
+	}
+	if _, ok := row["SKU层级1"]; !ok {
+		row["SKU层级1"] = ""
+	}
+	for _, key := range []string{"货币", "外显价格", "促销标签"} {
+		if _, ok := row[key]; !ok {
+			row[key] = ""
+		}
+	}
+	if s.request.ExtractRealPrice {
+		if _, ok := row["实价"]; !ok {
+			row["实价"] = row["外显价格"]
+		}
+	}
+}
+
+func (s *tripScraper) errorRow(item ScrapeItem, message string) map[string]string {
+	row := map[string]string{
+		"厂商":    item.Vendor,
+		"商品ID":  productID(item.URL),
+		"URL":   item.URL,
+		"商品名称":  "",
+		"评分":    "处理错误: " + message,
+		"评价数":   "",
+		"预定数":   "",
+		"客户服务":  "",
+		"方便程度":  "",
+		"讯号状态":  "",
+		"中差评价数": "",
+	}
+	if s.request.ExtractProductInfo {
+		row["商品资讯"] = ""
+	}
+	if !s.request.RatingOnly {
+		row["SKU层级1"] = ""
+		row["货币"] = ""
+		row["外显价格"] = ""
+		row["促销标签"] = ""
+		if s.request.ExtractRealPrice {
+			row["实价"] = ""
+		}
+	}
+	s.ensurePriceFields(row)
+	return row
+}
+
+func (s *tripScraper) evalString(js string, args ...any) string {
+	var out string
+	if err := s.evalJSON(&out, js, args...); err != nil {
+		return ""
+	}
+	return out
+}
+
+func (s *tripScraper) evalJSON(out any, js string, args ...any) error {
+	if s.page == nil {
+		return fmt.Errorf("browser is not started")
+	}
+	res, err := s.page.Evaluate(rod.Eval(js, args...))
+	if err != nil {
+		return err
+	}
+	return res.Value.Unmarshal(out)
+}
+
+func mergeEvent(a Event, b Event) Event {
+	out := Event{}
+	for key, value := range b {
+		out[key] = value
+	}
+	for key, value := range a {
+		out[key] = value
+	}
+	return out
+}
+
+func cloneRow(row map[string]string) map[string]string {
+	out := map[string]string{}
+	for key, value := range row {
+		out[key] = value
+	}
+	return out
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func previewText(value string, limit int) string {
+	value = compactText(value)
+	if limit <= 0 {
+		return value
+	}
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value
+	}
+	return string(runes[:limit])
+}
+
+var validDisplayPricePattern = regexp.MustCompile(`^HK\$\s*[0-9,]+(?:\.\d+)?`)
+
+func isValidDisplayPrice(value string) bool {
+	text := strings.TrimSpace(value)
+	return strings.Contains(text, "HK$") && validDisplayPricePattern.MatchString(text)
+}
+
+func splitPrice(value string) (string, string) {
+	priceText := strings.TrimSpace(value)
+	if priceText == "" || priceText == "价格未找到" || priceText == "未找到" {
+		return "N/A", "N/A"
+	}
+	currency := "N/A"
+	if strings.Contains(priceText, "HK$") {
+		currency = "HKD"
+		priceText = strings.ReplaceAll(priceText, "HK$", "")
+	} else if strings.Contains(priceText, "$") {
+		currency = "USD"
+		priceText = strings.ReplaceAll(priceText, "$", "")
+	} else if strings.Contains(priceText, "¥") || strings.Contains(priceText, "￥") || strings.Contains(priceText, "CNY") {
+		currency = "CNY"
+		priceText = strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(priceText, "¥", ""), "￥", ""), "CNY", "")
+	}
+	match := regexp.MustCompile(`([0-9,]+\.?[0-9]*)`).FindStringSubmatch(priceText)
+	if len(match) == 0 {
+		return currency, strings.TrimSpace(priceText)
+	}
+	return currency, strings.ReplaceAll(match[1], ",", "")
+}
+
+func productID(url string) string {
+	if match := regexp.MustCompile(`/detail/(\d+)`).FindStringSubmatch(url); len(match) > 1 {
+		return match[1]
+	}
+	if match := regexp.MustCompile(`(\d{5,})`).FindStringSubmatch(url); len(match) > 1 {
+		return match[1]
+	}
+	return ""
+}
+
+func bookingCount(text string) string {
+	return firstRegex(text, `([\d,]+)\s*(?:次預訂|次预订|booked|Bookings?)`)
+}
+
+func reviewCount(text string) string {
+	return firstRegex(text, `([\d,]+)\s*(?:則評價|条评价|reviews?)`)
+}
+
+func badReviewCount(text string) string {
+	return firstRegex(text, `(?:中差|中性評價及負面評價|中性评价及负面评价|negative|bad)[^\d]{0,20}([\d,]+)`)
+}
+
+func scoreNear(text string, label string) string {
+	return firstRegex(text, regexp.QuoteMeta(label)+`.{0,30}?(\d+(?:\.\d+)?)`)
+}
+
+func firstRegex(text string, pattern string) string {
+	re := regexp.MustCompile(`(?is)` + pattern)
+	match := re.FindStringSubmatch(text)
+	if len(match) < 2 {
+		return ""
+	}
+	return strings.ReplaceAll(match[1], ",", "")
+}
+
+func productInfo(text string) string {
+	for _, label := range []string{"Product Info", "商品資訊", "商品资讯", "Details"} {
+		index := strings.Index(text, label)
+		if index >= 0 {
+			runes := []rune(text[index:])
+			if len(runes) > 500 {
+				runes = runes[:500]
+			}
+			return strings.Join(strings.Fields(string(runes)), " ")
+		}
+	}
+	return ""
+}
+
+func numericText(value string) string {
+	return firstRegex(value, `([0-9,]+(?:\.\d+)?)`)
+}
+
+func scoreText(value string) string {
+	return firstRegex(value, `(\d+(?:\.\d+)?)`)
+}
+
+func compactText(value string) string {
+	return strings.Join(strings.Fields(strings.TrimSpace(value)), " ")
+}
+
+func detectChromePath() string {
+	candidates := []string{}
+	switch runtime.GOOS {
+	case "darwin":
+		home, _ := os.UserHomeDir()
+		candidates = []string{
+			"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+			filepath.Join(home, "Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+			"google-chrome",
+			"chrome",
+		}
+	case "windows":
+		candidates = []string{
+			os.ExpandEnv(`${ProgramFiles}\Google\Chrome\Application\chrome.exe`),
+			os.ExpandEnv(`${ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe`),
+			os.ExpandEnv(`${LocalAppData}\Google\Chrome\Application\chrome.exe`),
+		}
+	default:
+		candidates = []string{"google-chrome", "chromium", "chromium-browser"}
+	}
+	for _, candidate := range candidates {
+		path := candidate
+		if !strings.ContainsAny(candidate, `/\`) {
+			if found, err := exec.LookPath(candidate); err == nil {
+				path = found
+			}
+		}
+		if stat, err := os.Stat(path); err == nil && !stat.IsDir() {
+			return path
+		}
+	}
+	return ""
+}
+
+func chromeMajorVersion(chromePath string) string {
+	out, err := exec.Command(chromePath, "--version").CombinedOutput()
+	if err != nil {
+		return ""
+	}
+	match := regexp.MustCompile(`(\d+)\.`).FindStringSubmatch(string(out))
+	if len(match) > 1 {
+		return match[1]
+	}
+	return ""
+}
+
+func managedBrowserRSSMB(userDataDir string) float64 {
+	if userDataDir == "" || runtime.GOOS == "windows" {
+		return 0
+	}
+	cmd := exec.Command("ps", "-axo", "rss=,command=")
+	out, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+	totalKB := 0
+	scanner := bufio.NewScanner(strings.NewReader(string(out)))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.Contains(line, userDataDir) {
+			continue
+		}
+		parts := strings.Fields(line)
+		if len(parts) == 0 {
+			continue
+		}
+		rss, _ := strconv.Atoi(parts[0])
+		totalKB += rss
+	}
+	return float64(totalKB) / 1024
+}
+
+func elapsedMS(start time.Time) int {
+	return int(time.Since(start).Milliseconds())
+}
