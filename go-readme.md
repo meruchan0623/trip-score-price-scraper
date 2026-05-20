@@ -209,7 +209,7 @@ Excel 读取规则：
 
 1. 检测本机 Google Chrome 和主版本。
 2. 在 undetected-chromedriver cache 目录准备 patched chromedriver。
-3. 复制本机 Chrome User Data Dir 到临时 profile，避免直接占用默认 profile 的 remote debugging 限制。
+3. 使用 Go CLI 自己维护的 managed profile seed，并复制出 worker 专用 profile，避免直接占用默认 Chrome profile 的 remote debugging 限制。
 4. 直接启动 Chrome subprocess，附带 `--remote-debugging-host=127.0.0.1`、`--remote-debugging-port`、`--disable-blink-features=AutomationControlled`、`--start-maximized` 等参数。
 5. 启动 chromedriver service，并通过 `goog:chromeOptions.debuggerAddress` attach 到已有 Chrome。
 6. Rod 连接同一个 CDP endpoint，执行页面抓取。
@@ -235,8 +235,9 @@ profile 和 session：
 - 第二次运行会自动复用 `_state/session.json` 与 `_state/profile/`。
 - 如果 `_state/` 不存在，Go CLI 会扫描最近的 `~/Documents/trip_vendor_results/YYMMDD-HHMM/_workers/*/`，把历史 worker 的 `session.json` 和 `profile/` 迁移为 `_state/`。
 - 每次运行期间仍使用当前 run folder 下的 `_workers/<id_vendor>/session.json` 和 `_workers/<id_vendor>/profile/` 做隔离；任务结束后统合回 `_state/`，成功后清理 `_workers/`。
-- 默认以 `_state/profile/` 作为 profile seed；首次运行没有 `_state/profile/` 时才从本机 Chrome profile/cache 创建。
-- profile copy 会跳过 `Singleton*`、Crashpad、BrowserMetrics、journal、wal、shm、socket、symlink 等易损或锁文件。
+- 默认以 `_state/profile/` 作为 profile seed；首次运行没有 `_state/profile/` 时创建一个干净的 Go CLI 专用 profile，让 Chrome/CDP 自行积累登录态。
+- 如果检测到旧版从本机 Chrome 复制来的大型 `_state/profile/`，首次运行会把它重命名为 `profile_legacy_*` 备份，然后创建新的 managed profile，后续运行直接复用轻量状态。
+- profile copy 会跳过 `Singleton*`、Crashpad、BrowserMetrics、journal、wal、shm、socket、symlink、Cache、Code Cache、扩展目录和 Chrome 组件缓存等易损或膨胀文件。
 - session JSON 是 Python 兼容的补充层，结构为：
 
 ```json
@@ -328,7 +329,7 @@ profile 和 session：
 ```json
 {"event":"run_started","mode":"single","url_count":1,"workers":1,"delay_profile":"safe"}
 {"event":"browser_prepare","stage":"driver_prepare","driver_reused":true,"driver_version":"148.0.7778.178"}
-{"event":"browser_prepare","stage":"browser_start","profile_mode":"copied_local_profile","debugger_address":"127.0.0.1:53587"}
+{"event":"browser_prepare","stage":"browser_start","profile_mode":"configured_profile","debugger_address":"127.0.0.1:53587"}
 {"event":"url_started","url":"https://hk.trip.com/things-to-do/detail/92237157/","first_trip_navigation_url":"https://hk.trip.com/things-to-do/detail/92237157/?curr=HKD&locale=zh-hk","session_nav_skipped":true}
 {"event":"log","stage":"risk","message":"risk scripts detected","risk_scripts_detected":[".../risk/ubtrms/...",".../jigsaw-captcha/..."]}
 {"event":"delay_applied","stage":"page_open","label":"page","delay_ms":1112}

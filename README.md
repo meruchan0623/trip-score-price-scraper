@@ -673,7 +673,7 @@ failed: At least one URL is required via --input, --urls-file, or --excel-input.
 
 Go CLI 当前用于验证和运行 Go-native 抓取链路：patched chromedriver + Chrome subprocess + WebDriver attach 负责浏览器启动与生命周期，Rod/CDP 继续负责 Trip 页面、SKU 遍历、价格、实价和促销标签读取。它也提供 `--json-lines`、Excel 多厂商 worker、可取消中断、延迟档位等面向批量运行的能力。
 
-Go CLI 默认结果统一写入 `~/Documents/trip_vendor_results/YYMMDD-HHMM/`，默认不写 `run.log`；长期 session 与 profile 统一维护在 `~/Documents/trip_vendor_results/_state/`，第二次运行会自动复用。
+Go CLI 默认结果统一写入 `~/Documents/trip_vendor_results/YYMMDD-HHMM/`，默认不写 `run.log`；长期 session 与 managed profile 统一维护在 `~/Documents/trip_vendor_results/_state/`，第二次运行会自动复用。Go CLI 不再从本机日常 Chrome profile 复制完整 User Data，Windows 上会避免把数 GB 的缓存、扩展和组件文件复制到每个 worker。
 
 快速运行：
 

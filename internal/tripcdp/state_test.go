@@ -10,7 +10,7 @@ import (
 
 func TestDefaultOutputPathsUseVendorResultsRunFolder(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHome(t, home)
 
 	path := defaultSingleOutputPath(TaskRequest{}, "260520-1234")
 	want := filepath.Join(home, "Documents", "trip_vendor_results", "260520-1234", "trip_scoreandprice_results_260520-1234.xlsx")
@@ -32,11 +32,72 @@ func TestDefaultOutputPathsUseVendorResultsRunFolder(t *testing.T) {
 
 func TestDefaultSessionPathUsesStateFolder(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHome(t, home)
 
 	want := filepath.Join(home, "Documents", "trip_vendor_results", "_state", "session.json")
 	if got := defaultSessionPath(); got != want {
 		t.Fatalf("default session path = %q, want %q", got, want)
+	}
+}
+
+func TestResolveRuntimeStateCreatesManagedProfileWithoutSystemCopy(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+	localAppData := t.TempDir()
+	t.Setenv("LOCALAPPDATA", localAppData)
+	systemProfile := filepath.Join(localAppData, "Google", "Chrome", "User Data")
+	mustWrite(t, filepath.Join(systemProfile, "Local State"), []byte(`{"system":true}`))
+	mustWrite(t, filepath.Join(systemProfile, "Default", "Extensions", "extension", "manifest.json"), []byte(`{"name":"large extension"}`))
+
+	state := resolveRuntimeState(TaskRequest{})
+	if !fileExists(filepath.Join(state.StateProfileDir, managedProfileMarker)) {
+		t.Fatal("managed profile marker was not created")
+	}
+	if !fileExists(filepath.Join(state.StateProfileDir, "Local State")) {
+		t.Fatal("managed profile Local State was not created")
+	}
+	if fileExists(filepath.Join(state.StateProfileDir, "Default", "Extensions", "extension", "manifest.json")) {
+		t.Fatal("system Chrome extension should not be copied into managed state")
+	}
+}
+
+func TestResolveRuntimeStateIsolatesExistingUnmanagedProfile(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+	stateDir := filepath.Join(home, "Documents", "trip_vendor_results", "_state")
+	profileDir := filepath.Join(stateDir, "profile")
+	mustWrite(t, filepath.Join(profileDir, "Local State"), []byte(`{"ok":true}`))
+	mustWrite(t, filepath.Join(profileDir, "Default", "Network", "Cookies"), []byte("cookies"))
+	mustWrite(t, filepath.Join(profileDir, "Default", "Local Storage", "leveldb", "000003.log"), []byte("local-storage"))
+	mustWrite(t, filepath.Join(profileDir, "Default", "Cache", "Cache_Data", "data_0"), []byte("cache"))
+	mustWrite(t, filepath.Join(profileDir, "Default", "Extensions", "extension", "manifest.json"), []byte(`{"name":"extension"}`))
+
+	state := resolveRuntimeState(TaskRequest{})
+	if len(state.Warnings) > 0 {
+		t.Fatalf("resolveRuntimeState warnings = %#v", state.Warnings)
+	}
+	if !fileExists(filepath.Join(profileDir, managedProfileMarker)) {
+		t.Fatal("managed profile marker was not created after isolation")
+	}
+	if !fileExists(filepath.Join(profileDir, "Local State")) {
+		t.Fatal("new managed profile should contain Local State")
+	}
+	for _, skipped := range []string{
+		filepath.Join("Default", "Network", "Cookies"),
+		filepath.Join("Default", "Local Storage", "leveldb", "000003.log"),
+		filepath.Join("Default", "Cache", "Cache_Data", "data_0"),
+		filepath.Join("Default", "Extensions", "extension", "manifest.json"),
+	} {
+		if fileExists(filepath.Join(profileDir, skipped)) {
+			t.Fatalf("%s should not be copied into the new managed profile", skipped)
+		}
+	}
+	legacy, err := filepath.Glob(filepath.Join(stateDir, "profile_legacy_*"))
+	if err != nil || len(legacy) != 1 {
+		t.Fatalf("legacy profile backup = %v, err=%v", legacy, err)
+	}
+	if !fileExists(filepath.Join(legacy[0], "Default", "Network", "Cookies")) {
+		t.Fatal("legacy profile backup should retain original cookies")
 	}
 }
 
@@ -168,4 +229,12 @@ func mustWriteSession(t *testing.T, path string, data sessionData) {
 		t.Fatalf("marshal session: %v", err)
 	}
 	mustWrite(t, path, raw)
+}
+
+func setTestHome(t *testing.T, home string) {
+	t.Helper()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("HOMEDRIVE", "")
+	t.Setenv("HOMEPATH", "")
 }
