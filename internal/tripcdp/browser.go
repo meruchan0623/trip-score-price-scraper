@@ -2028,7 +2028,12 @@ func detectChromePath() string {
 }
 
 func chromeMajorVersion(chromePath string) string {
-	out, err := exec.Command(chromePath, "--version").CombinedOutput()
+	if runtime.GOOS == "windows" {
+		return chromeMajorVersionFromInstallDir(chromePath)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, chromePath, "--version").CombinedOutput()
 	if err != nil {
 		return ""
 	}
@@ -2037,6 +2042,53 @@ func chromeMajorVersion(chromePath string) string {
 		return match[1]
 	}
 	return ""
+}
+
+func chromeMajorVersionFromInstallDir(chromePath string) string {
+	entries, err := os.ReadDir(filepath.Dir(chromePath))
+	if err != nil {
+		return ""
+	}
+	versionRe := regexp.MustCompile(`^(\d+)\.\d+\.\d+\.\d+$`)
+	versionMain := ""
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		match := versionRe.FindStringSubmatch(entry.Name())
+		if len(match) < 2 {
+			continue
+		}
+		if versionMain == "" || compareVersionStrings(entry.Name(), versionMain) > 0 {
+			versionMain = entry.Name()
+		}
+	}
+	if versionMain == "" {
+		return ""
+	}
+	return strings.SplitN(versionMain, ".", 2)[0]
+}
+
+func compareVersionStrings(left string, right string) int {
+	leftParts := strings.Split(left, ".")
+	rightParts := strings.Split(right, ".")
+	for i := 0; i < len(leftParts) || i < len(rightParts); i++ {
+		leftValue := 0
+		rightValue := 0
+		if i < len(leftParts) {
+			leftValue, _ = strconv.Atoi(leftParts[i])
+		}
+		if i < len(rightParts) {
+			rightValue, _ = strconv.Atoi(rightParts[i])
+		}
+		if leftValue > rightValue {
+			return 1
+		}
+		if leftValue < rightValue {
+			return -1
+		}
+	}
+	return 0
 }
 
 func managedBrowserRSSMB(userDataDir string) float64 {

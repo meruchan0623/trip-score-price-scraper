@@ -126,8 +126,12 @@ func copyChromeProfile(src string, dst string) error {
 }
 
 func shouldSkipChromeProfilePath(rel string, entry fs.DirEntry) bool {
+	parts := strings.Split(filepath.ToSlash(rel), "/")
 	name := entry.Name()
 	if strings.HasPrefix(name, "Singleton") || strings.HasSuffix(name, "-journal") || strings.HasSuffix(name, "-wal") || strings.HasSuffix(name, "-shm") {
+		return true
+	}
+	if isChromeCacheDir(name) || isChromeGeneratedRoot(parts) || isChromeExtensionPath(parts) {
 		return true
 	}
 	if entry.IsDir() {
@@ -137,6 +141,47 @@ func shouldSkipChromeProfilePath(rel string, entry fs.DirEntry) bool {
 		}
 	}
 	return false
+}
+
+func isChromeCacheDir(name string) bool {
+	switch name {
+	case "Cache", "Code Cache", "GPUCache", "DawnCache", "ShaderCache", "GrShaderCache", "Media Cache", "blob_storage":
+		return true
+	default:
+		return false
+	}
+}
+
+func isChromeGeneratedRoot(parts []string) bool {
+	if len(parts) == 0 {
+		return false
+	}
+	switch parts[0] {
+	case "ActorSafetyLists", "AmountExtractionHeuristicRegexes", "AutofillStates", "CertificateRevocation",
+		"Crowd Deny", "FileTypePolicies", "FirstPartySetsPreloaded", "hyphen-data", "MEIPreload",
+		"OptimizationHints", "OptGuideOnDeviceModel", "OriginTrials", "PKIMetadata", "SafetyTips",
+		"SSLErrorAssistant", "Subresource Filter", "TrustTokenKeyCommitments", "WasmTtsEngine",
+		"ZxcvbnData", "component_crx_cache", "extensions_crx_cache", "segmentation_platform",
+		"optimization_guide_model_store", "MediaFoundationWidevineCdm", "OnDeviceHeadSuggestModel":
+		return true
+	default:
+		return false
+	}
+}
+
+func isChromeExtensionPath(parts []string) bool {
+	if len(parts) < 2 {
+		return false
+	}
+	if parts[0] != "Default" && parts[0] != "System Profile" {
+		return false
+	}
+	switch parts[1] {
+	case "Extensions", "Extension Rules", "Extension Scripts", "Extension State", "Local Extension Settings", "Managed Extension Settings", "Storage":
+		return true
+	default:
+		return false
+	}
 }
 
 func copyFile(src string, dst string, mode os.FileMode) error {

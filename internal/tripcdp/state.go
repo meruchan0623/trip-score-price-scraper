@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 )
 
 type runtimeState struct {
@@ -20,6 +21,8 @@ type runtimeState struct {
 	Migrated        bool
 	Warnings        []string
 }
+
+const managedProfileMarker = ".trip-score-cdp-managed-profile"
 
 func resolveRuntimeState(request TaskRequest) runtimeState {
 	state := runtimeState{
@@ -56,10 +59,19 @@ func resolveRuntimeState(request TaskRequest) runtimeState {
 		_ = writeEmptySession(state.SessionFile)
 	}
 	if !dirExists(state.StateProfileDir) {
-		source := defaultChromeUserDataDir()
-		if err := replaceProfileDir(source, state.StateProfileDir); err != nil {
+		if err := createManagedChromeProfile(state.StateProfileDir); err != nil {
 			state.Warnings = append(state.Warnings, "state profile seed unavailable: "+err.Error())
-			state.ProfileSeedDir = source
+		}
+	} else if !fileExists(filepath.Join(state.StateProfileDir, managedProfileMarker)) {
+		if err := isolateUnmanagedChromeProfile(state.StateProfileDir); err != nil {
+			state.Warnings = append(state.Warnings, "state profile isolation failed: "+err.Error())
+		} else if err := createManagedChromeProfile(state.StateProfileDir); err != nil {
+			state.Warnings = append(state.Warnings, "state profile seed unavailable: "+err.Error())
+		}
+	}
+	if !usableProfileDir(state.StateProfileDir) {
+		if err := createManagedChromeProfile(state.StateProfileDir); err != nil {
+			state.Warnings = append(state.Warnings, "state profile seed unavailable: "+err.Error())
 		}
 	}
 	return state
@@ -285,6 +297,38 @@ func replaceProfileDir(src string, dst string) error {
 	}
 	_ = os.RemoveAll(backup)
 	return nil
+}
+
+func createManagedChromeProfile(dst string) error {
+	dst = expandPath(dst)
+	if err := os.MkdirAll(filepath.Join(dst, "Default"), 0o755); err != nil {
+		return err
+	}
+	if !fileExists(filepath.Join(dst, "Local State")) {
+		if err := os.WriteFile(filepath.Join(dst, "Local State"), []byte(`{}`), 0o644); err != nil {
+			return err
+		}
+	}
+	preferences := filepath.Join(dst, "Default", "Preferences")
+	if !fileExists(preferences) {
+		if err := os.WriteFile(preferences, []byte(`{"profile":{"exit_type":null}}`), 0o644); err != nil {
+			return err
+		}
+	}
+	return os.WriteFile(filepath.Join(dst, managedProfileMarker), []byte("managed by trip-score-cdp\n"), 0o644)
+}
+
+func isolateUnmanagedChromeProfile(profileDir string) error {
+	profileDir = expandPath(profileDir)
+	if !dirExists(profileDir) {
+		return nil
+	}
+	parent := filepath.Dir(profileDir)
+	backup := filepath.Join(parent, "profile_legacy_"+time.Now().Format("20060102-150405"))
+	for i := 2; dirExists(backup); i++ {
+		backup = filepath.Join(parent, fmt.Sprintf("profile_legacy_%s_%d", time.Now().Format("20060102-150405"), i))
+	}
+	return os.Rename(profileDir, backup)
 }
 
 func usableProfileDir(path string) bool {

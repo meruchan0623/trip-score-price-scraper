@@ -37,6 +37,18 @@ func TestFindCachedPatchedDriverReusesNewestPatchedBinary(t *testing.T) {
 	oldPath := driverCachePath(dir, "147")
 	newPath := driverCachePath(dir, "148")
 	plainPath := filepath.Join(dir, "plain_chromedriver")
+	originalExec := execCommandOutput
+	t.Cleanup(func() { execCommandOutput = originalExec })
+	execCommandOutput = func(name string, args ...string) (string, error) {
+		switch name {
+		case oldPath:
+			return "ChromeDriver 147.0.0.0 test", nil
+		case newPath:
+			return "ChromeDriver 148.0.0.0 test", nil
+		default:
+			return "", fmt.Errorf("unexpected command: %s", name)
+		}
+	}
 	fakeDriver := fakeChromeDriverScript("148.0.0.0")
 	if err := os.WriteFile(oldPath, []byte(fakeChromeDriverScript("147.0.0.0")), 0o755); err != nil {
 		t.Fatal(err)
@@ -63,7 +75,11 @@ func TestFindCachedPatchedDriverReusesNewestPatchedBinary(t *testing.T) {
 
 func TestDriverCachePathIncludesChromeMajor(t *testing.T) {
 	path := driverCachePath("/tmp/cache", "148")
-	if filepath.Base(path) != "undetected_chromedriver_148" {
+	want := "undetected_chromedriver_148"
+	if filepath.Ext(path) == ".exe" {
+		want += ".exe"
+	}
+	if filepath.Base(path) != want {
 		t.Fatalf("cache path = %s", path)
 	}
 }

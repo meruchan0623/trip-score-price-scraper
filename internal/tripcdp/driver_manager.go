@@ -466,7 +466,7 @@ func validateChromeDriverBinary(path string, chromeMajor string) error {
 	return nil
 }
 
-func execCommandOutput(name string, args ...string) (string, error) {
+var execCommandOutput = func(name string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, name, args...)

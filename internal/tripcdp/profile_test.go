@@ -74,6 +74,23 @@ func TestDefaultChromeUserDataDir(t *testing.T) {
 	}
 }
 
+func TestChromeMajorVersionFromInstallDir(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "chrome.exe"), []byte("chrome"))
+	if err := os.Mkdir(filepath.Join(dir, "147.0.1.1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "148.0.7778.168"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "not-a-version"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := chromeMajorVersionFromInstallDir(filepath.Join(dir, "chrome.exe")); got != "148" {
+		t.Fatalf("chrome major = %q, want 148", got)
+	}
+}
+
 func TestCopyChromeProfileSkipsLocksAndKeepsCoreFiles(t *testing.T) {
 	root := t.TempDir()
 	src := filepath.Join(root, "Chrome")
@@ -87,6 +104,9 @@ func TestCopyChromeProfileSkipsLocksAndKeepsCoreFiles(t *testing.T) {
 	mustWrite(t, filepath.Join(src, "Default", "IndexedDB", "https_trip.com_0.indexeddb.leveldb", "000003.log"), []byte("indexeddb"))
 	mustWrite(t, filepath.Join(src, "Default", "Login Data"), []byte("login-data"))
 	mustWrite(t, filepath.Join(src, "Default", "Cache", "Cache_Data", "data_0"), []byte("cache"))
+	mustWrite(t, filepath.Join(src, "Default", "Code Cache", "js", "data_0"), []byte("code-cache"))
+	mustWrite(t, filepath.Join(src, "Default", "Extensions", "extension", "manifest.json"), []byte("extension"))
+	mustWrite(t, filepath.Join(src, "component_crx_cache", "metadata.json"), []byte("component-cache"))
 	mustWrite(t, filepath.Join(src, "Default", "Cookies-wal"), []byte("wal"))
 	mustWrite(t, filepath.Join(src, "Crashpad", "x"), []byte("crash"))
 
@@ -105,13 +125,20 @@ func TestCopyChromeProfileSkipsLocksAndKeepsCoreFiles(t *testing.T) {
 		filepath.Join("Default", "Session Storage", "000003.log"),
 		filepath.Join("Default", "IndexedDB", "https_trip.com_0.indexeddb.leveldb", "000003.log"),
 		filepath.Join("Default", "Login Data"),
-		filepath.Join("Default", "Cache", "Cache_Data", "data_0"),
 	} {
 		if _, err := os.Stat(filepath.Join(dst, kept)); err != nil {
 			t.Fatalf("%s was not copied: %v", kept, err)
 		}
 	}
-	for _, skipped := range []string{"SingletonLock", filepath.Join("Default", "Cookies-wal"), filepath.Join("Crashpad", "x")} {
+	for _, skipped := range []string{
+		"SingletonLock",
+		filepath.Join("Default", "Cookies-wal"),
+		filepath.Join("Crashpad", "x"),
+		filepath.Join("Default", "Cache", "Cache_Data", "data_0"),
+		filepath.Join("Default", "Code Cache", "js", "data_0"),
+		filepath.Join("Default", "Extensions", "extension", "manifest.json"),
+		filepath.Join("component_crx_cache", "metadata.json"),
+	} {
 		if _, err := os.Stat(filepath.Join(dst, skipped)); !os.IsNotExist(err) {
 			t.Fatalf("%s should have been skipped, stat err=%v", skipped, err)
 		}
