@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -103,7 +104,7 @@ func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bo
 	fs.IntVar(&workers, "workers", 0, "Concurrent browser workers, 1-5. Defaults to min(vendor count, 5).")
 	fs.Float64Var(&startupStagger, "startup-stagger", 0.5, "Seconds to wait between starting vendor browser workers. Use 0 to disable staggering.")
 	fs.IntVar(&stopGrace, "stop-grace-seconds", 30, "Seconds to wait for partial exports after SIGINT/SIGTERM before terminating workers.")
-	fs.StringVar(&runMode, "run-mode", "", "Preset run mode: mode1=headless full scrape; mode2=headed rating-only scrape.")
+	fs.StringVar(&runMode, "run-mode", "", "Preset run mode: mode1=headed full scrape; mode2=headed rating/product-info scrape.")
 	fs.StringVar(&browser, "browser", "chrome", "Browser to use. Only chrome is supported.")
 	fs.BoolFunc("headless", "Run Chrome in headless mode.", func(string) error { headless = triState{set: true, value: true}; return nil })
 	fs.BoolFunc("no-headless", "Run Chrome with a visible browser window.", func(string) error { headless = triState{set: true, value: false}; return nil })
@@ -152,6 +153,9 @@ func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bo
 	if err != nil {
 		return TaskRequest{}, "", "", false, false, err
 	}
+	if delayProfile == "normal" && !stringFlagPassed(argv, "delay-profile") && runMode == "mode2" {
+		delayProfile = "fast"
+	}
 	delayOptions, err := resolveDelayOptions(delayProfile, delayOverrides)
 	if err != nil {
 		return TaskRequest{}, "", "", false, false, err
@@ -194,7 +198,7 @@ func resolveRunOptions(runMode string, headless triState, ratingOnly triState, r
 	options := runOptions{headless: false, ratingOnly: false, realPrice: true, productInfo: true}
 	switch runMode {
 	case "mode1":
-		options = runOptions{headless: true, ratingOnly: false, realPrice: true, productInfo: true}
+		options = runOptions{headless: false, ratingOnly: false, realPrice: true, productInfo: true}
 	case "mode2":
 		options = runOptions{headless: false, ratingOnly: true, realPrice: false, productInfo: true}
 	}
@@ -211,6 +215,20 @@ func resolveRunOptions(runMode string, headless triState, ratingOnly triState, r
 		options.productInfo = productInfo.value
 	}
 	return options
+}
+
+func stringFlagPassed(argv []string, name string) bool {
+	long := "--" + name
+	short := "-" + name
+	for i, arg := range argv {
+		if arg == long || arg == short || strings.HasPrefix(arg, long+"=") || strings.HasPrefix(arg, short+"=") {
+			return true
+		}
+		if (arg == long || arg == short) && i+1 < len(argv) {
+			return true
+		}
+	}
+	return false
 }
 
 func buildDelayOverrides(pageMin float64, pageMax float64, scrollMin float64, scrollMax float64, skuClickMin float64, skuClickMax float64, skuPriceMin float64, skuPriceMax float64, skuBetweenMin float64, skuBetweenMax float64) (delayOverrides, error) {
