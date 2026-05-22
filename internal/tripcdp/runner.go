@@ -70,6 +70,8 @@ func scrapeSingle(request TaskRequest, reporter Reporter, runMode string) TaskRe
 		"profile_seed_dir":     absPath(state.ProfileSeedDir),
 	})
 	preflight(request, reporter)
+	powerGuard := startSystemAwakeGuard(reporter)
+	defer powerGuard.close()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -191,6 +193,8 @@ func scrapeVendorBatches(request TaskRequest, reporter Reporter, runMode string)
 		"profile_seed_dir":     absPath(state.ProfileSeedDir),
 	})
 	preflight(request, reporter)
+	powerGuard := startSystemAwakeGuard(reporter)
+	defer powerGuard.close()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

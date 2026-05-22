@@ -12,9 +12,9 @@ func TestDelayProfileOptions(t *testing.T) {
 		pageMin time.Duration
 		pageMax time.Duration
 	}{
-		{profile: "fast", pageMin: 200 * time.Millisecond, pageMax: 500 * time.Millisecond},
-		{profile: "normal", pageMin: 400 * time.Millisecond, pageMax: 900 * time.Millisecond},
-		{profile: "safe", pageMin: 800 * time.Millisecond, pageMax: 1500 * time.Millisecond},
+		{profile: "fast", pageMin: 400 * time.Millisecond, pageMax: 900 * time.Millisecond},
+		{profile: "normal", pageMin: 800 * time.Millisecond, pageMax: 1500 * time.Millisecond},
+		{profile: "safe", pageMin: 1500 * time.Millisecond, pageMax: 3 * time.Second},
 		{profile: "slow", pageMin: 1500 * time.Millisecond, pageMax: 3 * time.Second},
 	}
 	for _, tt := range tests {
@@ -46,7 +46,7 @@ func TestResolveDelayOptionsOverrides(t *testing.T) {
 	if options.SKUClick.Min != 2*time.Second || options.SKUClick.Max != 3*time.Second {
 		t.Fatalf("sku click override = %s-%s, want 2s-3s", options.SKUClick.Min, options.SKUClick.Max)
 	}
-	if options.Page.Min != 800*time.Millisecond || options.Page.Max != 1500*time.Millisecond {
+	if options.Page.Min != 1500*time.Millisecond || options.Page.Max != 3*time.Second {
 		t.Fatalf("page profile default changed unexpectedly: %s-%s", options.Page.Min, options.Page.Max)
 	}
 }

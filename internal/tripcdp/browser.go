@@ -3,6 +3,7 @@ package tripcdp
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -49,6 +50,13 @@ type skuOption struct {
 	ID    string `json:"id"`
 }
 
+const (
+	skuLayerWaitMax    = 8 * time.Second
+	skuLayerWaitPoll   = 300 * time.Millisecond
+	skuOptionsWaitMax  = 5 * time.Second
+	skuOptionsWaitPoll = 300 * time.Millisecond
+)
+
 type priceBundle struct {
 	DisplayPrice    string `json:"display_price"`
 	RealPrice       string `json:"real_price"`
@@ -56,6 +64,22 @@ type priceBundle struct {
 	FooterText      string `json:"footer_text"`
 	FooterSignature string `json:"footer_signature"`
 	SampleAtMS      int    `json:"sample_at_ms"`
+}
+
+type batchPromotionPriceBundle struct {
+	PackageID       int64   `json:"package_id"`
+	ResourceID      int64   `json:"resource_id"`
+	ItemID          int64   `json:"item_id"`
+	Currency        string  `json:"currency"`
+	OriginalPrice   float64 `json:"original_price"`
+	DeductionAmount float64 `json:"deduction_amount"`
+	DeductionPrice  float64 `json:"deduction_price"`
+	PromoDisplay    string  `json:"promo_display"`
+	PromoName       string  `json:"promo_name"`
+	PromoMatched    bool    `json:"promo_matched"`
+	ResponseStatus  int     `json:"response_status"`
+	ResponseURL     string  `json:"response_url"`
+	ResponseText    string  `json:"response_text"`
 }
 
 type baseRatingBundle struct {
@@ -170,66 +194,44 @@ const baseRatingBundleJS = `(includeProductInfo) => {
 		return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
 	};
 	const textOf = (el) => (el && (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ')) || '';
-	const firstText = (selectors) => {
-		for (const selector of selectors) {
-			for (const el of document.querySelectorAll(selector)) {
-				if (!isVisible(el)) continue;
-				const text = textOf(el);
-				if (text) return text;
-			}
-		}
-		return '';
+	const cssText = (selector) => {
+		const el = document.querySelectorAll(selector)[0];
+		return textOf(el);
+	};
+	const xpathText = (xpath) => {
+		const snapshot = document.evaluate(xpath, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+		return textOf(snapshot.snapshotItem(0));
 	};
 	const numberText = (text) => {
 		const match = (text || '').match(/([0-9,]+(?:\.\d+)?)/);
+		return match ? match[1].replace(/,/g, '') : '';
+	};
+	const parenthesizedNumberText = (text) => {
+		const match = (text || '').match(/\(([0-9,]+)/);
 		return match ? match[1].replace(/,/g, '') : '';
 	};
 	const scoreFromText = (text) => {
 		const match = (text || '').match(/(\d+(?:\.\d+)?)/);
 		return match ? match[1] : '';
 	};
-	const scoreForLabels = (labels) => {
-		const exactElements = Array.from(document.querySelectorAll('div,span')).filter((el) => {
-			if (!isVisible(el)) return false;
-			return labels.includes(textOf(el));
-		});
-		for (const labelEl of exactElements) {
-			const sibling = labelEl.nextElementSibling;
-			const siblingScore = scoreFromText(textOf(sibling));
-			if (siblingScore) return siblingScore;
-			const parent = labelEl.parentElement;
-			if (!parent) continue;
-			const scoreEl = parent.querySelector('[class*="socre"], [class*="score"], span');
-			if (scoreEl && scoreEl !== labelEl) {
-				const score = scoreFromText(textOf(scoreEl));
-				if (score) return score;
-			}
-			const label = textOf(labelEl);
-			const pattern = new RegExp(label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\\\s+(\\\\d+(?:\\\\.\\\\d+)?)');
-			const match = textOf(parent).match(pattern);
-			if (match) return match[1];
+	const bookingCountText = (text) => {
+		if (!text) return '';
+		if (text.includes('次預訂')) {
+			return text.split('次預訂')[0].trim().replace(/,/g, '');
 		}
-		for (const row of document.querySelectorAll('div[class*="ct-review-list-subitem-title"]')) {
-			if (!isVisible(row)) continue;
-			const rowText = textOf(row);
-			if (!labels.some((label) => rowText.includes(label))) continue;
-			const score = scoreFromText(rowText);
-			if (score) return score;
-		}
-		return '';
+		return text.replace(/,/g, '');
 	};
-	const bookingText = firstText(['span[testid="saleInfoId"]']);
-	const reviewText = firstText(['span[testid="productdetail-productInfo-commentCountDesc"]']);
-	const score = scoreFromText(firstText(['span[testid="productdetail-productInfo-commentScore"]', '[class*="commentScore"]']));
-	let badReviewCount = '';
-	for (const el of document.querySelectorAll('div[class*="ct-review-list-filiter-label-item"]')) {
-		if (!isVisible(el)) continue;
-		const text = textOf(el);
-		if (text.includes('中性評價及負面評價') || text.includes('中性评价及负面评价') || text.toLowerCase().includes('negative') || text.toLowerCase().includes('bad')) {
-			badReviewCount = numberText(text);
-			if (badReviewCount) break;
-		}
-	}
+	const badReviewNumberText = (text) => {
+		const match = (text || '').match(/\(([0-9,]+)\)/);
+		return match ? match[1].replace(/,/g, '') : '';
+	};
+	const bookingText = cssText('span[testid="saleInfoId"]');
+	const reviewText = cssText('span[testid="productdetail-productInfo-commentCountDesc"]');
+	const score = cssText('span[testid="productdetail-productInfo-commentScore"]');
+	const customerText = score ? xpathText("//div[text()='客戶服務']/following-sibling::span") : '';
+	const convenienceText = score ? xpathText("//div[text()='方便程度']/following-sibling::span") : '';
+	const signalText = score ? xpathText("//div[text()='訊號狀態']/following-sibling::span") : '';
+	const badReviewText = score ? xpathText("//div[contains(@class, 'ct-review-list-filiter-label-item') and contains(., '中性評價及負面評價')]") : '';
 	let productInfo = '';
 	if (includeProductInfo) {
 		for (const selector of ['#group_1001 > div > div > div[class*="style_content_box"] > div > div', 'div[class*="activity_product_detail_html_box"]', '#group_1001']) {
@@ -248,13 +250,13 @@ const baseRatingBundleJS = `(includeProductInfo) => {
 		}
 	}
 	const out = {
-		booking_count: numberText(bookingText),
-		review_count: numberText(reviewText),
+		booking_count: bookingCountText(bookingText),
+		review_count: score ? parenthesizedNumberText(reviewText) : '',
 		score,
-		customer: scoreForLabels(['客戶服務', '客户服务', 'Customer Service']),
-		convenience: scoreForLabels(['方便程度', 'Convenience']),
-		signal: scoreForLabels(['訊號狀態', '讯号状态', 'Signal']),
-		bad_review_count: badReviewCount,
+		customer: score ? scoreFromText(customerText) : '',
+		convenience: score ? scoreFromText(convenienceText) : '',
+		signal: score ? scoreFromText(signalText) : '',
+		bad_review_count: score ? badReviewNumberText(badReviewText) : '',
 		product_info: productInfo,
 	};
 	out.signature = [out.score, out.customer, out.convenience, out.signal, out.bad_review_count, out.product_info].join('||');
@@ -709,7 +711,7 @@ func (s *tripScraper) extractBaseRow(ctx context.Context, item ScrapeItem) map[s
 		s.emit(Event{"event": "log", "stage": "base_fields", "message": fmt.Sprintf("base fields incomplete score=%q customer=%q convenience=%q signal=%q bad_reviews=%q", bundle.Score, bundle.Customer, bundle.Convenience, bundle.Signal, bundle.BadReviewCount)})
 	}
 	if bundle.Score == "" {
-		bundle.Score = s.firstText([]string{`span[testid="productdetail-productInfo-commentScore"]`, `[class*="commentScore"]`})
+		bundle.Score = s.firstText([]string{`span[testid="productdetail-productInfo-commentScore"]`})
 	}
 	title := firstNonEmpty(s.firstText([]string{"h1", `[data-testid="product-title"]`, `[class*="title"]`}), s.titleFromDocument())
 	return baseRowFromBundle(item, title, text, bundle, s.request.ExtractProductInfo)
@@ -722,19 +724,17 @@ func baseRowFromBundle(item ScrapeItem, title string, pageText string, bundle ba
 	convenience := ""
 	signal := ""
 	badReviews := ""
-	if score != "" {
-		customer = firstNonEmpty(bundle.Customer, scoreNear(pageText, "Customer Service"), scoreNear(pageText, "客户服务"), scoreNear(pageText, "客戶服務"))
-		convenience = firstNonEmpty(bundle.Convenience, scoreNear(pageText, "Convenience"), scoreNear(pageText, "方便程度"), scoreNear(pageText, "方便"))
-		signal = firstNonEmpty(bundle.Signal, scoreNear(pageText, "Signal"), scoreNear(pageText, "讯号状态"), scoreNear(pageText, "訊號狀態"), scoreNear(pageText, "讯号"))
-		badReviews = firstNonEmpty(bundle.BadReviewCount, badReviewCount(pageText))
-	}
+	customer = bundle.Customer
+	convenience = bundle.Convenience
+	signal = bundle.Signal
+	badReviews = bundle.BadReviewCount
 	row := map[string]string{
 		"厂商":    item.Vendor,
 		"商品ID":  productID(item.URL),
 		"URL":   item.URL,
 		"商品名称":  title,
-		"预定数":   firstNonEmpty(bundle.BookingCount, bookingCount(pageText)),
-		"评价数":   firstNonEmpty(bundle.ReviewCount, reviewCount(pageText)),
+		"预定数":   bundle.BookingCount,
+		"评价数":   bundle.ReviewCount,
 		"评分":    score,
 		"客户服务":  customer,
 		"方便程度":  convenience,
@@ -749,12 +749,16 @@ func baseRowFromBundle(item ScrapeItem, title string, pageText string, bundle ba
 
 func (s *tripScraper) extractAllSKUPrices(ctx context.Context) []map[string]string {
 	s.emit(Event{"event": "log", "stage": "sku", "message": "starting SKU option and price extraction"})
-	count := s.skuLayerCount()
+	count, waitMS := s.waitSKULayerCount(ctx, skuLayerWaitMax)
 	if count == 0 {
-		s.emit(Event{"event": "log", "stage": "sku", "message": "SKU container not found; product may have no SKU options"})
+		s.emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("SKU container not found after wait; product may have no SKU options wait_ms=%d", waitMS)})
 		return nil
 	}
+	if waitMS > 1000 {
+		s.emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("SKU container appeared after wait_ms=%d", waitMS)})
+	}
 	s.maxSKULayers = max(s.maxSKULayers, count)
+	s.enableBatchPromotionCapture()
 	s.emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("found %d SKU layers", count)})
 	layers := make([]skuLayerInfo, 0, count)
 	for i := 0; i < count; i++ {
@@ -762,13 +766,71 @@ func (s *tripScraper) extractAllSKUPrices(ctx context.Context) []map[string]stri
 		layers = append(layers, skuLayerInfo{Index: i, Title: title})
 		s.emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("layer %d: %s", i+1, title)})
 	}
-	results := traverseSKUCombinations(ctx, layers, s.layerOptions, func(option skuOption, deselect bool) bool {
+	results := traverseSKUCombinations(ctx, layers, func(index int) []skuOption {
+		options, waitMS := s.waitLayerOptions(ctx, index, skuOptionsWaitMax)
+		if waitMS > 1000 && len(options) > 0 {
+			s.emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("layer %d options appeared after wait_ms=%d", index+1, waitMS)})
+		}
+		return options
+	}, func(option skuOption, deselect bool) bool {
 		return s.clickSKUOption(ctx, option, deselect)
 	}, func(selected []skuOption) map[string]string {
 		return s.currentCombinationPrice(ctx, selected)
 	}, s.emit)
 	s.emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("recursive SKU traversal complete; captured %d combinations", len(results))})
 	return results
+}
+
+func (s *tripScraper) waitSKULayerCount(ctx context.Context, maxWait time.Duration) (int, int) {
+	return waitForSKULayerCount(ctx, s.skuLayerCount, maxWait, skuLayerWaitPoll)
+}
+
+func waitForSKULayerCount(ctx context.Context, countLayers func() int, maxWait time.Duration, pollInterval time.Duration) (int, int) {
+	started := time.Now()
+	deadline := started.Add(maxWait)
+	for {
+		if ctx.Err() != nil {
+			return 0, elapsedMS(started)
+		}
+		count := countLayers()
+		if count > 0 {
+			return count, elapsedMS(started)
+		}
+		if time.Now().After(deadline) {
+			return 0, elapsedMS(started)
+		}
+		select {
+		case <-ctx.Done():
+			return 0, elapsedMS(started)
+		case <-time.After(pollInterval):
+		}
+	}
+}
+
+func (s *tripScraper) waitLayerOptions(ctx context.Context, index int, maxWait time.Duration) ([]skuOption, int) {
+	return waitForLayerOptions(ctx, s.layerOptions, index, maxWait, skuOptionsWaitPoll)
+}
+
+func waitForLayerOptions(ctx context.Context, getOptions func(int) []skuOption, index int, maxWait time.Duration, pollInterval time.Duration) ([]skuOption, int) {
+	started := time.Now()
+	deadline := started.Add(maxWait)
+	for {
+		if ctx.Err() != nil {
+			return nil, elapsedMS(started)
+		}
+		options := getOptions(index)
+		if len(options) > 0 {
+			return options, elapsedMS(started)
+		}
+		if time.Now().After(deadline) {
+			return nil, elapsedMS(started)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, elapsedMS(started)
+		case <-time.After(pollInterval):
+		}
+	}
 }
 
 func traverseSKUCombinations(ctx context.Context, layers []skuLayerInfo, getOptions func(int) []skuOption, click func(skuOption, bool) bool, currentPrice func([]skuOption) map[string]string, emit Reporter) []map[string]string {
@@ -813,32 +875,307 @@ func (s *tripScraper) currentCombinationPrice(ctx context.Context, selected []sk
 	if !sleepDelay(ctx, s.emit, "sku", "sku_price", s.request.DelayOptions.SKUPrice) {
 		return nil
 	}
-	bundle, waitMS := s.waitCurrentPriceBundleStable(ctx, 2*time.Second)
+	batchBundle, waitMS := s.waitBatchPromotionPriceBundle(ctx, selected, 3*time.Second)
 	if ctx.Err() != nil {
 		return nil
 	}
-	fallbackPrice := ""
-	if bundle.DisplayPrice == "" {
-		fallbackPrice = s.currentPrice(ctx, 1)
-	}
-	result := currentCombinationPriceRow(selected, bundle, fallbackPrice, s.request.ExtractRealPrice)
+	result := currentCombinationPriceRowFromBatchPromotion(selected, batchBundle, s.request.ExtractRealPrice)
 	if result["price"] != "价格获取失败" {
 		if waitMS > 1000 {
-			s.emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("price bundle settled slowly: %s wait_ms=%d footer_empty=%v", result["combination"], waitMS, strings.TrimSpace(bundle.FooterText) == "")})
+			s.emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("batch promotion price settled slowly: %s wait_ms=%d promo_matched=%v", result["combination"], waitMS, batchBundle.PromoMatched)})
 		}
-		s.emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("combination price: %s = display:%s%s, real:%s%s, promo:%s", result["combination"], result["currency"], result["price"], result["real_currency"], result["real_price"], result["promo_tag"])})
+		s.emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("combination price: %s = display:%s%s, real:%s%s, promo:%s, price_source=batchSearchBookingSalesPromotion, resourceId=%d, itemId=%d, promo_matched=%v", result["combination"], result["currency"], result["price"], result["real_currency"], result["real_price"], result["promo_tag"], batchBundle.ResourceID, batchBundle.ItemID, batchBundle.PromoMatched)})
 		if !sleepDelay(ctx, s.emit, "sku", "sku_between", s.request.DelayOptions.SKUBetween) {
 			return nil
 		}
 		return result
 	}
-	return currentCombinationPriceRow(selected, priceBundle{}, "", s.request.ExtractRealPrice)
+	s.emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("combination price failed: %s, price_source=batchSearchBookingSalesPromotion, resourceId=%d, itemId=%d, promo_matched=%v", result["combination"], batchBundle.ResourceID, batchBundle.ItemID, batchBundle.PromoMatched)})
+	return result
+}
+
+func (s *tripScraper) enableBatchPromotionCapture() {
+	_ = s.evalJSON(&struct{}{}, `() => {
+		window.__tripCdpBatchPromotionResponses = [];
+		if (window.__tripCdpBatchPromotionHooked) return {};
+		window.__tripCdpBatchPromotionHooked = true;
+		const keep = (url) => String(url || '').includes('/restapi/soa2/31644/batchSearchBookingSalesPromotion');
+		const push = (kind, url, status, text) => {
+			try {
+				window.__tripCdpBatchPromotionResponses.push({
+					kind,
+					url: String(url || ''),
+					status: Number(status || 0),
+					text: String(text || ''),
+					ts: Date.now()
+				});
+				window.__tripCdpBatchPromotionResponses = window.__tripCdpBatchPromotionResponses.slice(-80);
+			} catch (e) {}
+		};
+		const originalFetch = window.fetch;
+		if (typeof originalFetch === 'function') {
+			window.fetch = async function(input, init) {
+				const response = await originalFetch.apply(this, arguments);
+				const url = typeof input === 'string' ? input : (input && input.url) || response.url;
+				if (keep(url)) {
+					response.clone().text().then((text) => push('fetch', url, response.status, text)).catch(() => push('fetch', url, response.status, ''));
+				}
+				return response;
+			};
+		}
+		const OriginalXHR = window.XMLHttpRequest;
+		if (OriginalXHR && OriginalXHR.prototype) {
+			const originalOpen = OriginalXHR.prototype.open;
+			const originalSend = OriginalXHR.prototype.send;
+			OriginalXHR.prototype.open = function(method, url) {
+				this.__tripCdpPromotionURL = url;
+				return originalOpen.apply(this, arguments);
+			};
+			OriginalXHR.prototype.send = function() {
+				this.addEventListener('load', function() {
+					const url = this.__tripCdpPromotionURL || '';
+					if (keep(url)) push('xhr', url, this.status, this.responseText || '');
+				});
+				return originalSend.apply(this, arguments);
+			};
+		}
+		return {};
+	}`)
+}
+
+func (s *tripScraper) clearBatchPromotionResponses() {
+	_ = s.evalJSON(&struct{}{}, `() => {
+		window.__tripCdpBatchPromotionResponses = [];
+		return {};
+	}`)
+}
+
+func (s *tripScraper) waitBatchPromotionPriceBundle(ctx context.Context, selected []skuOption, maxWait time.Duration) (batchPromotionPriceBundle, int) {
+	started := time.Now()
+	deadline := started.Add(maxWait)
+	var latest batchPromotionPriceBundle
+	selectedTexts := make([]string, 0, len(selected))
+	for _, option := range selected {
+		selectedTexts = append(selectedTexts, option.Text)
+	}
+	for {
+		if ctx.Err() != nil {
+			return latest, elapsedMS(started)
+		}
+		latest = s.currentBatchPromotionPriceBundle(selectedTexts)
+		if latest.OriginalPrice > 0 && (latest.PromoMatched || latest.ResponseStatus > 0 || time.Now().After(started.Add(2500*time.Millisecond))) {
+			return latest, elapsedMS(started)
+		}
+		if time.Now().After(deadline) {
+			return latest, elapsedMS(started)
+		}
+		select {
+		case <-ctx.Done():
+			return latest, elapsedMS(started)
+		case <-time.After(150 * time.Millisecond):
+		}
+	}
+}
+
+func (s *tripScraper) currentBatchPromotionPriceBundle(selectedTexts []string) batchPromotionPriceBundle {
+	var bundle batchPromotionPriceBundle
+	_ = s.evalJSON(&bundle, `(selectedTexts) => {
+		const textIncludesAll = (value, parts) => {
+			const text = String(value || '');
+			return (parts || []).every((part) => text.includes(String(part || '')));
+		};
+		const nextScript = document.querySelector('script#__NEXT_DATA__');
+		let product = null;
+		try {
+			const data = JSON.parse((nextScript && nextScript.textContent) || '{}');
+			product = data.props.pageProps.initialState.__STATE_MAP__.PageModel.ds.getProductInfo[0];
+		} catch (e) {}
+		const packages = (product && (product.packageInfos || (product.basicInfo && product.basicInfo.packages))) || [];
+		const resources = (product && product.resourceInfos) || [];
+		const resourceByID = new Map(resources.map((resource) => [Number(resource.resourceId), resource]));
+		const packageInfo = packages.find((item) => textIncludesAll(item.packageName, selectedTexts)) || null;
+		const resourceID = Number((packageInfo && packageInfo.resourceIds && packageInfo.resourceIds[0]) || 0);
+		const resource = resourceByID.get(resourceID) || null;
+		const basic = (resource && resource.basicInfo) || {};
+		const visible = (el) => {
+			if (!el) return false;
+			const style = window.getComputedStyle(el);
+			if (!style || style.display === 'none' || style.visibility === 'hidden') return false;
+			return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+		};
+		const textOf = (el) => (el && (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ')) || '';
+		const firstRenderedBasePrice = () => {
+			const footer = Array.from(document.querySelectorAll('div[class*="price-comp_m_footer_left"], div[class*="default_new_title_foot_warp"], #select_quantity')).find(visible);
+			const root = footer || document.body;
+			for (const el of Array.from(root.querySelectorAll('span,div'))) {
+				if (!visible(el)) continue;
+				const text = textOf(el);
+				const match = text.match(/HK\$\s*([0-9,]+(?:\.\d+)?)/);
+				if (match) return Number(match[1].replace(/,/g, ''));
+			}
+			return 0;
+		};
+		const out = {
+			package_id: Number((packageInfo && packageInfo.packageId) || 0),
+			resource_id: resourceID,
+			item_id: 0,
+			currency: basic.originMarketCurrency || 'HKD',
+			original_price: Number(basic.minPrice || 0) || firstRenderedBasePrice(),
+			deduction_amount: 0,
+			deduction_price: 0,
+			promo_display: '',
+			promo_name: '',
+			promo_matched: false,
+			response_status: 0,
+			response_url: '',
+			response_text: ''
+		};
+		const responses = (window.__tripCdpBatchPromotionResponses || []).slice().reverse();
+		for (const response of responses) {
+			let parsed = null;
+			try { parsed = JSON.parse(response.text || '{}'); } catch (e) {}
+			const aggregations = (parsed && parsed.searchItemAggregations) || [];
+			for (const aggregation of aggregations) {
+				for (const item of (aggregation.itemList || [])) {
+					if (Number(item.itemId) !== resourceID) continue;
+					const promos = item.salespromotionList || [];
+					const promo = promos[0] || {};
+					out.response_status = Number(response.status || 0);
+					out.response_url = String(response.url || '');
+					out.response_text = String(response.text || '');
+					out.item_id = Number(item.itemId || 0);
+					out.promo_matched = promos.length > 0;
+					out.promo_display = String(promo.displayName || '');
+					out.promo_name = String(promo.name || '');
+					out.deduction_amount = Number(promo.deductionAmount || 0);
+					out.deduction_price = Number(promo.deductionPrice || 0);
+					if (!out.deduction_amount && Array.isArray(promo.deductionList) && promo.deductionList.length && out.original_price) {
+						const hit = promo.deductionList.find((entry) => entry && entry.hit) || promo.deductionList[0];
+						const deduction = Number(hit && hit.deduction || 0);
+						const type = Number(hit && hit.type || promo.deductionType || 0);
+						if (type === 1 && deduction > 0 && deduction < 1) {
+							out.deduction_amount = out.original_price * deduction;
+						}
+					}
+					return out;
+				}
+			}
+		}
+		return out;
+	}`, selectedTexts)
+	if bundle.ResourceID > 0 && bundle.ResponseText != "" {
+		applyBatchPromotionResponse(&bundle, bundle.ResponseText, bundle.ResponseStatus, bundle.ResponseURL)
+	}
+	return bundle
+}
+
+func applyBatchPromotionResponse(bundle *batchPromotionPriceBundle, responseText string, status int, responseURL string) bool {
+	if bundle == nil || bundle.ResourceID == 0 || strings.TrimSpace(responseText) == "" {
+		return false
+	}
+	var payload struct {
+		SearchItemAggregations []struct {
+			ItemList []struct {
+				ItemID             int64 `json:"itemId"`
+				SalesPromotionList []struct {
+					DisplayName     string  `json:"displayName"`
+					Name            string  `json:"name"`
+					DeductionAmount float64 `json:"deductionAmount"`
+					DeductionPrice  float64 `json:"deductionPrice"`
+					DeductionType   int     `json:"deductionType"`
+					DeductionList   []struct {
+						Hit       bool    `json:"hit"`
+						Deduction float64 `json:"deduction"`
+						Type      int     `json:"type"`
+					} `json:"deductionList"`
+				} `json:"salespromotionList"`
+			} `json:"itemList"`
+		} `json:"searchItemAggregations"`
+	}
+	if err := json.Unmarshal([]byte(responseText), &payload); err != nil {
+		return false
+	}
+	for _, aggregation := range payload.SearchItemAggregations {
+		for _, item := range aggregation.ItemList {
+			if item.ItemID != bundle.ResourceID {
+				continue
+			}
+			bundle.ItemID = item.ItemID
+			bundle.ResponseStatus = status
+			bundle.ResponseURL = responseURL
+			bundle.PromoMatched = len(item.SalesPromotionList) > 0
+			if !bundle.PromoMatched {
+				bundle.PromoDisplay = ""
+				bundle.PromoName = ""
+				bundle.DeductionAmount = 0
+				bundle.DeductionPrice = 0
+				return true
+			}
+			promo := item.SalesPromotionList[0]
+			bundle.PromoDisplay = promo.DisplayName
+			bundle.PromoName = promo.Name
+			bundle.DeductionAmount = promo.DeductionAmount
+			bundle.DeductionPrice = promo.DeductionPrice
+			if bundle.DeductionAmount == 0 && bundle.OriginalPrice > 0 && len(promo.DeductionList) > 0 {
+				hit := promo.DeductionList[0]
+				for _, entry := range promo.DeductionList {
+					if entry.Hit {
+						hit = entry
+						break
+					}
+				}
+				deductionType := hit.Type
+				if deductionType == 0 {
+					deductionType = promo.DeductionType
+				}
+				if deductionType == 1 && hit.Deduction > 0 && hit.Deduction < 1 {
+					bundle.DeductionAmount = bundle.OriginalPrice * hit.Deduction
+				}
+			}
+			return true
+		}
+	}
+	return false
+}
+
+func currentCombinationPriceRowFromBatchPromotion(selected []skuOption, bundle batchPromotionPriceBundle, extractRealPrice bool) map[string]string {
+	if len(selected) == 0 {
+		return nil
+	}
+	parts := make([]string, 0, len(selected))
+	for _, option := range selected {
+		parts = append(parts, option.Text)
+	}
+	combination := strings.Join(parts, " | ")
+	currency := firstNonEmpty(bundle.Currency, "HKD")
+	if bundle.OriginalPrice <= 0 {
+		return map[string]string{"combination": combination, "currency": "N/A", "price": "价格获取失败", "real_currency": "N/A", "real_price": "N/A", "promo_tag": ""}
+	}
+	price := formatPriceNumber(bundle.OriginalPrice)
+	realCurrency, realPrice := "N/A", "N/A"
+	if extractRealPrice {
+		realCurrency = currency
+		if bundle.PromoMatched && bundle.DeductionAmount > 0 {
+			realPrice = formatPriceNumber(bundle.OriginalPrice - bundle.DeductionAmount)
+		} else {
+			realPrice = price
+		}
+	}
+	promoTag := ""
+	if bundle.PromoMatched {
+		promoText := firstNonEmpty(bundle.PromoDisplay, bundle.PromoName)
+		if promoText != "" {
+			promoTag = "即" + promoText
+		}
+	}
+	return map[string]string{"combination": combination, "currency": currency, "price": price, "real_currency": realCurrency, "real_price": realPrice, "promo_tag": promoTag}
 }
 
 func (s *tripScraper) waitBaseRatingBundleStable(ctx context.Context, maxWait time.Duration) (baseRatingBundle, int) {
 	started := time.Now()
 	samples := []baseRatingBundle{}
 	deadline := started.Add(maxWait)
+	reviewMetricsNudged := false
 	for {
 		if ctx.Err() != nil {
 			return selectBaseRatingBundle(samples), elapsedMS(started)
@@ -847,13 +1184,20 @@ func (s *tripScraper) waitBaseRatingBundleStable(ctx context.Context, maxWait ti
 		bundle.SampleAtMS = elapsedMS(started)
 		samples = append(samples, bundle)
 		if stable, ok := stableBaseRatingBundle(samples); ok {
+			s.scrollToPageTop()
 			return stable, elapsedMS(started)
 		}
+		if !reviewMetricsNudged && bundle.Score != "" && (bundle.Customer == "" || bundle.Convenience == "" || bundle.Signal == "" || bundle.BadReviewCount == "") {
+			reviewMetricsNudged = true
+			s.nudgeReviewMetricsLoad()
+		}
 		if time.Now().After(deadline) {
+			s.scrollToPageTop()
 			return selectBaseRatingBundle(samples), elapsedMS(started)
 		}
 		select {
 		case <-ctx.Done():
+			s.scrollToPageTop()
 			return selectBaseRatingBundle(samples), elapsedMS(started)
 		case <-time.After(200 * time.Millisecond):
 		}
@@ -866,6 +1210,31 @@ func (s *tripScraper) currentBaseRatingBundle() baseRatingBundle {
 	return normalizeBaseRatingBundle(bundle)
 }
 
+func (s *tripScraper) nudgeReviewMetricsLoad() {
+	if s.page == nil {
+		return
+	}
+	_, _ = s.page.Evaluate(rod.Eval(`() => {
+		const textOf = (el) => (el && (el.textContent || '').trim()) || '';
+		const reviewMetric = Array.from(document.querySelectorAll('div')).find((el) => {
+			const text = textOf(el);
+			return text === '客戶服務' || text === '方便程度' || text === '訊號狀態' || text.includes('中性評價及負面評價');
+		});
+		if (reviewMetric) {
+			reviewMetric.scrollIntoView({block: 'center'});
+			return;
+		}
+		window.scrollTo(0, Math.floor(document.body.scrollHeight * 0.55));
+	}`))
+}
+
+func (s *tripScraper) scrollToPageTop() {
+	if s.page == nil {
+		return
+	}
+	_, _ = s.page.Evaluate(rod.Eval(`() => window.scrollTo(0, 0)`))
+}
+
 func stableBaseRatingBundle(samples []baseRatingBundle) (baseRatingBundle, bool) {
 	if len(samples) < 2 {
 		return baseRatingBundle{}, false
@@ -873,6 +1242,9 @@ func stableBaseRatingBundle(samples []baseRatingBundle) (baseRatingBundle, bool)
 	last := samples[len(samples)-1]
 	prev := samples[len(samples)-2]
 	if last.Score == "" {
+		return baseRatingBundle{}, false
+	}
+	if last.ReviewCount == "" || last.Customer == "" || last.Convenience == "" || last.Signal == "" || last.BadReviewCount == "" {
 		return baseRatingBundle{}, false
 	}
 	if baseRatingSignature(last) == "" || baseRatingSignature(last) != baseRatingSignature(prev) {
@@ -1625,11 +1997,14 @@ func (s *tripScraper) clickSKUOption(ctx context.Context, option skuOption, dese
 		if ctx.Err() != nil {
 			return false
 		}
-		var prepared bool
+		var prepared struct {
+			OK       bool `json:"ok"`
+			Selected bool `json:"selected"`
+		}
 		_ = s.evalJSON(&prepared, `(index, optionText, optionID, deselect) => {
 		const layers = Array.from(document.querySelectorAll('div[class*="sku_tab_ceil"]')).filter(el => el.offsetParent !== null);
 		const layer = layers[index];
-		if (!layer) return false;
+		if (!layer) return {ok: false, selected: false};
 		const isVisible = (el) => {
 			if (!el) return false;
 			const style = window.getComputedStyle(el);
@@ -1652,17 +2027,18 @@ func (s *tripScraper) clickSKUOption(ctx context.Context, option skuOption, dese
 			if (textColor.includes('172, 180, 191') || textColor.includes('206, 210, 217')) continue;
 			const elementColor = getComputedStyle(el).color;
 			if (elementColor.includes('206, 210, 217')) continue;
+			const selectedMarker = el.querySelector('[testid$="_select"]');
 			const borderColor = getComputedStyle(el).borderColor || '';
-			const selected = borderColor.includes('44, 97, 254');
-			if (!deselect && selected) return true;
-			if (deselect && !selected) return true;
+			const selected = !!selectedMarker || borderColor.includes('44, 97, 254');
+			if (!deselect && selected) return {ok: true, selected: true};
+			if (deselect && !selected) return {ok: true, selected: false};
 			el.scrollIntoView({block: 'center'});
 			el.dataset.tripCdpPendingClick = '1';
-			return true;
+			return {ok: true, selected};
 		}
-		return false;
+		return {ok: false, selected: false};
 		}`, option.Layer-1, option.Text, option.ID, deselect)
-		if !prepared {
+		if !prepared.OK {
 			if retry < 2 {
 				if !sleepFixed(ctx, 200*time.Millisecond) {
 					return false
@@ -1673,11 +2049,22 @@ func (s *tripScraper) clickSKUOption(ctx context.Context, option skuOption, dese
 			s.markRestartAfterURLIfUnhealthy(fmt.Sprintf("SKU click failed while page is unhealthy: layer %d option %s", option.Layer, option.Text))
 			return false
 		}
+		if !deselect && prepared.Selected {
+			s.emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("layer %d already selected: %s", option.Layer, option.Text)})
+			return true
+		}
+		if deselect && !prepared.Selected {
+			s.emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("layer %d already deselected: %s", option.Layer, option.Text)})
+			return true
+		}
+		if !deselect {
+			s.clearBatchPromotionResponses()
+		}
 		if !sleepFixed(ctx, 50*time.Millisecond) {
 			return false
 		}
 		var clicked bool
-		_ = s.evalJSON(&clicked, `(index, optionText, optionID, deselect) => {
+		_ = s.evalJSON(&clicked, `(index, optionText, optionID, useMouseEvents, deselect) => {
 			const layers = Array.from(document.querySelectorAll('div[class*="sku_tab_ceil"]')).filter(el => el.offsetParent !== null);
 			const layer = layers[index];
 			if (!layer) return false;
@@ -1691,24 +2078,52 @@ func (s *tripScraper) clickSKUOption(ctx context.Context, option skuOption, dese
 				const text = ((textEl && (textEl.innerText || textEl.textContent)) || '').trim();
 				if (text !== optionText) continue;
 				const borderColor = getComputedStyle(el).borderColor || '';
-				const selected = borderColor.includes('44, 97, 254');
+				const selected = !!el.querySelector('[testid$="_select"]') || borderColor.includes('44, 97, 254');
 				if (!deselect && selected) return true;
 				if (deselect && !selected) return true;
+				if (useMouseEvents) {
+					el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true, view: window}));
+					el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true, view: window}));
+				}
 				el.click();
 				return true;
 			}
 			return false;
-		}`, option.Layer-1, option.Text, option.ID, deselect)
+		}`, option.Layer-1, option.Text, option.ID, retry > 0, deselect)
 		if clicked {
 			if deselect {
 				if !sleepFixed(ctx, 100*time.Millisecond) {
 					return false
 				}
-			} else if !sleepDelay(ctx, s.emit, "sku", "sku_click", s.request.DelayOptions.SKUClick) {
+				s.emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("layer %d %s: %s", option.Layer, action, option.Text)})
+				return true
+			}
+			if !sleepDelay(ctx, s.emit, "sku", "sku_click", s.request.DelayOptions.SKUClick) {
 				return false
 			}
-			s.emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("layer %d %s: %s", option.Layer, action, option.Text)})
-			return true
+			var selected bool
+			_ = s.evalJSON(&selected, `(index, optionText, optionID) => {
+				const layers = Array.from(document.querySelectorAll('div[class*="sku_tab_ceil"]')).filter(el => el.offsetParent !== null);
+				const layer = layers[index];
+				if (!layer) return false;
+				let optionElements = Array.from(layer.querySelectorAll('div.m_ceil.style_m_ceil__mUygk'));
+				if (optionID) {
+					const byID = document.getElementById(optionID);
+					if (byID) optionElements = [byID, ...optionElements.filter(el => el !== byID)];
+				}
+				for (const el of optionElements) {
+					const textEl = el.querySelector('span[testid^="title_saleproperty_"]');
+					const text = ((textEl && (textEl.innerText || textEl.textContent)) || '').trim();
+					if (text !== optionText) continue;
+					const borderColor = getComputedStyle(el).borderColor || '';
+					return !!el.querySelector('[testid$="_select"]') || borderColor.includes('44, 97, 254');
+				}
+				return false;
+			}`, option.Layer-1, option.Text, option.ID)
+			if selected {
+				s.emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("layer %d %s: %s", option.Layer, action, option.Text)})
+				return true
+			}
 		}
 		if retry < 2 {
 			s.emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("click layer %d option %s failed; retry %d/3", option.Layer, option.Text, retry+1)})
@@ -1930,6 +2345,19 @@ func splitPrice(value string) (string, string) {
 		return currency, strings.TrimSpace(priceText)
 	}
 	return currency, strings.ReplaceAll(match[1], ",", "")
+}
+
+func formatPriceNumber(value float64) string {
+	if value < 0 {
+		value = 0
+	}
+	text := strconv.FormatFloat(value, 'f', 2, 64)
+	text = strings.TrimRight(text, "0")
+	text = strings.TrimRight(text, ".")
+	if text == "" {
+		return "0"
+	}
+	return text
 }
 
 func productID(url string) string {

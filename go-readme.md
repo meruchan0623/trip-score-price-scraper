@@ -4,6 +4,8 @@
 
 当前浏览器链路为：Go 准备 patched chromedriver，直接启动 Chrome subprocess，再由 chromedriver 通过 `debuggerAddress` attach 到该 Chrome，最后由 Rod/CDP 执行页面抓取。WebDriver 只负责 UC attach 和生命周期，DOM、SKU、价格读取仍走 Rod/CDP。
 
+程序运行期间会自动启用系统保活，避免长任务因系统空闲休眠、显示器休眠或自动锁屏相关策略中断：macOS 使用系统 `caffeinate`，Windows 使用 `SetThreadExecutionState`。该行为默认启用，不需要额外参数；任务结束后自动释放。
+
 ## 1. 快速启动
 
 以下命令均使用有头 Chrome、JSON lines 输出、命令行 verbose 日志、不写 `run.log` / `--log-file`，并使用默认输出目录 `~/Documents/trip_vendor_results/YYMMDD-HHMM/`。
@@ -131,9 +133,9 @@ HK 商品页会在浏览器实际导航前自动补齐 `locale=zh-hk&curr=HKD`�
 
 | 档位 | page | scroll | sku click | sku price | between SKU |
 | --- | --- | --- | --- | --- | --- |
-| `fast` | `0.2-0.5` | `0.1-0.25` | `0.08-0.2` | `0.15-0.35` | `0.08-0.18` |
-| `normal` | `0.4-0.9` | `0.2-0.45` | `0.15-0.35` | `0.25-0.55` | `0.12-0.3` |
-| `safe` | `0.8-1.5` | `0.3-0.7` | `0.25-0.6` | `0.4-0.8` | `0.2-0.5` |
+| `fast` | `0.4-0.9` | `0.1-0.25` | `0.08-0.2` | `0.15-0.35` | `0.08-0.18` |
+| `normal` | `0.8-1.5` | `0.2-0.45` | `0.15-0.35` | `0.25-0.55` | `0.12-0.3` |
+| `safe` | `1.5-3` | `0.3-0.7` | `0.25-0.6` | `0.4-0.8` | `0.2-0.5` |
 | `slow` | `1.5-3` | `0.6-1.2` | `0.6-1.2` | `0.8-1.6` | `0.4-0.9` |
 
 可用具体参数覆盖某一类延迟：

@@ -2,6 +2,7 @@ package tripcdp
 
 import (
 	"context"
+	"math"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -156,6 +157,228 @@ func TestTraverseSKUCombinationsRefreshesLayerOptions(t *testing.T) {
 	}
 	if layerOptionCalls[1] != 2 {
 		t.Fatalf("child layer options read %d times, want 2", layerOptionCalls[1])
+	}
+}
+
+func TestTraverseSKUCombinationsDeselectsAfterLeafPrice(t *testing.T) {
+	layers := []skuLayerInfo{{Index: 0, Title: "天数"}, {Index: 1, Title: "流量"}}
+	selected := []string{}
+	clicks := []string{}
+	results := traverseSKUCombinations(
+		context.Background(),
+		layers,
+		func(index int) []skuOption {
+			if index == 0 {
+				return []skuOption{{Text: "1天", Layer: 1}, {Text: "2天", Layer: 1}}
+			}
+			switch strings.Join(selected, "|") {
+			case "1天":
+				return []skuOption{{Text: "每日-1GB", Layer: 2}}
+			case "2天":
+				return []skuOption{{Text: "每日-2GB", Layer: 2}}
+			default:
+				return nil
+			}
+		},
+		func(option skuOption, deselect bool) bool {
+			action := "select"
+			if deselect {
+				action = "deselect"
+				selected = selected[:len(selected)-1]
+			} else {
+				selected = append(selected, option.Text)
+			}
+			clicks = append(clicks, action+":"+option.Text)
+			return true
+		},
+		func(options []skuOption) map[string]string {
+			return map[string]string{"combination": strings.Join(selected, " | ")}
+		},
+		func(Event) {},
+	)
+	if len(results) != 2 {
+		t.Fatalf("results = %d, want 2", len(results))
+	}
+	wantClicks := []string{
+		"select:1天",
+		"select:每日-1GB",
+		"deselect:每日-1GB",
+		"deselect:1天",
+		"select:2天",
+		"select:每日-2GB",
+		"deselect:每日-2GB",
+		"deselect:2天",
+	}
+	if !reflect.DeepEqual(clicks, wantClicks) {
+		t.Fatalf("clicks = %v, want %v", clicks, wantClicks)
+	}
+}
+
+func TestWaitForSKULayerCountEventuallyFindsLayers(t *testing.T) {
+	calls := 0
+	count, _ := waitForSKULayerCount(context.Background(), func() int {
+		calls++
+		if calls < 3 {
+			return 0
+		}
+		return 2
+	}, 50*time.Millisecond, time.Millisecond)
+	if count != 2 {
+		t.Fatalf("count = %d, want 2", count)
+	}
+	if calls < 3 {
+		t.Fatalf("calls = %d, want at least 3", calls)
+	}
+}
+
+func TestWaitForSKULayerCountTimeoutAllowsNoSKUFallback(t *testing.T) {
+	count, _ := waitForSKULayerCount(context.Background(), func() int {
+		return 0
+	}, 3*time.Millisecond, time.Millisecond)
+	if count != 0 {
+		t.Fatalf("count = %d, want 0", count)
+	}
+}
+
+func TestWaitForLayerOptionsEventuallyFindsOptions(t *testing.T) {
+	calls := 0
+	options, _ := waitForLayerOptions(context.Background(), func(index int) []skuOption {
+		if index != 1 {
+			t.Fatalf("index = %d, want 1", index)
+		}
+		calls++
+		if calls < 3 {
+			return nil
+		}
+		return []skuOption{{Text: "每日-1GB", Layer: 2}}
+	}, 1, 50*time.Millisecond, time.Millisecond)
+	if len(options) != 1 || options[0].Text != "每日-1GB" {
+		t.Fatalf("options = %+v, want one delayed option", options)
+	}
+}
+
+func TestCurrentCombinationPriceRowFromBatchPromotionDiscounts(t *testing.T) {
+	tests := []struct {
+		name          string
+		bundle        batchPromotionPriceBundle
+		wantPrice     string
+		wantRealPrice string
+		wantPromo     string
+	}{
+		{
+			name: "fifty percent",
+			bundle: batchPromotionPriceBundle{
+				Currency:        "HKD",
+				OriginalPrice:   1.37,
+				DeductionAmount: 0.69,
+				PromoDisplay:    "減50%",
+				PromoMatched:    true,
+			},
+			wantPrice:     "1.37",
+			wantRealPrice: "0.68",
+			wantPromo:     "即減50%",
+		},
+		{
+			name: "five percent",
+			bundle: batchPromotionPriceBundle{
+				Currency:        "HKD",
+				OriginalPrice:   12.63,
+				DeductionAmount: 0.64,
+				PromoDisplay:    "減5%",
+				PromoMatched:    true,
+			},
+			wantPrice:     "12.63",
+			wantRealPrice: "11.99",
+			wantPromo:     "即減5%",
+		},
+		{
+			name: "large package",
+			bundle: batchPromotionPriceBundle{
+				Currency:        "HKD",
+				OriginalPrice:   214.51,
+				DeductionAmount: 10.73,
+				PromoDisplay:    "減5%",
+				PromoMatched:    true,
+			},
+			wantPrice:     "214.51",
+			wantRealPrice: "203.78",
+			wantPromo:     "即減5%",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			row := currentCombinationPriceRowFromBatchPromotion([]skuOption{{Text: "1天", Layer: 1}, {Text: "每日-1GB", Layer: 2}}, tt.bundle, true)
+			if row["price"] != tt.wantPrice || row["real_price"] != tt.wantRealPrice || row["promo_tag"] != tt.wantPromo {
+				t.Fatalf("row = %+v, want price=%s real=%s promo=%s", row, tt.wantPrice, tt.wantRealPrice, tt.wantPromo)
+			}
+		})
+	}
+}
+
+func TestCurrentCombinationPriceRowFromBatchPromotionNoPromoKeepsOriginal(t *testing.T) {
+	row := currentCombinationPriceRowFromBatchPromotion(
+		[]skuOption{{Text: "1天", Layer: 1}},
+		batchPromotionPriceBundle{Currency: "HKD", OriginalPrice: 8.63},
+		true,
+	)
+	if row["price"] != "8.63" || row["real_currency"] != "HKD" || row["real_price"] != "8.63" || row["promo_tag"] != "" {
+		t.Fatalf("no-promo row should keep original as real price and blank promo: %+v", row)
+	}
+}
+
+func TestApplyBatchPromotionResponse(t *testing.T) {
+	response := `{
+		"searchItemAggregations": [
+			{"itemList": [
+				{"itemId": 85965312, "salespromotionList": [
+					{"displayName": "減50%", "name": "Half", "deductionAmount": 0.69, "deductionPrice": 0.68,
+					 "deductionList": [{"hit": true, "deduction": 0.5, "type": 1}]}
+				]},
+				{"itemId": 104252031, "salespromotionList": [
+					{"displayName": "減5%", "deductionAmount": 0.64, "deductionPrice": 11.99},
+					{"displayName": "第二個優惠", "deductionAmount": 1.00}
+				]},
+				{"itemId": 94674472, "salespromotionList": []},
+				{"itemId": 102009474, "salespromotionList": [
+					{"displayName": "減5%", "deductionAmount": 0, "deductionType": 1,
+					 "deductionList": [{"hit": true, "deduction": 0.05, "type": 1}]}
+				]}
+			]}
+		]
+	}`
+	tests := []struct {
+		name            string
+		resourceID      int64
+		originalPrice   float64
+		wantMatched     bool
+		wantFound       bool
+		wantDisplay     string
+		wantDeduction   float64
+		wantDeductPrice float64
+	}{
+		{name: "fifty percent", resourceID: 85965312, originalPrice: 1.37, wantFound: true, wantMatched: true, wantDisplay: "減50%", wantDeduction: 0.69, wantDeductPrice: 0.68},
+		{name: "first promo wins", resourceID: 104252031, originalPrice: 12.63, wantFound: true, wantMatched: true, wantDisplay: "減5%", wantDeduction: 0.64, wantDeductPrice: 11.99},
+		{name: "no promotion", resourceID: 94674472, originalPrice: 59.51, wantFound: true, wantMatched: false},
+		{name: "deduction list fallback", resourceID: 102009474, originalPrice: 214.51, wantFound: true, wantMatched: true, wantDisplay: "減5%", wantDeduction: 10.7255},
+		{name: "item id mismatch", resourceID: 1, originalPrice: 9.99, wantFound: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bundle := batchPromotionPriceBundle{ResourceID: tt.resourceID, OriginalPrice: tt.originalPrice}
+			found := applyBatchPromotionResponse(&bundle, response, 200, "https://hk.trip.com/restapi/soa2/31644/batchSearchBookingSalesPromotion")
+			if found != tt.wantFound {
+				t.Fatalf("found = %v, want %v", found, tt.wantFound)
+			}
+			if !found {
+				return
+			}
+			if bundle.ItemID != tt.resourceID || bundle.PromoMatched != tt.wantMatched || bundle.PromoDisplay != tt.wantDisplay {
+				t.Fatalf("bundle identity/promo mismatch: %+v", bundle)
+			}
+			if math.Abs(bundle.DeductionAmount-tt.wantDeduction) > 0.000001 || math.Abs(bundle.DeductionPrice-tt.wantDeductPrice) > 0.000001 {
+				t.Fatalf("deduction mismatch: %+v, want amount=%v price=%v", bundle, tt.wantDeduction, tt.wantDeductPrice)
+			}
+		})
 	}
 }
 
