@@ -40,14 +40,14 @@ func TestBaseRowClearsReviewDimensionFieldsWhenScoreMissing(t *testing.T) {
 	}
 }
 
-func TestBaseRowFallbackLabelsSupportTraditionalSimplifiedAndEnglish(t *testing.T) {
+func TestBaseRowDoesNotFallbackToPageTextForReviewFields(t *testing.T) {
 	item := ScrapeItem{URL: "https://hk.trip.com/things-to-do/detail/92237157/"}
 	text := "Customer Service 4.1\n方便程度 4.2\n訊號狀態 4.3\n中性評價及負面評價 (12)"
 	row := baseRowFromBundle(item, "product", text, baseRatingBundle{Score: "4.6"}, false)
-	assertRowValue(t, row, "客户服务", "4.1")
-	assertRowValue(t, row, "方便程度", "4.2")
-	assertRowValue(t, row, "讯号状态", "4.3")
-	assertRowValue(t, row, "中差评价数", "12")
+	assertRowValue(t, row, "客户服务", "")
+	assertRowValue(t, row, "方便程度", "")
+	assertRowValue(t, row, "讯号状态", "")
+	assertRowValue(t, row, "中差评价数", "")
 	if _, ok := row["商品资讯"]; ok {
 		t.Fatal("商品资讯 should not be present when product info extraction is disabled")
 	}
@@ -56,7 +56,7 @@ func TestBaseRowFallbackLabelsSupportTraditionalSimplifiedAndEnglish(t *testing.
 func TestBaseRatingStableSelectionPrefersCompleteSample(t *testing.T) {
 	samples := []baseRatingBundle{
 		normalizeBaseRatingBundle(baseRatingBundle{Score: "4.6"}),
-		normalizeBaseRatingBundle(baseRatingBundle{Score: "4.6", Customer: "4.6", Convenience: "4.7", Signal: "4.5", BadReviewCount: "601"}),
+		normalizeBaseRatingBundle(baseRatingBundle{Score: "4.6", ReviewCount: "443", Customer: "4.6", Convenience: "4.7", Signal: "4.5", BadReviewCount: "601"}),
 	}
 	selected := selectBaseRatingBundle(samples)
 	if selected.Customer != "4.6" || selected.BadReviewCount != "601" {
@@ -64,18 +64,48 @@ func TestBaseRatingStableSelectionPrefersCompleteSample(t *testing.T) {
 	}
 }
 
+func TestBaseRatingStableSelectionWaitsForGUIReviewFields(t *testing.T) {
+	samples := []baseRatingBundle{
+		normalizeBaseRatingBundle(baseRatingBundle{Score: "4.6", ReviewCount: "443"}),
+		normalizeBaseRatingBundle(baseRatingBundle{Score: "4.6", ReviewCount: "443"}),
+	}
+	if stable, ok := stableBaseRatingBundle(samples); ok {
+		t.Fatalf("stableBaseRatingBundle returned incomplete bundle: %+v", stable)
+	}
+}
+
 func TestBaseRatingJSContainsGUISelectors(t *testing.T) {
 	for _, want := range []string{
+		`document.evaluate`,
 		`span[testid="productdetail-productInfo-commentScore"]`,
 		`span[testid="productdetail-productInfo-commentCountDesc"]`,
 		`span[testid="saleInfoId"]`,
-		`ct-review-list-subitem-title`,
-		`ct-review-list-filiter-label-item`,
+		`//div[text()='客戶服務']/following-sibling::span`,
+		`//div[text()='方便程度']/following-sibling::span`,
+		`//div[text()='訊號狀態']/following-sibling::span`,
+		`//div[contains(@class, 'ct-review-list-filiter-label-item') and contains(., '中性評價及負面評價')]`,
 		`activity_product_detail_html_box`,
 		`#group_1001`,
 	} {
 		if !strings.Contains(baseRatingBundleJS, want) {
 			t.Fatalf("baseRatingBundleJS missing %q", want)
+		}
+	}
+}
+
+func TestBaseRatingJSDoesNotContainBroadRatingFallbacks(t *testing.T) {
+	for _, forbidden := range []string{
+		`followingSiblingText`,
+		`[class*="commentScore"]`,
+		`Customer Service`,
+		`客户服务`,
+		`中性评价及负面评价`,
+		`includes('negative')`,
+		`includes('bad')`,
+		`ct-review-list-subitem-title`,
+	} {
+		if strings.Contains(baseRatingBundleJS, forbidden) {
+			t.Fatalf("baseRatingBundleJS should not contain broad fallback %q", forbidden)
 		}
 	}
 }
