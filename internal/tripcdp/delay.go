@@ -30,7 +30,7 @@ func delayProfileOptions(profile string) (DelayOptions, error) {
 	case "", "normal":
 		return DelayOptions{Profile: "normal", Page: secondsRange(0.8, 1.5), Scroll: secondsRange(0.2, 0.45), SKUClick: secondsRange(0.15, 0.35), SKUPrice: secondsRange(0.25, 0.55), SKUBetween: secondsRange(0.12, 0.3)}, nil
 	case "fast":
-		return DelayOptions{Profile: "fast", Page: secondsRange(0.4, 0.9), Scroll: secondsRange(0.1, 0.25), SKUClick: secondsRange(0.08, 0.2), SKUPrice: secondsRange(0.15, 0.35), SKUBetween: secondsRange(0.08, 0.18)}, nil
+		return DelayOptions{Profile: "fast", Page: secondsRange(0.4, 0.9), Scroll: secondsRange(0.1, 0.25), SKUClick: secondsRange(0.04, 0.12), SKUPrice: secondsRange(0.08, 0.22), SKUBetween: secondsRange(0, 0.06)}, nil
 	case "safe":
 		return DelayOptions{Profile: "safe", Page: secondsRange(1.5, 3), Scroll: secondsRange(0.3, 0.7), SKUClick: secondsRange(0.25, 0.6), SKUPrice: secondsRange(0.4, 0.8), SKUBetween: secondsRange(0.2, 0.5)}, nil
 	case "slow":

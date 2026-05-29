@@ -18,6 +18,8 @@ python3 main.py --gui
 
 CLI 启动至少需要一种输入来源：
 
+> Agent 默认约定：日常抓取不要默认传入 `--json-lines`，也不要把终端输出保存为 `run.jsonl`；只有明确需要机器解析事件流时才临时启用。
+
 ```bash
 python3 main.py --input "https://www.trip.com/..."
 ```
@@ -87,7 +89,7 @@ CLI 还提供运行模式，用于打包常用抓取选项：
 | 运行模式 | Headless | 仅评分 | 动态实价 | 商品资讯 | 用途 |
 | --- | --- | --- | --- | --- | --- |
 | 不传 `--run-mode` | 关闭 | 关闭 | 开启 | 开启 | 保持旧默认行为。 |
-| `--run-mode mode1` | 开启 | 关闭 | 开启 | 开启 | 无头完整抓取，结果表输出 `实价` 列。 |
+| `--run-mode mode1` | 关闭 | 关闭 | 开启 | 开启 | 默认建议有头完整抓取，配合 `--delay-profile fast`，结果表输出 `实价` 列。 |
 | `--run-mode mode2` | 关闭 | 开启 | 关闭 | 开启 | 有头仅评分抓取。 |
 
 优先级：先应用程序默认值，再应用 `--run-mode`，最后应用显式开关。因此显式开关会覆盖运行模式。如果 `mode1` 同时传入 `--no-real-price` 或 `--rating-only`，则不会输出 `实价` 列。
@@ -133,16 +135,16 @@ CLI 参数：
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
 | `--browser chrome` | `chrome` | 当前只支持 Chrome。 |
-| `--headless` | 关闭 | 使用 Chrome headless 模式。 |
+| `--headless` | 关闭 | 使用 Chrome headless 模式；项目当前默认建议保持有头以减少不必要检测。 |
 | `--workers N` | `min(厂商数, 5)` | 厂商 Excel 模式并发浏览器数。 |
-| `--run-mode mode1` | 无 | 无头完整抓取。 |
-| `--run-mode mode2` | 无 | 有头仅评分抓取。 |
+| `--run-mode mode1` | 无 | 默认建议有头完整抓取，并显式搭配 `--delay-profile fast`。 |
+| `--run-mode mode2` | 无 | 有头仅评分抓取，默认 `fast`。 |
 | `--timeout SECONDS` | `300` | 等待浏览器启动完成的最长秒数。 |
 
 示例：
 
 ```bash
-python3 main.py --excel-input ./vendors.xlsx --workers 3 --headless
+python3 main.py --excel-input ./vendors.xlsx --workers 5 --delay-profile fast
 ```
 
 Headless 会向 Chrome 注入：
@@ -153,7 +155,7 @@ Headless 会向 Chrome 注入：
 --disable-gpu
 ```
 
-如果 Trip 页面在 headless 下出现验证码、空结果或启动失败，去掉 `--headless`，改用可见 Chrome。
+项目当前默认建议：优先使用可见 Chrome + `--delay-profile fast`；只有在明确需要无头运行时再传 `--headless`。如果 Trip 页面在 headless 下出现验证码、空结果或启动失败，去掉 `--headless`，改用可见 Chrome。
 
 Mac 新机首次运行时，如果日志出现 `CERTIFICATE_VERIFY_FAILED`，先执行：
 

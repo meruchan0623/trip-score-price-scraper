@@ -11,11 +11,14 @@ func TestDelayProfileOptions(t *testing.T) {
 		profile string
 		pageMin time.Duration
 		pageMax time.Duration
+		skuClickMin time.Duration
+		skuPriceMin time.Duration
+		skuBetweenMax time.Duration
 	}{
-		{profile: "fast", pageMin: 400 * time.Millisecond, pageMax: 900 * time.Millisecond},
-		{profile: "normal", pageMin: 800 * time.Millisecond, pageMax: 1500 * time.Millisecond},
-		{profile: "safe", pageMin: 1500 * time.Millisecond, pageMax: 3 * time.Second},
-		{profile: "slow", pageMin: 1500 * time.Millisecond, pageMax: 3 * time.Second},
+		{profile: "fast", pageMin: 400 * time.Millisecond, pageMax: 900 * time.Millisecond, skuClickMin: 40 * time.Millisecond, skuPriceMin: 80 * time.Millisecond, skuBetweenMax: 60 * time.Millisecond},
+		{profile: "normal", pageMin: 800 * time.Millisecond, pageMax: 1500 * time.Millisecond, skuClickMin: 150 * time.Millisecond, skuPriceMin: 250 * time.Millisecond, skuBetweenMax: 300 * time.Millisecond},
+		{profile: "safe", pageMin: 1500 * time.Millisecond, pageMax: 3 * time.Second, skuClickMin: 250 * time.Millisecond, skuPriceMin: 400 * time.Millisecond, skuBetweenMax: 500 * time.Millisecond},
+		{profile: "slow", pageMin: 1500 * time.Millisecond, pageMax: 3 * time.Second, skuClickMin: 600 * time.Millisecond, skuPriceMin: 800 * time.Millisecond, skuBetweenMax: 900 * time.Millisecond},
 	}
 	for _, tt := range tests {
 		options, err := delayProfileOptions(tt.profile)
@@ -27,6 +30,15 @@ func TestDelayProfileOptions(t *testing.T) {
 		}
 		if options.Page.Min != tt.pageMin || options.Page.Max != tt.pageMax {
 			t.Fatalf("%s page delay = %s-%s, want %s-%s", tt.profile, options.Page.Min, options.Page.Max, tt.pageMin, tt.pageMax)
+		}
+		if options.SKUClick.Min != tt.skuClickMin {
+			t.Fatalf("%s sku click min = %s, want %s", tt.profile, options.SKUClick.Min, tt.skuClickMin)
+		}
+		if options.SKUPrice.Min != tt.skuPriceMin {
+			t.Fatalf("%s sku price min = %s, want %s", tt.profile, options.SKUPrice.Min, tt.skuPriceMin)
+		}
+		if options.SKUBetween.Max != tt.skuBetweenMax {
+			t.Fatalf("%s sku between max = %s, want %s", tt.profile, options.SKUBetween.Max, tt.skuBetweenMax)
 		}
 	}
 }
