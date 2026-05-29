@@ -2092,8 +2092,10 @@ func (s *tripScraper) clickSKUOption(ctx context.Context, option skuOption, dese
 		}`, option.Layer-1, option.Text, option.ID, retry > 0, deselect)
 		if clicked {
 			if deselect {
-				if !sleepFixed(ctx, 100*time.Millisecond) {
-					return false
+				if s.request.DelayOptions.Profile != "fast" {
+					if !sleepFixed(ctx, 100*time.Millisecond) {
+						return false
+					}
 				}
 				s.emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("layer %d %s: %s", option.Layer, action, option.Text)})
 				return true
