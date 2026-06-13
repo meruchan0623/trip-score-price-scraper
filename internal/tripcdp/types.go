@@ -60,6 +60,7 @@ type TaskRequest struct {
 	ExtractProductInfo  bool
 	DelayOptions        DelayOptions
 	BrowserOptions      BrowserOptions
+	CompareVendor       string // If set, run vendor comparison against this base vendor after scrape
 }
 
 type TaskResult struct {

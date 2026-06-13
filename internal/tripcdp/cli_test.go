@@ -26,11 +26,11 @@ func TestResolveRunOptionsAppliesModeThenExplicitFlags(t *testing.T) {
 	if options.headless {
 		t.Fatal("mode2 should remain headed unless explicitly overridden")
 	}
-	if options.ratingOnly {
-		t.Fatal("explicit --no-rating-only should override mode2")
+	if !options.ratingOnly {
+		t.Fatal("mode2 must remain rating-only even if --no-rating-only is passed")
 	}
-	if !options.realPrice {
-		t.Fatal("explicit --real-price should override mode2")
+	if options.realPrice {
+		t.Fatal("mode2 must never scrape real price even if --real-price is passed")
 	}
 	if !options.productInfo {
 		t.Fatal("mode2 should keep product info enabled")

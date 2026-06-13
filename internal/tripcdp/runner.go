@@ -343,6 +343,17 @@ func scrapeVendorBatches(request TaskRequest, reporter Reporter, runMode string)
 		}
 		return TaskResult{Success: false, OutputPath: outputDir, OutputPaths: outputPaths, ProcessedCount: 0, Warnings: warnings, FailedVendors: failedVendors, LogFile: request.LogFile, Error: "no rows captured and no successful worker output", ExitCode: 4}
 	}
+
+	// Run vendor comparison if requested
+	if request.CompareVendor != "" && request.ExcelInput != "" {
+		compareResult, compareErr := CompareVendors(request.ExcelInput, request.CompareVendor, outputDir, stamp, reporter)
+		if compareErr != nil {
+			reporter(Event{"event": "warning", "stage": "vendor_compare", "message": fmt.Sprintf("vendor comparison failed: %v", compareErr)})
+		} else if compareResult != nil {
+			outputPaths = append(outputPaths, compareResult.OutputPath)
+		}
+	}
+
 	return TaskResult{Success: true, OutputPath: outputDir, OutputPaths: outputPaths, ProcessedCount: rows, Warnings: warnings, LogFile: request.LogFile, ExitCode: 0}
 }
 

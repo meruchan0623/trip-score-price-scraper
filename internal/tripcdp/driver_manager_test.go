@@ -12,6 +12,9 @@ import (
 )
 
 func TestPatchChromeDriverBinaryReplacesCDCBlock(t *testing.T) {
+	if !shouldPatchChromeDriver() {
+		t.Skip("macOS keeps Chrome for Testing chromedriver unmodified to preserve code signature")
+	}
 	path := filepath.Join(t.TempDir(), "chromedriver")
 	raw := []byte(`prefix {window.cdc_abc = "detected"; window.cdc_def = "detected"; window.cdc_ghi = "detected";} suffix`)
 	if err := os.WriteFile(path, raw, 0o755); err != nil {

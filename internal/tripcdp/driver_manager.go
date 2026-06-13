@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -48,7 +49,15 @@ type cftVersion struct {
 	} `json:"downloads"`
 }
 
+var chromeDriverPrepareMu sync.Mutex
+
 func prepareUndetectedChromeDriver(ctx context.Context, options BrowserOptions) (chromeDriverInfo, error) {
+	// Vendor workers run concurrently in one process and share the same
+	// undetected_chromedriver cache path. Serialize prepare/download/unzip/patch
+	// so workers do not race on chromedriver_download.zip or *.tmp files.
+	chromeDriverPrepareMu.Lock()
+	defer chromeDriverPrepareMu.Unlock()
+
 	started := time.Now()
 	if err := ctx.Err(); err != nil {
 		return chromeDriverInfo{}, err
@@ -181,7 +190,10 @@ func isPatchedChromeDriver(path string) bool {
 
 func isReusableChromeDriver(path string, versionMain string) bool {
 	stat, err := os.Stat(path)
-	if err != nil || stat.IsDir() || !isPatchedChromeDriver(path) {
+	if err != nil || stat.IsDir() {
+		return false
+	}
+	if shouldPatchChromeDriver() && !isPatchedChromeDriver(path) {
 		return false
 	}
 	if versionMain != "" && chromeDriverMajorVersion(path) != versionMain {
@@ -191,6 +203,9 @@ func isReusableChromeDriver(path string, versionMain string) bool {
 }
 
 func patchChromeDriverBinary(path string) error {
+	if !shouldPatchChromeDriver() {
+		return os.Chmod(path, 0o755)
+	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return err
@@ -217,6 +232,14 @@ func patchChromeDriverBinary(path string) error {
 		return err
 	}
 	return os.Chmod(path, 0o755)
+}
+
+func shouldPatchChromeDriver() bool {
+	// Chrome for Testing chromedriver on macOS is code-signed. Mutating the
+	// binary invalidates its signature and macOS kills it at exec time, which
+	// appears as `chromedriver --version failed` / SIGKILL. Prefer runtime
+	// browser stealth patches on macOS and keep the driver binary intact.
+	return runtime.GOOS != "darwin"
 }
 
 func resolveChromeDriverDownload(ctx context.Context, versionMain string) (string, string, error) {

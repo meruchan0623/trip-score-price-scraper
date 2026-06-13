@@ -87,6 +87,8 @@ func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bo
 	var skuBetweenDelayMin float64 = -1
 	var skuBetweenDelayMax float64 = -1
 
+	var compareVendor string
+
 	fs := flag.NewFlagSet("trip-score-cdp", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.Usage = func() {
@@ -104,7 +106,7 @@ func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bo
 	fs.IntVar(&workers, "workers", 0, "Concurrent browser workers, 1-5. Defaults to min(vendor count, 5).")
 	fs.Float64Var(&startupStagger, "startup-stagger", 0.5, "Seconds to wait between starting vendor browser workers. Use 0 to disable staggering.")
 	fs.IntVar(&stopGrace, "stop-grace-seconds", 30, "Seconds to wait for partial exports after SIGINT/SIGTERM before terminating workers.")
-	fs.StringVar(&runMode, "run-mode", "", "Preset run mode: mode1=headed full scrape; mode2=headed rating/product-info scrape.")
+	fs.StringVar(&runMode, "run-mode", "", "Preset run mode: mode1=headed full SKU/price/rating scrape; mode2=headed rating-only + product-info scrape (no SKU, no price columns).")
 	fs.StringVar(&browser, "browser", "chrome", "Browser to use. Only chrome is supported.")
 	fs.BoolFunc("headless", "Run Chrome in headless mode.", func(string) error { headless = triState{set: true, value: true}; return nil })
 	fs.BoolFunc("no-headless", "Run Chrome with a visible browser window.", func(string) error { headless = triState{set: true, value: false}; return nil })
@@ -134,6 +136,7 @@ func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bo
 	fs.BoolFunc("no-real-price", "Skip dynamic real-price extraction.", func(string) error { realPrice = triState{set: true, value: false}; return nil })
 	fs.BoolFunc("product-info", "Scrape product information fields.", func(string) error { productInfo = triState{set: true, value: true}; return nil })
 	fs.BoolFunc("no-product-info", "Skip product info extraction.", func(string) error { productInfo = triState{set: true, value: false}; return nil })
+	fs.StringVar(&compareVendor, "compare-vendor", "", "After scraping, compare all vendors against this base vendor using row-based region mapping from --excel-input.")
 
 	if err := fs.Parse(argv); err != nil {
 		return TaskRequest{}, "", "", false, false, err
@@ -184,6 +187,7 @@ func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bo
 			MemoryLimitMB:      memoryLimit,
 			RestartEvery:       restartEvery,
 		},
+		CompareVendor: compareVendor,
 	}, runMode, logLevel, jsonLines, noColor, nil
 }
 
@@ -204,6 +208,13 @@ func resolveRunOptions(runMode string, headless triState, ratingOnly triState, r
 	}
 	if headless.set {
 		options.headless = headless.value
+	}
+	// mode2 is intentionally a fixed compatibility mode matching the legacy GUI
+	// checkboxes: "仅抓取评分" + "抓取商品资讯".  It must never expand SKU
+	// combinations or emit price columns, even if callers accidentally pass
+	// --no-rating-only or --real-price from older scripts.
+	if runMode == "mode2" {
+		return options
 	}
 	if ratingOnly.set {
 		options.ratingOnly = ratingOnly.value
