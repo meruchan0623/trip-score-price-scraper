@@ -1,84 +1,36 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[cod]
-*$py.class
+# Go build artifacts
+/trip-score-cdp
+*.exe
+*.test
+*.out
+/dist/
+/build/
 
-# C extensions
-*.so
+# Runtime output and temporary state
+_workers/
+_state/
+*.log
+*.tmp
+tmp/
+temp/
 
-# Distribution / packaging
-build/
-dist/
-develop-eggs/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
+# Local generated workbooks / packages
+*.xlsx
+*.zip
+*.jsonl
 
-# PyInstaller
-*.manifest
+# Hermes local planning cache; project skills are intentionally tracked under .hermes/skills/
+.hermes/plans/
 
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
-
-# Unit test coverage
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py,cover
-.hypothesis/
-.pytest_cache/
-
-# Translations
-*.mo
-*.pot
-
-# Environments
-.env
-.venv
-env/
-venv/
-ENV/
-env.bak
-venv.bak/
-
-# IDE
+# Editor / OS
+.DS_Store
+Thumbs.db
+Desktop.ini
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
-.spyderproject
-.spyproject
 
-# Jupyter
-.ipynb_checkpoints
-
-# OS
-.DS_Store
-Thumbs.db
-Desktop.ini
-$RECYCLE.BIN/
-
-# Project specific
-*.exe
-*.log
-*.tmp
-temp/
-tmp/
+# Generic cache
+.cache/

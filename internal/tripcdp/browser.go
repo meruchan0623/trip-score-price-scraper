@@ -951,8 +951,52 @@ func (s *tripScraper) clearBatchPromotionResponses() {
 }
 
 func (s *tripScraper) waitBatchPromotionPriceBundle(ctx context.Context, selected []skuOption, maxWait time.Duration) (batchPromotionPriceBundle, int) {
-	started := time.Now()
+	return waitForBatchPromotionPriceBundle(ctx, selected, s.currentBatchPromotionPriceBundle, batchPromotionWaitOptions{
+		MaxWait:             maxWait,
+		PollInterval:        150 * time.Millisecond,
+		NoPromoFallbackWait: 2500 * time.Millisecond,
+		FastNoPromoReturn:   true,
+	})
+}
+
+type batchPromotionWaitOptions struct {
+	MaxWait             time.Duration
+	PollInterval        time.Duration
+	NoPromoFallbackWait time.Duration
+	FastNoPromoReturn   bool
+	Now                 func() time.Time
+	Sleep               func(context.Context, time.Duration) bool
+}
+
+func batchPromotionBundleHasCompleteBasePrice(bundle batchPromotionPriceBundle) bool {
+	return bundle.ResourceID > 0 && bundle.OriginalPrice > 0
+}
+
+func waitForBatchPromotionPriceBundle(ctx context.Context, selected []skuOption, current func([]string) batchPromotionPriceBundle, options batchPromotionWaitOptions) (batchPromotionPriceBundle, int) {
+	nowFn := options.Now
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	sleepFn := options.Sleep
+	if sleepFn == nil {
+		sleepFn = sleepFixed
+	}
+	maxWait := options.MaxWait
+	if maxWait <= 0 {
+		maxWait = 3 * time.Second
+	}
+	pollInterval := options.PollInterval
+	if pollInterval <= 0 {
+		pollInterval = 150 * time.Millisecond
+	}
+	noPromoFallbackWait := options.NoPromoFallbackWait
+	if noPromoFallbackWait <= 0 {
+		noPromoFallbackWait = 2500 * time.Millisecond
+	}
+
+	started := nowFn()
 	deadline := started.Add(maxWait)
+	fallbackDeadline := started.Add(noPromoFallbackWait)
 	var latest batchPromotionPriceBundle
 	selectedTexts := make([]string, 0, len(selected))
 	for _, option := range selected {
@@ -960,19 +1004,20 @@ func (s *tripScraper) waitBatchPromotionPriceBundle(ctx context.Context, selecte
 	}
 	for {
 		if ctx.Err() != nil {
-			return latest, elapsedMS(started)
+			return latest, int(nowFn().Sub(started).Milliseconds())
 		}
-		latest = s.currentBatchPromotionPriceBundle(selectedTexts)
-		if latest.OriginalPrice > 0 && (latest.PromoMatched || latest.ResponseStatus > 0 || time.Now().After(started.Add(2500*time.Millisecond))) {
-			return latest, elapsedMS(started)
+		latest = current(selectedTexts)
+		now := nowFn()
+		if batchPromotionBundleHasCompleteBasePrice(latest) {
+			if latest.PromoMatched || latest.ResponseStatus > 0 || options.FastNoPromoReturn || !now.Before(fallbackDeadline) {
+				return latest, int(now.Sub(started).Milliseconds())
+			}
 		}
-		if time.Now().After(deadline) {
-			return latest, elapsedMS(started)
+		if !now.Before(deadline) {
+			return latest, int(now.Sub(started).Milliseconds())
 		}
-		select {
-		case <-ctx.Done():
-			return latest, elapsedMS(started)
-		case <-time.After(150 * time.Millisecond):
+		if !sleepFn(ctx, pollInterval) {
+			return latest, int(nowFn().Sub(started).Milliseconds())
 		}
 	}
 }

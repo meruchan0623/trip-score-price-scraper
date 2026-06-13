@@ -93,13 +93,62 @@ func TestExportRowsFieldShape(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"厂商", "商品ID", "URL", "商品名称", "SKU层级1", "SKU层级2", "货币", "外显价格", "实价", "促销标签", "预定数", "评价数", "评分", "客户服务", "方便程度", "讯号状态", "中差评价数", "商品资讯"}
+	want := []string{"厂商", "商品ID", "URL", "商品名称", "SKU层级1", "SKU层级2", "货币", "外显价格", "实价", "促销标签", "商品资讯", "预定数", "评价数", "评分", "客户服务", "方便程度", "讯号状态", "中差评价数"}
 	if len(header) == 0 || len(header[0]) != len(want) {
 		t.Fatalf("unexpected header length: %v", header)
 	}
 	for i, value := range want {
 		if header[0][i] != value {
 			t.Fatalf("header[%d] = %q, want %q", i, header[0][i], value)
+		}
+	}
+}
+
+func TestExportRowsRatingOnlyProductInfoShapeMatchesLegacyGUI(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rating-only.xlsx")
+	rows := []map[string]string{{
+		"商品ID":  "12345",
+		"URL":   "https://www.trip.com/detail/12345",
+		"商品名称":  "Product",
+		"商品资讯":  "Device info",
+		"预定数":   "10",
+		"评价数":   "2",
+		"评分":    "4.8",
+		"客户服务":  "4.7",
+		"方便程度":  "4.6",
+		"讯号状态":  "4.5",
+		"中差评价数": "0",
+	}}
+
+	if _, err := exportRows(rows, path, true, false, true, false); err != nil {
+		t.Fatal(err)
+	}
+	file, err := excelize.OpenFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	sheet := file.GetSheetName(file.GetActiveSheetIndex())
+	gotRows, err := file.GetRows(sheet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"商品ID", "URL", "商品名称", "商品资讯", "预定数", "评价数", "评分", "客户服务", "方便程度", "讯号状态", "中差评价数"}
+	if !reflect.DeepEqual(gotRows[0], want) {
+		t.Fatalf("rating-only header = %#v, want %#v", gotRows[0], want)
+	}
+	dimension, err := file.GetSheetDimension(sheet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dimension != "A1:K2" {
+		t.Fatalf("rating-only sheet dimension = %q, want A1:K2", dimension)
+	}
+	for _, forbidden := range []string{"SKU层级1", "货币", "外显价格", "实价", "促销标签"} {
+		for _, field := range gotRows[0] {
+			if field == forbidden {
+				t.Fatalf("rating-only header unexpectedly contains %q: %#v", forbidden, gotRows[0])
+			}
 		}
 	}
 }
@@ -323,6 +372,116 @@ func TestCurrentCombinationPriceRowFromBatchPromotionNoPromoKeepsOriginal(t *tes
 	)
 	if row["price"] != "8.63" || row["real_currency"] != "HKD" || row["real_price"] != "8.63" || row["promo_tag"] != "" {
 		t.Fatalf("no-promo row should keep original as real price and blank promo: %+v", row)
+	}
+}
+
+func TestBatchPromotionBundleHasCompleteBasePrice(t *testing.T) {
+	tests := []struct {
+		name   string
+		bundle batchPromotionPriceBundle
+		want   bool
+	}{
+		{name: "complete static price", bundle: batchPromotionPriceBundle{ResourceID: 123, Currency: "HKD", OriginalPrice: 8.63}, want: true},
+		{name: "currency defaults allowed", bundle: batchPromotionPriceBundle{ResourceID: 123, OriginalPrice: 8.63}, want: true},
+		{name: "missing resource id", bundle: batchPromotionPriceBundle{OriginalPrice: 8.63}, want: false},
+		{name: "missing price", bundle: batchPromotionPriceBundle{ResourceID: 123, Currency: "HKD"}, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := batchPromotionBundleHasCompleteBasePrice(tt.bundle); got != tt.want {
+				t.Fatalf("batchPromotionBundleHasCompleteBasePrice(%+v) = %v, want %v", tt.bundle, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestWaitForBatchPromotionPriceBundleFastReturnsOnCompleteNoPromoPrice(t *testing.T) {
+	baseTime := time.Unix(100, 0)
+	now := baseTime
+	sleeps := 0
+	bundle, waitMS := waitForBatchPromotionPriceBundle(
+		context.Background(),
+		[]skuOption{{Text: "1天", Layer: 1}, {Text: "每日-1GB", Layer: 2}},
+		func([]string) batchPromotionPriceBundle {
+			return batchPromotionPriceBundle{ResourceID: 123, Currency: "HKD", OriginalPrice: 8.63}
+		},
+		batchPromotionWaitOptions{
+			MaxWait:             3 * time.Second,
+			PollInterval:        150 * time.Millisecond,
+			NoPromoFallbackWait: 2500 * time.Millisecond,
+			FastNoPromoReturn:   true,
+			Now:                 func() time.Time { return now },
+			Sleep: func(context.Context, time.Duration) bool {
+				sleeps++
+				now = now.Add(150 * time.Millisecond)
+				return true
+			},
+		},
+	)
+	if bundle.OriginalPrice != 8.63 || bundle.ResourceID != 123 {
+		t.Fatalf("unexpected bundle: %+v", bundle)
+	}
+	if waitMS != 0 || sleeps != 0 {
+		t.Fatalf("fast complete no-promo price should not wait: waitMS=%d sleeps=%d", waitMS, sleeps)
+	}
+}
+
+func TestWaitForBatchPromotionPriceBundleNonFastPreservesNoPromoFallbackWait(t *testing.T) {
+	baseTime := time.Unix(100, 0)
+	now := baseTime
+	sleeps := 0
+	bundle, waitMS := waitForBatchPromotionPriceBundle(
+		context.Background(),
+		[]skuOption{{Text: "1天", Layer: 1}},
+		func([]string) batchPromotionPriceBundle {
+			return batchPromotionPriceBundle{ResourceID: 123, Currency: "HKD", OriginalPrice: 8.63}
+		},
+		batchPromotionWaitOptions{
+			MaxWait:             3 * time.Second,
+			PollInterval:        150 * time.Millisecond,
+			NoPromoFallbackWait: 2500 * time.Millisecond,
+			FastNoPromoReturn:   false,
+			Now:                 func() time.Time { return now },
+			Sleep: func(context.Context, time.Duration) bool {
+				sleeps++
+				now = now.Add(150 * time.Millisecond)
+				return true
+			},
+		},
+	)
+	if bundle.OriginalPrice != 8.63 || bundle.ResourceID != 123 {
+		t.Fatalf("unexpected bundle: %+v", bundle)
+	}
+	if waitMS < 2500 || sleeps == 0 {
+		t.Fatalf("non-fast no-promo price should preserve fallback wait: waitMS=%d sleeps=%d", waitMS, sleeps)
+	}
+}
+
+func TestWaitForBatchPromotionPriceBundlePromotionResponseReturnsImmediately(t *testing.T) {
+	baseTime := time.Unix(100, 0)
+	now := baseTime
+	sleeps := 0
+	bundle, waitMS := waitForBatchPromotionPriceBundle(
+		context.Background(),
+		[]skuOption{{Text: "1天", Layer: 1}},
+		func([]string) batchPromotionPriceBundle {
+			return batchPromotionPriceBundle{ResourceID: 123, Currency: "HKD", OriginalPrice: 8.63, PromoMatched: true}
+		},
+		batchPromotionWaitOptions{
+			MaxWait:             3 * time.Second,
+			PollInterval:        150 * time.Millisecond,
+			NoPromoFallbackWait: 2500 * time.Millisecond,
+			FastNoPromoReturn:   false,
+			Now:                 func() time.Time { return now },
+			Sleep: func(context.Context, time.Duration) bool {
+				sleeps++
+				now = now.Add(150 * time.Millisecond)
+				return true
+			},
+		},
+	)
+	if !bundle.PromoMatched || waitMS != 0 || sleeps != 0 {
+		t.Fatalf("promotion response should return immediately: bundle=%+v waitMS=%d sleeps=%d", bundle, waitMS, sleeps)
 	}
 }
 

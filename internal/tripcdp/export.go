@@ -57,10 +57,10 @@ func exportRows(rows []map[string]string, outputPath string, ratingOnly bool, ex
 		}
 		fields = append(fields, "促销标签")
 	}
-	fields = append(fields, "预定数", "评价数", "评分", "客户服务", "方便程度", "讯号状态", "中差评价数")
 	if extractProductInfo {
 		fields = append(fields, "商品资讯")
 	}
+	fields = append(fields, "预定数", "评价数", "评分", "客户服务", "方便程度", "讯号状态", "中差评价数")
 
 	for col, field := range fields {
 		cell, _ := excelize.CoordinatesToCellName(col+1, 1)
@@ -86,6 +86,8 @@ func exportRows(rows []map[string]string, outputPath string, ratingOnly bool, ex
 		name, _ := excelize.ColumnNumberToName(col + 1)
 		_ = file.SetColWidth(sheet, name, name, float64(width))
 	}
+	lastCell, _ := excelize.CoordinatesToCellName(len(fields), len(rows)+1)
+	_ = file.SetSheetDimension(sheet, "A1:"+lastCell)
 
 	if err := file.SaveAs(path); err != nil {
 		return "", err

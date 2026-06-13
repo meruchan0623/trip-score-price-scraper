@@ -8,11 +8,11 @@ import (
 
 func TestDelayProfileOptions(t *testing.T) {
 	tests := []struct {
-		profile string
-		pageMin time.Duration
-		pageMax time.Duration
-		skuClickMin time.Duration
-		skuPriceMin time.Duration
+		profile       string
+		pageMin       time.Duration
+		pageMax       time.Duration
+		skuClickMin   time.Duration
+		skuPriceMin   time.Duration
 		skuBetweenMax time.Duration
 	}{
 		{profile: "fast", pageMin: 400 * time.Millisecond, pageMax: 900 * time.Millisecond, skuClickMin: 40 * time.Millisecond, skuPriceMin: 80 * time.Millisecond, skuBetweenMax: 60 * time.Millisecond},
