@@ -1,6 +1,6 @@
 # Trip.com SKU / 价格抓取工具（Go CDP-only）
 
-本项目现在只保留 **Go + Chrome DevTools Protocol (CDP)** 抓取程序。旧版 Python CLI、Python GUI、Selenium/undetected-chromedriver 流程以及 PyInstaller 打包 spec 已删除并停止跟踪。
+本项目现在只保留 **Go + Chrome DevTools Protocol (CDP)** 抓取程序。旧版 Python CLI、Python GUI、Selenium/undetected-chromedriver 流程以及 PyInstaller 打包 spec 已删除并停止跟踪；用于自动化机器执行的支持脚本仍保留在仓库中。
 
 唯一入口：
 
