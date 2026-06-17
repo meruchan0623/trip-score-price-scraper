@@ -3,6 +3,7 @@ package tripcdp
 import (
 	"context"
 	"math"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -144,6 +145,137 @@ func TestExportRowsAddsScrapeNoteColumnOnlyWhenPresent(t *testing.T) {
 	}
 	if gotRows[1][len(gotRows[0])-1] != "被Cloudflare拦截" {
 		t.Fatalf("scrape note value = %q", gotRows[1][len(gotRows[0])-1])
+	}
+}
+
+func TestExportRowsAddsPriceQualityColumnsOnlyWhenPresent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "quality.xlsx")
+	rows := []map[string]string{{
+		"厂商":       "Vendor",
+		"商品ID":     "12345",
+		"URL":      "https://www.trip.com/detail/12345",
+		"商品名称":     "Product",
+		"SKU层级1":   "1天",
+		"货币":       "HKD",
+		"外显价格":     "",
+		"实价":       "",
+		"促销标签":     "",
+		"价格状态":     "untrusted_resource_miss",
+		"资源ID":     "0",
+		"接口ItemID": "0",
+		"促销命中":     "false",
+		"价格来源":     "batchSearchBookingSalesPromotion",
+		"原始捕获价格":   "22",
+		"预定数":      "1",
+		"评价数":      "2",
+		"评分":       "4.8",
+		"客户服务":     "4.7",
+		"方便程度":     "4.6",
+		"讯号状态":     "4.5",
+		"中差评价数":    "0",
+		"抓取备注":     "价格未可信匹配: resourceId=0 itemId=0 promoMatched=false fallback=HKD22",
+	}}
+
+	if _, err := exportRows(rows, path, false, true, false, true); err != nil {
+		t.Fatal(err)
+	}
+	file, err := excelize.OpenFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	sheet := file.GetSheetName(file.GetActiveSheetIndex())
+	gotRows, err := file.GetRows(sheet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"价格状态", "资源ID", "接口ItemID", "促销命中", "价格来源", "原始捕获价格", "抓取备注"} {
+		if !containsString(gotRows[0], field) {
+			t.Fatalf("quality header %q missing from %#v", field, gotRows[0])
+		}
+	}
+	if gotRows[1][indexOfString(gotRows[0], "外显价格")] != "" || gotRows[1][indexOfString(gotRows[0], "实价")] != "" {
+		t.Fatalf("untrusted prices should be blank in price columns: %#v", gotRows[1])
+	}
+	if gotRows[1][indexOfString(gotRows[0], "原始捕获价格")] != "22" {
+		t.Fatalf("raw captured price missing: %#v", gotRows[1])
+	}
+}
+
+func TestRiskBlockedRowCarriesPriceQualityStatus(t *testing.T) {
+	s := &tripScraper{request: TaskRequest{ExtractRealPrice: true}}
+	row := s.riskBlockedRow(ScrapeItem{Vendor: "Vendor", URL: "https://hk.trip.com/things-to-do/detail/12345/"}, "whaleguard block")
+	if row["价格状态"] != priceStatusRiskBlocked {
+		t.Fatalf("price status = %q, want %q; row=%+v", row["价格状态"], priceStatusRiskBlocked, row)
+	}
+	if row["外显价格"] != "" || row["实价"] != "" {
+		t.Fatalf("risk blocked row should not carry prices: %+v", row)
+	}
+	if !strings.Contains(row["抓取备注"], "whaleguard block") {
+		t.Fatalf("risk note missing: %+v", row)
+	}
+}
+
+func TestLoadVendorProductsSkipsUntrustedPriceStatusRows(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vendor.xlsx")
+	file := excelize.NewFile()
+	sheet := file.GetSheetName(file.GetActiveSheetIndex())
+	headers := []string{"商品ID", "URL", "商品名称", "SKU层级1", "SKU层级2", "货币", "外显价格", "实价", "促销标签", "预定数", "评价数", "评分", "价格状态"}
+	for i, header := range headers {
+		cell, _ := excelize.CoordinatesToCellName(i+1, 1)
+		_ = file.SetCellValue(sheet, cell, header)
+	}
+	values := [][]string{
+		{"12345", "https://hk.trip.com/things-to-do/detail/12345/", "Product", "1天", "每日-1GB", "HKD", "", "", "", "1", "2", "4.8", priceStatusUntrustedResourceMiss},
+		{"", "", "", "2天", "每日-1GB", "HKD", "10", "9", "", "", "", "", priceStatusTrustedBase},
+	}
+	for r, row := range values {
+		for c, value := range row {
+			cell, _ := excelize.CoordinatesToCellName(c+1, r+2)
+			_ = file.SetCellValue(sheet, cell, value)
+		}
+	}
+	if err := file.SaveAs(path); err != nil {
+		t.Fatal(err)
+	}
+
+	products, err := loadVendorProducts(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := products["12345"]
+	if len(got) != 1 {
+		t.Fatalf("loaded SKU count = %d, want 1; rows=%+v", len(got), got)
+	}
+	if got[0].SKU1 != "2天" || got[0].RealPrice != 9 {
+		t.Fatalf("trusted row not loaded correctly: %+v", got[0])
+	}
+}
+
+func TestLoadVendorProductsKeepsLegacyRowsWithoutPriceStatus(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.xlsx")
+	file := excelize.NewFile()
+	sheet := file.GetSheetName(file.GetActiveSheetIndex())
+	headers := []string{"商品ID", "URL", "商品名称", "SKU层级1", "SKU层级2", "货币", "外显价格", "实价", "促销标签", "预定数", "评价数", "评分"}
+	for i, header := range headers {
+		cell, _ := excelize.CoordinatesToCellName(i+1, 1)
+		_ = file.SetCellValue(sheet, cell, header)
+	}
+	row := []string{"12345", "https://hk.trip.com/things-to-do/detail/12345/", "Product", "1天", "每日-1GB", "HKD", "10", "8", "", "1", "2", "4.8"}
+	for c, value := range row {
+		cell, _ := excelize.CoordinatesToCellName(c+1, 2)
+		_ = file.SetCellValue(sheet, cell, value)
+	}
+	if err := file.SaveAs(path); err != nil {
+		t.Fatal(err)
+	}
+
+	products, err := loadVendorProducts(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(products["12345"]) != 1 {
+		t.Fatalf("legacy row should still load: %+v", products)
 	}
 }
 
@@ -360,6 +492,8 @@ func TestCurrentCombinationPriceRowFromBatchPromotionDiscounts(t *testing.T) {
 		{
 			name: "fifty percent",
 			bundle: batchPromotionPriceBundle{
+				ResourceID:      123,
+				ItemID:          123,
 				Currency:        "HKD",
 				OriginalPrice:   1.37,
 				DeductionAmount: 0.69,
@@ -373,6 +507,8 @@ func TestCurrentCombinationPriceRowFromBatchPromotionDiscounts(t *testing.T) {
 		{
 			name: "five percent",
 			bundle: batchPromotionPriceBundle{
+				ResourceID:      123,
+				ItemID:          123,
 				Currency:        "HKD",
 				OriginalPrice:   12.63,
 				DeductionAmount: 0.64,
@@ -386,6 +522,8 @@ func TestCurrentCombinationPriceRowFromBatchPromotionDiscounts(t *testing.T) {
 		{
 			name: "large package",
 			bundle: batchPromotionPriceBundle{
+				ResourceID:      123,
+				ItemID:          123,
 				Currency:        "HKD",
 				OriginalPrice:   214.51,
 				DeductionAmount: 10.73,
@@ -410,11 +548,94 @@ func TestCurrentCombinationPriceRowFromBatchPromotionDiscounts(t *testing.T) {
 func TestCurrentCombinationPriceRowFromBatchPromotionNoPromoKeepsOriginal(t *testing.T) {
 	row := currentCombinationPriceRowFromBatchPromotion(
 		[]skuOption{{Text: "1天", Layer: 1}},
-		batchPromotionPriceBundle{Currency: "HKD", OriginalPrice: 8.63},
+		batchPromotionPriceBundle{ResourceID: 123, Currency: "HKD", OriginalPrice: 8.63},
 		true,
 	)
-	if row["price"] != "8.63" || row["real_currency"] != "HKD" || row["real_price"] != "8.63" || row["promo_tag"] != "" {
+	if row["price_status"] != priceStatusTrustedBase || row["price"] != "8.63" || row["real_currency"] != "HKD" || row["real_price"] != "8.63" || row["promo_tag"] != "" {
 		t.Fatalf("no-promo row should keep original as real price and blank promo: %+v", row)
+	}
+}
+
+func TestCurrentCombinationPriceRowFromBatchPromotionResourceMissIsUntrusted(t *testing.T) {
+	row := currentCombinationPriceRowFromBatchPromotion(
+		[]skuOption{{Text: "1天", Layer: 1}, {Text: "每日-1GB", Layer: 2}},
+		batchPromotionPriceBundle{Currency: "HKD", OriginalPrice: 22},
+		true,
+	)
+	if row["price_status"] != priceStatusUntrustedResourceMiss {
+		t.Fatalf("price_status = %q, want %q; row=%+v", row["price_status"], priceStatusUntrustedResourceMiss, row)
+	}
+	if row["price"] != "" || row["real_price"] != "" {
+		t.Fatalf("untrusted resource miss should not write price columns: %+v", row)
+	}
+	if row["raw_captured_price"] != "22" || !strings.Contains(row["scrape_note"], "resourceId=0") {
+		t.Fatalf("untrusted row should keep raw diagnostic price and note: %+v", row)
+	}
+}
+
+func TestPriceQualityTrackerStopsOnResourceMisses(t *testing.T) {
+	tracker := newPriceQualityTracker()
+	var decision priceQualityDecision
+	for i := 0; i < 5; i++ {
+		decision = tracker.observe(map[string]string{
+			"price_status":       priceStatusUntrustedResourceMiss,
+			"raw_captured_price": "22",
+		})
+	}
+	if !decision.Stop || decision.Reason != "consecutive_resource_miss" {
+		t.Fatalf("decision = %+v, want consecutive_resource_miss stop", decision)
+	}
+	if tracker.untrustedRows != 5 || tracker.trustedRows != 0 {
+		t.Fatalf("tracker counts = %+v", tracker)
+	}
+}
+
+func TestPriceQualityTrackerStopsOnDominantFallbackPrice(t *testing.T) {
+	tracker := newPriceQualityTracker()
+	var decision priceQualityDecision
+	for i := 0; i < 10; i++ {
+		status := priceStatusTrustedBase
+		raw := ""
+		if i < 4 || i >= 6 {
+			status = priceStatusUntrustedResourceMiss
+			raw = "22"
+		}
+		decision = tracker.observe(map[string]string{"price_status": status, "raw_captured_price": raw})
+	}
+	if !decision.Stop || decision.Reason != "resource_miss_rate" {
+		t.Fatalf("decision = %+v, want resource_miss_rate stop", decision)
+	}
+}
+
+func TestWritePriceQualityDiagnostic(t *testing.T) {
+	dir := t.TempDir()
+	tracker := newPriceQualityTracker()
+	for i := 0; i < 5; i++ {
+		tracker.observe(map[string]string{
+			"combination":        "1天 | 每日-1GB",
+			"price_status":       priceStatusUntrustedResourceMiss,
+			"resource_id":        "0",
+			"item_id":            "0",
+			"raw_captured_price": "22",
+			"response_status":    "200",
+			"response_url":       "https://hk.trip.com/restapi/soa2/31644/batchSearchBookingSalesPromotion",
+			"response_preview":   `{"searchItemAggregations":[]}`,
+		})
+	}
+	s := &tripScraper{request: TaskRequest{OutputDir: dir}}
+	path := s.writePriceQualityDiagnostic(ScrapeItem{Vendor: "TSIM 網址", URL: "https://hk.trip.com/things-to-do/detail/85483615/"}, tracker)
+	if path == "" {
+		t.Fatal("diagnostic path should be returned")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	for _, want := range []string{`"event":"price_quality_failure"`, `"product_id":"85483615"`, `"reason":"consecutive_resource_miss"`, `"raw_captured_price":"22"`} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("diagnostic missing %s: %s", want, text)
+		}
 	}
 }
 
@@ -684,4 +905,17 @@ func TestIsValidDisplayPrice(t *testing.T) {
 	if isValidDisplayPrice("N/A") || isValidDisplayPrice("USD 1") {
 		t.Fatal("unexpected valid display price")
 	}
+}
+
+func containsString(values []string, target string) bool {
+	return indexOfString(values, target) >= 0
+}
+
+func indexOfString(values []string, target string) int {
+	for i, value := range values {
+		if value == target {
+			return i
+		}
+	}
+	return -1
 }

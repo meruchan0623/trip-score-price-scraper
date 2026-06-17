@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -56,6 +57,24 @@ const (
 	skuLayerWaitPoll   = 300 * time.Millisecond
 	skuOptionsWaitMax  = 5 * time.Second
 	skuOptionsWaitPoll = 300 * time.Millisecond
+)
+
+const (
+	priceStatusTrustedPromo          = "trusted_promo"
+	priceStatusTrustedBase           = "trusted_base"
+	priceStatusUntrustedResourceMiss = "untrusted_resource_miss"
+	priceStatusUntrustedPriceMissing = "untrusted_price_missing"
+	priceStatusRiskBlocked           = "risk_blocked"
+	priceStatusPartialUnhealthy      = "partial_unhealthy"
+
+	priceSourceBatchPromotion = "batchSearchBookingSalesPromotion"
+)
+
+const (
+	maxConsecutiveResourceMiss = 5
+	minSamplesForResourceRate  = 10
+	resourceMissRateLimit      = 0.80
+	sameFallbackPriceStreak    = 8
 )
 
 type priceBundle struct {
@@ -496,7 +515,8 @@ func (s *tripScraper) scrapeOne(ctx context.Context, item ScrapeItem, index int,
 		if !retry {
 			restartAfterURL := s.restartAfterURL
 			restartReason := s.restartReason
-			s.emit(mergeEvent(Event{"event": "url_done", "rows": len(rows), "elapsed_ms": elapsedMS(started), "final_url": snapshot.URL, "page_valid": isProductPageReady(snapshot), "page_retry_count": attempt - 1, "restart_after_url": restartAfterURL}, base))
+			trustedRows, untrustedRows, qualityFailed := countPriceQualityRows(rows)
+			s.emit(mergeEvent(Event{"event": "url_done", "rows": len(rows), "elapsed_ms": elapsedMS(started), "final_url": snapshot.URL, "page_valid": isProductPageReady(snapshot), "page_retry_count": attempt - 1, "restart_after_url": restartAfterURL, "trusted_rows": trustedRows, "untrusted_rows": untrustedRows, "price_quality_failed": qualityFailed}, base))
 			if restartAfterURL {
 				_ = s.restartBrowser(ctx, restartReason)
 			}
@@ -525,7 +545,7 @@ func (s *tripScraper) scrapeOne(ctx context.Context, item ScrapeItem, index int,
 	}
 	if isWhaleguardSnapshot(lastSnapshot) {
 		s.emit(mergeEvent(Event{"event": "risk_challenge_detected", "stage": "risk", "message": "whaleguard block after retry", "risk_kind": lastSnapshot.RiskKind, "http_status": lastSnapshot.HTTPStatus, "body_preview": lastSnapshot.BodyPreview, "retry_after_risk": false, "risk_retry_count": 1, "final_url": lastSnapshot.URL}, base))
-		rows := []map[string]string{s.errorRow(item, "whaleguard block")}
+		rows := []map[string]string{s.riskBlockedRow(item, "whaleguard block")}
 		s.emit(mergeEvent(Event{"event": "url_done", "rows": len(rows), "elapsed_ms": elapsedMS(started), "final_url": lastSnapshot.URL, "page_valid": false, "page_retry_count": 1, "restart_after_url": false, "risk_kind": lastSnapshot.RiskKind, "http_status": lastSnapshot.HTTPStatus}, base))
 		s.cleanupAfterURL()
 		_ = s.restartBrowserNoSessionSave(ctx, "whaleguard block after retry")
@@ -584,7 +604,9 @@ func (s *tripScraper) scrapeOneAttempt(ctx context.Context, item ScrapeItem, tar
 	if !sleepDelay(ctx, s.emit, "page_open", "page", s.request.DelayOptions.Page) {
 		return nil, snapshot, false, ctx.Err()
 	}
-	s.recordCloudflareIfPresent("after_page_delay", base)
+	if s.recordCloudflareIfPresent("after_page_delay", base) {
+		return []map[string]string{s.riskBlockedRow(item, "cloudflare overlay detected before extraction")}, snapshot, false, nil
+	}
 	risk := s.detectRiskChallenge()
 	if len(risk.Scripts) > 0 {
 		s.emit(mergeEvent(Event{"event": "log", "stage": "risk", "message": "risk scripts detected", "risk_scripts_detected": risk.Scripts}, base))
@@ -596,21 +618,24 @@ func (s *tripScraper) scrapeOneAttempt(ctx context.Context, item ScrapeItem, tar
 		s.emit(mergeEvent(Event{"event": "risk_challenge_detected", "stage": "risk", "message": risk.Reason, "risk_kind": risk.Kind, "http_status": snapshot.HTTPStatus, "body_preview": risk.BodyPreview, "risk_scripts_detected": risk.Scripts, "final_url": snapshot.URL}, base))
 		if risk.Kind == "cloudflare" {
 			s.markCloudflareBlocked("risk", base, risk.Reason, risk.BodyPreview)
-			snapshot.RiskChallenge = false
-			snapshot.RiskKind = ""
+			return []map[string]string{s.riskBlockedRow(item, risk.Reason)}, snapshot, false, nil
 		} else {
 			if risk.Kind == "whaleguard" {
 				return nil, snapshot, true, nil
 			}
-			return []map[string]string{s.errorRow(item, risk.Reason)}, snapshot, false, nil
+			return []map[string]string{s.riskBlockedRow(item, risk.Reason)}, snapshot, false, nil
 		}
 	}
 	s.emit(mergeEvent(Event{"event": "log", "stage": "lazy_load", "message": "scrolling page"}, base))
 	s.scrollPage(ctx)
-	s.recordCloudflareIfPresent("after_scroll", base)
+	if s.recordCloudflareIfPresent("after_scroll", base) {
+		return []map[string]string{s.riskBlockedRow(item, "cloudflare overlay detected after scroll")}, snapshot, false, nil
+	}
 	snapshot, waitMS = s.waitProductPageExtractable(ctx, 12*time.Second, s.request.RatingOnly)
 	snapshot.withNavigationStatus(navStatus, navURL)
-	s.recordCloudflareIfPresent("before_extract", base)
+	if s.recordCloudflareIfPresent("before_extract", base) {
+		return []map[string]string{s.riskBlockedRow(item, "cloudflare overlay detected before extraction")}, snapshot, false, nil
+	}
 	if snapshot.RiskChallenge {
 		risk := s.detectRiskChallenge()
 		if risk.Challenge {
@@ -620,13 +645,12 @@ func (s *tripScraper) scrapeOneAttempt(ctx context.Context, item ScrapeItem, tar
 			s.emit(mergeEvent(Event{"event": "risk_challenge_detected", "stage": "risk", "message": reason, "risk_kind": risk.Kind, "http_status": snapshot.HTTPStatus, "body_preview": risk.BodyPreview, "risk_scripts_detected": risk.Scripts, "final_url": snapshot.URL}, base))
 			if risk.Kind == "cloudflare" {
 				s.markCloudflareBlocked("lazy_load", base, reason, risk.BodyPreview)
-				snapshot.RiskChallenge = false
-				snapshot.RiskKind = ""
+				return []map[string]string{s.riskBlockedRow(item, reason)}, snapshot, false, nil
 			} else {
 				if risk.Kind == "whaleguard" {
 					return nil, snapshot, true, nil
 				}
-				return []map[string]string{s.errorRow(item, reason)}, snapshot, false, nil
+				return []map[string]string{s.riskBlockedRow(item, reason)}, snapshot, false, nil
 			}
 		}
 		snapshot.RiskChallenge = false
@@ -638,7 +662,10 @@ func (s *tripScraper) scrapeOneAttempt(ctx context.Context, item ScrapeItem, tar
 	}
 	s.emit(mergeEvent(Event{"event": "log", "stage": "extract", "message": "extracting page"}, base))
 	rows, valid := s.extractRows(ctx, item, snapshot)
-	s.recordCloudflareIfPresent("after_extract", base)
+	if s.recordCloudflareIfPresent("after_extract", base) {
+		s.restartAfterURL = true
+		s.restartReason = "cloudflare overlay after extraction"
+	}
 	s.applyCurrentScrapeNoteToRows(rows)
 	if !valid {
 		snapshot = s.currentPageSnapshot()
@@ -653,6 +680,20 @@ func (s *tripScraper) errorRows(item ScrapeItem, err error, started time.Time, b
 	return []map[string]string{s.errorRow(item, err.Error())}
 }
 
+func countPriceQualityRows(rows []map[string]string) (trusted int, untrusted int, failed bool) {
+	for _, row := range rows {
+		status := strings.TrimSpace(row["价格状态"])
+		switch {
+		case isTrustedPriceStatus(status):
+			trusted++
+		case status != "":
+			untrusted++
+			failed = true
+		}
+	}
+	return trusted, untrusted, failed
+}
+
 func (s *tripScraper) extractRows(ctx context.Context, item ScrapeItem, snapshot pageSnapshot) ([]map[string]string, bool) {
 	baseRow := s.extractBaseRow(ctx, item)
 	s.applyCurrentScrapeNote(baseRow)
@@ -661,11 +702,18 @@ func (s *tripScraper) extractRows(ctx context.Context, item ScrapeItem, snapshot
 		return []map[string]string{baseRow}, isProductPageExtractable(snapshot, true)
 	}
 	oldMax := s.maxSKULayers
-	combinations := s.extractAllSKUPrices(ctx)
+	combinations, quality := s.extractAllSKUPrices(ctx)
 	if s.maxSKULayers > oldMax {
 		s.emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("SKU layers increased to %d", s.maxSKULayers)})
 	}
 	if len(combinations) == 0 {
+		if quality != nil && quality.failed {
+			s.emitURLQualityFailed(item, quality)
+			row := s.errorRow(item, "价格质量检查失败: "+quality.failReason)
+			row["价格状态"] = priceStatusUntrustedResourceMiss
+			row["抓取备注"] = "价格质量检查失败: " + quality.failReason
+			return []map[string]string{row}, true
+		}
 		if !allowNoSKUFallback(baseRow, snapshot) {
 			return nil, false
 		}
@@ -677,6 +725,7 @@ func (s *tripScraper) extractRows(ctx context.Context, item ScrapeItem, snapshot
 		if s.request.ExtractRealPrice {
 			row["实价"] = price
 		}
+		row["价格状态"] = priceStatusTrustedBase
 		layerCount := max(s.maxSKULayers, 1)
 		for i := 0; i < layerCount; i++ {
 			if i == 0 {
@@ -705,6 +754,7 @@ func (s *tripScraper) extractRows(ctx context.Context, item ScrapeItem, snapshot
 			row["实价"] = combo["real_price"]
 		}
 		row["促销标签"] = combo["promo_tag"]
+		copyPriceQualityFields(row, combo)
 		parts := []string{}
 		if combo["combination"] != "" {
 			parts = strings.Split(combo["combination"], " | ")
@@ -720,7 +770,106 @@ func (s *tripScraper) extractRows(ctx context.Context, item ScrapeItem, snapshot
 		s.ensurePriceFields(row)
 		rows = append(rows, row)
 	}
+	if quality != nil && quality.failed {
+		s.emitURLQualityFailed(item, quality)
+		s.restartAfterURL = true
+		s.restartReason = "price quality failed: " + quality.failReason
+	}
 	return rows, true
+}
+
+func copyPriceQualityFields(row map[string]string, combo map[string]string) {
+	if row == nil || combo == nil {
+		return
+	}
+	fieldMap := map[string]string{
+		"price_status":       "价格状态",
+		"resource_id":        "资源ID",
+		"item_id":            "接口ItemID",
+		"promo_matched":      "促销命中",
+		"price_source":       "价格来源",
+		"raw_captured_price": "原始捕获价格",
+	}
+	for src, dst := range fieldMap {
+		if value := strings.TrimSpace(combo[src]); value != "" {
+			row[dst] = value
+		}
+	}
+	if note := strings.TrimSpace(combo["scrape_note"]); note != "" {
+		if existing := strings.TrimSpace(row["抓取备注"]); existing != "" {
+			if !strings.Contains(existing, note) {
+				row["抓取备注"] = existing + "；" + note
+			}
+		} else {
+			row["抓取备注"] = note
+		}
+	}
+}
+
+func (s *tripScraper) emitURLQualityFailed(item ScrapeItem, quality *priceQualityTracker) {
+	if quality == nil || !quality.failed {
+		return
+	}
+	diagnosticPath := s.writePriceQualityDiagnostic(item, quality)
+	s.emit(Event{
+		"event":               "url_quality_failed",
+		"stage":               "sku",
+		"vendor":              item.Vendor,
+		"url":                 item.URL,
+		"product_id":          productID(item.URL),
+		"reason":              quality.failReason,
+		"trusted_rows":        quality.trustedRows,
+		"untrusted_rows":      quality.untrustedRows,
+		"resource_miss_rows":  quality.resourceMissRows,
+		"total_rows":          quality.totalRows,
+		"resource_miss_rate":  quality.resourceMissRate(),
+		"top_fallback_prices": quality.topFallbackPrices(3),
+		"diagnostic_path":     diagnosticPath,
+	})
+}
+
+func (s *tripScraper) writePriceQualityDiagnostic(item ScrapeItem, quality *priceQualityTracker) string {
+	if quality == nil {
+		return ""
+	}
+	dir := expandPath(s.request.OutputDir)
+	if dir == "" && strings.TrimSpace(s.request.OutputPath) != "" {
+		dir = filepath.Dir(expandPath(s.request.OutputPath))
+	}
+	if dir == "" {
+		return ""
+	}
+	path := filepath.Join(dir, "_diagnostics", "price_quality_failures.jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return ""
+	}
+	payload := map[string]any{
+		"event":               "price_quality_failure",
+		"vendor":              item.Vendor,
+		"url":                 item.URL,
+		"product_id":          productID(item.URL),
+		"reason":              quality.failReason,
+		"trusted_rows":        quality.trustedRows,
+		"untrusted_rows":      quality.untrustedRows,
+		"resource_miss_rows":  quality.resourceMissRows,
+		"total_rows":          quality.totalRows,
+		"resource_miss_rate":  quality.resourceMissRate(),
+		"top_fallback_prices": quality.topFallbackPrices(5),
+		"examples":            quality.examples,
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return ""
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	if _, err := f.Write(append(raw, '\n')); err != nil {
+		return ""
+	}
+	return absPath(path)
 }
 
 func (s *tripScraper) extractBaseRow(ctx context.Context, item ScrapeItem) map[string]string {
@@ -769,12 +918,12 @@ func baseRowFromBundle(item ScrapeItem, title string, pageText string, bundle ba
 	return row
 }
 
-func (s *tripScraper) extractAllSKUPrices(ctx context.Context) []map[string]string {
+func (s *tripScraper) extractAllSKUPrices(ctx context.Context) ([]map[string]string, *priceQualityTracker) {
 	s.emit(Event{"event": "log", "stage": "sku", "message": "starting SKU option and price extraction"})
 	count, waitMS := s.waitSKULayerCount(ctx, skuLayerWaitMax)
 	if count == 0 {
 		s.emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("SKU container not found after wait; product may have no SKU options wait_ms=%d", waitMS)})
-		return nil
+		return nil, nil
 	}
 	if waitMS > 1000 {
 		s.emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("SKU container appeared after wait_ms=%d", waitMS)})
@@ -788,7 +937,8 @@ func (s *tripScraper) extractAllSKUPrices(ctx context.Context) []map[string]stri
 		layers = append(layers, skuLayerInfo{Index: i, Title: title})
 		s.emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("layer %d: %s", i+1, title)})
 	}
-	results := traverseSKUCombinations(ctx, layers, func(index int) []skuOption {
+	quality := newPriceQualityTracker()
+	results := traverseSKUCombinationsWithQuality(ctx, layers, func(index int) []skuOption {
 		options, waitMS := s.waitLayerOptions(ctx, index, skuOptionsWaitMax)
 		if waitMS > 1000 && len(options) > 0 {
 			s.emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("layer %d options appeared after wait_ms=%d", index+1, waitMS)})
@@ -798,9 +948,9 @@ func (s *tripScraper) extractAllSKUPrices(ctx context.Context) []map[string]stri
 		return s.clickSKUOption(ctx, option, deselect)
 	}, func(selected []skuOption) map[string]string {
 		return s.currentCombinationPrice(ctx, selected)
-	}, s.emit)
-	s.emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("recursive SKU traversal complete; captured %d combinations", len(results))})
-	return results
+	}, quality, s.emit)
+	s.emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("recursive SKU traversal complete; captured %d trusted combinations", len(results))})
+	return results, quality
 }
 
 func (s *tripScraper) waitSKULayerCount(ctx context.Context, maxWait time.Duration) (int, int) {
@@ -855,16 +1005,162 @@ func waitForLayerOptions(ctx context.Context, getOptions func(int) []skuOption, 
 	}
 }
 
+type priceQualityDecision struct {
+	Stop   bool
+	Reason string
+}
+
+type priceQualityTracker struct {
+	totalRows               int
+	trustedRows             int
+	untrustedRows           int
+	resourceMissRows        int
+	consecutiveResourceMiss int
+	lastFallbackPrice       string
+	fallbackPriceStreak     int
+	fallbackCounts          map[string]int
+	examples                []map[string]string
+	failed                  bool
+	failReason              string
+}
+
+func newPriceQualityTracker() *priceQualityTracker {
+	return &priceQualityTracker{fallbackCounts: map[string]int{}}
+}
+
+func (t *priceQualityTracker) observe(row map[string]string) priceQualityDecision {
+	if t == nil || row == nil {
+		return priceQualityDecision{}
+	}
+	if t.failed {
+		return priceQualityDecision{Stop: true, Reason: t.failReason}
+	}
+	t.totalRows++
+	status := strings.TrimSpace(row["price_status"])
+	switch status {
+	case priceStatusTrustedPromo, priceStatusTrustedBase:
+		t.trustedRows++
+		t.consecutiveResourceMiss = 0
+		t.lastFallbackPrice = ""
+		t.fallbackPriceStreak = 0
+	case priceStatusUntrustedResourceMiss:
+		t.untrustedRows++
+		t.resourceMissRows++
+		t.consecutiveResourceMiss++
+		t.addExample(row)
+		rawPrice := strings.TrimSpace(row["raw_captured_price"])
+		if rawPrice != "" {
+			t.fallbackCounts[rawPrice]++
+			if rawPrice == t.lastFallbackPrice {
+				t.fallbackPriceStreak++
+			} else {
+				t.lastFallbackPrice = rawPrice
+				t.fallbackPriceStreak = 1
+			}
+		} else {
+			t.lastFallbackPrice = ""
+			t.fallbackPriceStreak = 0
+		}
+	case priceStatusUntrustedPriceMissing, priceStatusRiskBlocked, priceStatusPartialUnhealthy:
+		t.untrustedRows++
+		t.addExample(row)
+		t.consecutiveResourceMiss = 0
+		t.lastFallbackPrice = ""
+		t.fallbackPriceStreak = 0
+	default:
+		if strings.TrimSpace(row["price"]) != "" || strings.TrimSpace(row["real_price"]) != "" {
+			t.trustedRows++
+		}
+		t.consecutiveResourceMiss = 0
+	}
+	if t.consecutiveResourceMiss >= maxConsecutiveResourceMiss {
+		return t.stop("consecutive_resource_miss")
+	}
+	if t.totalRows >= minSamplesForResourceRate && float64(t.resourceMissRows)/float64(t.totalRows) >= resourceMissRateLimit {
+		return t.stop("resource_miss_rate")
+	}
+	if t.fallbackPriceStreak >= sameFallbackPriceStreak {
+		return t.stop("same_fallback_price_streak")
+	}
+	return priceQualityDecision{}
+}
+
+func (t *priceQualityTracker) addExample(row map[string]string) {
+	if len(t.examples) >= 5 {
+		return
+	}
+	example := map[string]string{}
+	for _, key := range []string{"combination", "price_status", "resource_id", "item_id", "promo_matched", "raw_captured_price", "response_status", "response_url", "response_preview", "scrape_note"} {
+		if value := strings.TrimSpace(row[key]); value != "" {
+			example[key] = value
+		}
+	}
+	t.examples = append(t.examples, example)
+}
+
+func (t *priceQualityTracker) stop(reason string) priceQualityDecision {
+	t.failed = true
+	t.failReason = reason
+	return priceQualityDecision{Stop: true, Reason: reason}
+}
+
+func (t *priceQualityTracker) resourceMissRate() float64 {
+	if t == nil || t.totalRows == 0 {
+		return 0
+	}
+	return float64(t.resourceMissRows) / float64(t.totalRows)
+}
+
+func (t *priceQualityTracker) topFallbackPrices(limit int) []string {
+	if t == nil || limit <= 0 || len(t.fallbackCounts) == 0 {
+		return nil
+	}
+	type entry struct {
+		price string
+		count int
+	}
+	entries := make([]entry, 0, len(t.fallbackCounts))
+	for price, count := range t.fallbackCounts {
+		entries = append(entries, entry{price: price, count: count})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].count == entries[j].count {
+			return entries[i].price < entries[j].price
+		}
+		return entries[i].count > entries[j].count
+	})
+	out := make([]string, 0, min(limit, len(entries)))
+	for i := 0; i < len(entries) && i < limit; i++ {
+		out = append(out, fmt.Sprintf("%s:%d", entries[i].price, entries[i].count))
+	}
+	return out
+}
+
 func traverseSKUCombinations(ctx context.Context, layers []skuLayerInfo, getOptions func(int) []skuOption, click func(skuOption, bool) bool, currentPrice func([]skuOption) map[string]string, emit Reporter) []map[string]string {
+	return traverseSKUCombinationsWithQuality(ctx, layers, getOptions, click, currentPrice, nil, emit)
+}
+
+func traverseSKUCombinationsWithQuality(ctx context.Context, layers []skuLayerInfo, getOptions func(int) []skuOption, click func(skuOption, bool) bool, currentPrice func([]skuOption) map[string]string, quality *priceQualityTracker, emit Reporter) []map[string]string {
 	results := []map[string]string{}
+	stopTraversal := false
 	var walk func(int, []skuOption)
 	walk = func(layerIndex int, selected []skuOption) {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || stopTraversal {
 			return
 		}
 		if layerIndex >= len(layers) {
 			if result := currentPrice(selected); result != nil {
-				results = append(results, result)
+				if quality != nil {
+					decision := quality.observe(result)
+					if isTrustedPriceStatus(result["price_status"]) || result["price_status"] == "" {
+						results = append(results, result)
+					}
+					if decision.Stop {
+						stopTraversal = true
+					}
+				} else {
+					results = append(results, result)
+				}
 			}
 			return
 		}
@@ -876,7 +1172,7 @@ func traverseSKUCombinations(ctx context.Context, layers []skuLayerInfo, getOpti
 		}
 		emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("traversing layer %d %s: %d options", layerIndex+1, layer.Title, len(options))})
 		for _, option := range options {
-			if ctx.Err() != nil {
+			if ctx.Err() != nil || stopTraversal {
 				return
 			}
 			if !click(option, false) {
@@ -884,6 +1180,9 @@ func traverseSKUCombinations(ctx context.Context, layers []skuLayerInfo, getOpti
 			}
 			walk(layerIndex+1, append(selected, option))
 			_ = click(option, true)
+			if stopTraversal {
+				return
+			}
 		}
 	}
 	walk(0, nil)
@@ -902,7 +1201,7 @@ func (s *tripScraper) currentCombinationPrice(ctx context.Context, selected []sk
 		return nil
 	}
 	result := currentCombinationPriceRowFromBatchPromotion(selected, batchBundle, s.request.ExtractRealPrice)
-	if result["price"] != "价格获取失败" {
+	if isTrustedPriceStatus(result["price_status"]) {
 		if waitMS > 1000 {
 			s.emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("batch promotion price settled slowly: %s wait_ms=%d promo_matched=%v", result["combination"], waitMS, batchBundle.PromoMatched)})
 		}
@@ -912,7 +1211,7 @@ func (s *tripScraper) currentCombinationPrice(ctx context.Context, selected []sk
 		}
 		return result
 	}
-	s.emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("combination price failed: %s, price_source=batchSearchBookingSalesPromotion, resourceId=%d, itemId=%d, promo_matched=%v", result["combination"], batchBundle.ResourceID, batchBundle.ItemID, batchBundle.PromoMatched)})
+	s.emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("combination price untrusted: %s, status=%s, raw=%s, price_source=batchSearchBookingSalesPromotion, resourceId=%d, itemId=%d, promo_matched=%v", result["combination"], result["price_status"], result["raw_captured_price"], batchBundle.ResourceID, batchBundle.ItemID, batchBundle.PromoMatched)})
 	return result
 }
 
@@ -1215,14 +1514,51 @@ func currentCombinationPriceRowFromBatchPromotion(selected []skuOption, bundle b
 	}
 	combination := strings.Join(parts, " | ")
 	currency := firstNonEmpty(bundle.Currency, "HKD")
+	base := map[string]string{
+		"combination":   combination,
+		"currency":      currency,
+		"real_currency": "N/A",
+		"promo_tag":     "",
+		"resource_id":   strconv.FormatInt(bundle.ResourceID, 10),
+		"item_id":       strconv.FormatInt(bundle.ItemID, 10),
+		"promo_matched": strconv.FormatBool(bundle.PromoMatched),
+		"price_source":  priceSourceBatchPromotion,
+	}
+	if bundle.ResponseStatus > 0 {
+		base["response_status"] = strconv.Itoa(bundle.ResponseStatus)
+	}
+	if strings.TrimSpace(bundle.ResponseURL) != "" {
+		base["response_url"] = strings.TrimSpace(bundle.ResponseURL)
+	}
+	if strings.TrimSpace(bundle.ResponseText) != "" {
+		base["response_preview"] = previewText(bundle.ResponseText, 300)
+	}
 	if bundle.OriginalPrice <= 0 {
-		return map[string]string{"combination": combination, "currency": "N/A", "price": "价格获取失败", "real_currency": "N/A", "real_price": "N/A", "promo_tag": ""}
+		base["currency"] = "N/A"
+		base["price"] = ""
+		base["real_price"] = ""
+		base["price_status"] = priceStatusUntrustedPriceMissing
+		base["scrape_note"] = fmt.Sprintf("价格未获取: resourceId=%d itemId=%d promoMatched=%v", bundle.ResourceID, bundle.ItemID, bundle.PromoMatched)
+		return base
 	}
 	price := formatPriceNumber(bundle.OriginalPrice)
+	base["raw_captured_price"] = price
+	if bundle.ResourceID <= 0 {
+		base["price"] = ""
+		base["real_price"] = ""
+		base["price_status"] = priceStatusUntrustedResourceMiss
+		base["scrape_note"] = fmt.Sprintf("价格未可信匹配: resourceId=%d itemId=%d promoMatched=%v fallback=%s%s", bundle.ResourceID, bundle.ItemID, bundle.PromoMatched, currency, price)
+		return base
+	}
+	status := priceStatusTrustedBase
+	if bundle.PromoMatched && bundle.ItemID == bundle.ResourceID {
+		status = priceStatusTrustedPromo
+	}
+	base["price_status"] = status
 	realCurrency, realPrice := "N/A", "N/A"
 	if extractRealPrice {
 		realCurrency = currency
-		if bundle.PromoMatched && bundle.DeductionAmount > 0 {
+		if status == priceStatusTrustedPromo && bundle.DeductionAmount > 0 {
 			realPrice = formatPriceNumber(bundle.OriginalPrice - bundle.DeductionAmount)
 		} else {
 			realPrice = price
@@ -1235,7 +1571,20 @@ func currentCombinationPriceRowFromBatchPromotion(selected []skuOption, bundle b
 			promoTag = "即" + promoText
 		}
 	}
-	return map[string]string{"combination": combination, "currency": currency, "price": price, "real_currency": realCurrency, "real_price": realPrice, "promo_tag": promoTag}
+	base["price"] = price
+	base["real_currency"] = realCurrency
+	base["real_price"] = realPrice
+	base["promo_tag"] = promoTag
+	return base
+}
+
+func isTrustedPriceStatus(status string) bool {
+	switch strings.TrimSpace(status) {
+	case priceStatusTrustedPromo, priceStatusTrustedBase:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *tripScraper) waitBaseRatingBundleStable(ctx context.Context, maxWait time.Duration) (baseRatingBundle, int) {
@@ -2414,6 +2763,23 @@ func (s *tripScraper) errorRow(item ScrapeItem, message string) map[string]strin
 	}
 	s.applyCurrentScrapeNote(row)
 	s.ensurePriceFields(row)
+	return row
+}
+
+func (s *tripScraper) riskBlockedRow(item ScrapeItem, message string) map[string]string {
+	row := s.errorRow(item, message)
+	if !s.request.RatingOnly {
+		row["价格状态"] = priceStatusRiskBlocked
+		row["价格来源"] = priceSourceBatchPromotion
+		row["原始捕获价格"] = ""
+	}
+	if message = strings.TrimSpace(message); message != "" {
+		if existing := strings.TrimSpace(row["抓取备注"]); existing != "" && !strings.Contains(existing, message) {
+			row["抓取备注"] = existing + "；" + message
+		} else if existing == "" {
+			row["抓取备注"] = message
+		}
+	}
 	return row
 }
 
