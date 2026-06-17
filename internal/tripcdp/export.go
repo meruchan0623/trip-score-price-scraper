@@ -29,9 +29,16 @@ func exportRows(rows []map[string]string, outputPath string, ratingOnly bool, ex
 
 	maxSKULayers := 0
 	hasScrapeNote := false
+	hasPriceQuality := false
 	for _, row := range rows {
 		if strings.TrimSpace(row["抓取备注"]) != "" {
 			hasScrapeNote = true
+		}
+		for _, field := range priceQualityExportFields() {
+			if strings.TrimSpace(row[field]) != "" {
+				hasPriceQuality = true
+				break
+			}
 		}
 		for key := range row {
 			if strings.HasPrefix(key, "SKU层级") {
@@ -60,6 +67,9 @@ func exportRows(rows []map[string]string, outputPath string, ratingOnly bool, ex
 			fields = append(fields, "实价")
 		}
 		fields = append(fields, "促销标签")
+		if hasPriceQuality {
+			fields = append(fields, priceQualityExportFields()...)
+		}
 	}
 	if extractProductInfo {
 		fields = append(fields, "商品资讯")
@@ -100,6 +110,10 @@ func exportRows(rows []map[string]string, outputPath string, ratingOnly bool, ex
 		return "", err
 	}
 	return absPath(path), nil
+}
+
+func priceQualityExportFields() []string {
+	return []string{"价格状态", "资源ID", "接口ItemID", "促销命中", "价格来源", "原始捕获价格"}
 }
 
 func ensureParent(path string) error {

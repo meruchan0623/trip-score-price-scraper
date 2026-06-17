@@ -64,15 +64,16 @@ type TaskRequest struct {
 }
 
 type TaskResult struct {
-	Success        bool
-	OutputPath     string
-	OutputPaths    []string
-	ProcessedCount int
-	Warnings       []string
-	FailedVendors  []string
-	LogFile        string
-	Error          string
-	ExitCode       int
+	Success           bool
+	OutputPath        string
+	OutputPaths       []string
+	ProcessedCount    int
+	Warnings          []string
+	FailedVendors     []string
+	LogFile           string
+	Error             string
+	ExitCode          int
+	QualityFailedURLs int
 }
 
 type Event map[string]any

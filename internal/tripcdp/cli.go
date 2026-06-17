@@ -38,15 +38,16 @@ func Run(argv []string) int {
 	renderer := newRenderer(request.LogFile, logLevel, jsonLines)
 	result := scrape(request, renderer.emit, runMode)
 	renderer.emit(Event{
-		"event":           "run_done",
-		"success":         result.Success,
-		"exit_code":       result.ExitCode,
-		"processed_count": result.ProcessedCount,
-		"output_path":     absPath(result.OutputPath),
-		"output_paths":    absPaths(result.OutputPaths),
-		"failed_vendors":  result.FailedVendors,
-		"log_file":        absPath(result.LogFile),
-		"error":           result.Error,
+		"event":               "run_done",
+		"success":             result.Success,
+		"exit_code":           result.ExitCode,
+		"processed_count":     result.ProcessedCount,
+		"output_path":         absPath(result.OutputPath),
+		"output_paths":        absPaths(result.OutputPaths),
+		"failed_vendors":      result.FailedVendors,
+		"log_file":            absPath(result.LogFile),
+		"error":               result.Error,
+		"quality_failed_urls": result.QualityFailedURLs,
 	})
 	return result.ExitCode
 }

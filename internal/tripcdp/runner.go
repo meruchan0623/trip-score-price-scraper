@@ -30,6 +30,7 @@ func scrapeSingle(request TaskRequest, reporter Reporter, runMode string) TaskRe
 	if outputPath == "" {
 		outputPath = defaultSingleOutputPath(request, stamp)
 	}
+	request.OutputPath = outputPath
 	state := resolveRuntimeState(request)
 	for _, warning := range state.Warnings {
 		reporter(Event{"event": "warning", "stage": "state", "message": warning})
@@ -79,7 +80,14 @@ func scrapeSingle(request TaskRequest, reporter Reporter, runMode string) TaskRe
 	stopCount := installStopHandlers(request.StopGraceSeconds, reporter, cancel, func() { signalOnce(forceClose) })
 	defer stopCount.restore()
 
-	scraper := newTripScraper(request, reporter, defaultVendor, 1, len(items))
+	qualityFailedURLs := 0
+	scraperReporter := func(event Event) {
+		if event["event"] == "url_quality_failed" {
+			qualityFailedURLs++
+		}
+		reporter(event)
+	}
+	scraper := newTripScraper(request, scraperReporter, defaultVendor, 1, len(items))
 	rows := []map[string]string{}
 	done := 0
 	go func() {
@@ -133,19 +141,19 @@ func scrapeSingle(request TaskRequest, reporter Reporter, runMode string) TaskRe
 	if len(rows) > 0 {
 		savedPath, err := exportRows(rows, outputPath, request.RatingOnly, request.ExtractRealPrice, request.ExtractProductInfo, false)
 		if err != nil {
-			return TaskResult{Success: false, OutputPath: outputPath, ProcessedCount: len(rows), LogFile: request.LogFile, Error: err.Error(), ExitCode: 4}
+			return TaskResult{Success: false, OutputPath: outputPath, ProcessedCount: len(rows), LogFile: request.LogFile, Error: err.Error(), ExitCode: 4, QualityFailedURLs: qualityFailedURLs}
 		}
 		if ctx.Err() != nil {
 			reporter(Event{"event": "partial_export_done", "vendor": defaultVendor, "rows": len(rows), "output_path": savedPath})
-			return TaskResult{Success: false, OutputPath: savedPath, ProcessedCount: len(rows), LogFile: request.LogFile, Error: "stopped by signal", ExitCode: 130}
+			return TaskResult{Success: false, OutputPath: savedPath, ProcessedCount: len(rows), LogFile: request.LogFile, Error: "stopped by signal", ExitCode: 130, QualityFailedURLs: qualityFailedURLs}
 		}
 		reporter(Event{"event": "export_done", "vendor": defaultVendor, "rows": len(rows), "output_path": savedPath})
-		return TaskResult{Success: true, OutputPath: savedPath, ProcessedCount: len(rows), LogFile: request.LogFile, ExitCode: 0}
+		return TaskResult{Success: true, OutputPath: savedPath, ProcessedCount: len(rows), LogFile: request.LogFile, ExitCode: 0, QualityFailedURLs: qualityFailedURLs}
 	}
 	if ctx.Err() != nil {
-		return TaskResult{Success: false, OutputPath: outputPath, LogFile: request.LogFile, Error: "stopped by signal", ExitCode: 130}
+		return TaskResult{Success: false, OutputPath: outputPath, LogFile: request.LogFile, Error: "stopped by signal", ExitCode: 130, QualityFailedURLs: qualityFailedURLs}
 	}
-	return TaskResult{Success: false, OutputPath: outputPath, LogFile: request.LogFile, Error: "no score/price data captured", ExitCode: 4}
+	return TaskResult{Success: false, OutputPath: outputPath, LogFile: request.LogFile, Error: "no score/price data captured", ExitCode: 4, QualityFailedURLs: qualityFailedURLs}
 }
 
 func scrapeVendorBatches(request TaskRequest, reporter Reporter, runMode string) TaskResult {
@@ -325,23 +333,25 @@ func scrapeVendorBatches(request TaskRequest, reporter Reporter, runMode string)
 	}
 	rows := 0
 	failedVendors := []string{}
+	qualityFailedURLs := 0
 	for _, result := range results {
 		rows += result.Rows
+		qualityFailedURLs += result.QualityFailedURLs
 		if !result.Success {
 			failedVendors = append(failedVendors, result.Vendor)
 		}
 	}
 	if ctx.Err() != nil {
-		return TaskResult{Success: false, OutputPath: outputDir, OutputPaths: outputPaths, ProcessedCount: rows, Warnings: warnings, FailedVendors: failedVendors, LogFile: request.LogFile, Error: "stopped by signal", ExitCode: 130}
+		return TaskResult{Success: false, OutputPath: outputDir, OutputPaths: outputPaths, ProcessedCount: rows, Warnings: warnings, FailedVendors: failedVendors, LogFile: request.LogFile, Error: "stopped by signal", ExitCode: 130, QualityFailedURLs: qualityFailedURLs}
 	}
 	if len(failedVendors) > 0 {
-		return TaskResult{Success: false, OutputPath: outputDir, OutputPaths: outputPaths, ProcessedCount: rows, Warnings: warnings, FailedVendors: failedVendors, LogFile: request.LogFile, Error: summarizeFailures(results), ExitCode: 4}
+		return TaskResult{Success: false, OutputPath: outputDir, OutputPaths: outputPaths, ProcessedCount: rows, Warnings: warnings, FailedVendors: failedVendors, LogFile: request.LogFile, Error: summarizeFailures(results), ExitCode: 4, QualityFailedURLs: qualityFailedURLs}
 	}
 	if rows == 0 && len(groups) > 0 {
 		for _, group := range groups {
 			failedVendors = append(failedVendors, group.Vendor)
 		}
-		return TaskResult{Success: false, OutputPath: outputDir, OutputPaths: outputPaths, ProcessedCount: 0, Warnings: warnings, FailedVendors: failedVendors, LogFile: request.LogFile, Error: "no rows captured and no successful worker output", ExitCode: 4}
+		return TaskResult{Success: false, OutputPath: outputDir, OutputPaths: outputPaths, ProcessedCount: 0, Warnings: warnings, FailedVendors: failedVendors, LogFile: request.LogFile, Error: "no rows captured and no successful worker output", ExitCode: 4, QualityFailedURLs: qualityFailedURLs}
 	}
 
 	// Run vendor comparison if requested
@@ -354,7 +364,7 @@ func scrapeVendorBatches(request TaskRequest, reporter Reporter, runMode string)
 		}
 	}
 
-	return TaskResult{Success: true, OutputPath: outputDir, OutputPaths: outputPaths, ProcessedCount: rows, Warnings: warnings, LogFile: request.LogFile, ExitCode: 0}
+	return TaskResult{Success: true, OutputPath: outputDir, OutputPaths: outputPaths, ProcessedCount: rows, Warnings: warnings, LogFile: request.LogFile, ExitCode: 0, QualityFailedURLs: qualityFailedURLs}
 }
 
 type stopControl struct {
@@ -508,52 +518,57 @@ func cancellableSleep(ctx context.Context, duration time.Duration) bool {
 }
 
 type workerResult struct {
-	Vendor      string
-	WorkerID    int
-	Success     bool
-	Stopped     bool
-	Rows        int
-	OutputPath  string
-	SessionFile string
-	ProfileDir  string
-	Error       string
-	ErrorType   string
-	Stage       string
-	URLCount    int
-	URLsDone    int
-	LogFile     string
+	Vendor            string
+	WorkerID          int
+	Success           bool
+	Stopped           bool
+	Rows              int
+	OutputPath        string
+	SessionFile       string
+	ProfileDir        string
+	Error             string
+	ErrorType         string
+	Stage             string
+	URLCount          int
+	URLsDone          int
+	LogFile           string
+	QualityFailedURLs int
 }
 
 func (r workerResult) Event() Event {
 	return Event{
-		"event":        "vendor_done",
-		"vendor":       r.Vendor,
-		"worker_id":    r.WorkerID,
-		"success":      r.Success,
-		"stopped":      r.Stopped,
-		"rows":         r.Rows,
-		"output_path":  r.OutputPath,
-		"session_file": r.SessionFile,
-		"profile_dir":  r.ProfileDir,
-		"error":        r.Error,
-		"error_type":   r.ErrorType,
-		"stage":        r.Stage,
-		"log_file":     r.LogFile,
-		"url_count":    r.URLCount,
-		"urls_done":    r.URLsDone,
+		"event":               "vendor_done",
+		"vendor":              r.Vendor,
+		"worker_id":           r.WorkerID,
+		"success":             r.Success,
+		"stopped":             r.Stopped,
+		"rows":                r.Rows,
+		"output_path":         r.OutputPath,
+		"session_file":        r.SessionFile,
+		"profile_dir":         r.ProfileDir,
+		"error":               r.Error,
+		"error_type":          r.ErrorType,
+		"stage":               r.Stage,
+		"log_file":            r.LogFile,
+		"url_count":           r.URLCount,
+		"urls_done":           r.URLsDone,
+		"quality_failed_urls": r.QualityFailedURLs,
 	}
 }
 
 func runVendorWorker(ctx context.Context, workerID int, group vendorGroup, request TaskRequest, outputPath string, globalTotal int, reporter Reporter, resultCh chan<- workerResult, registerForceClose func(func())) {
+	rows := []map[string]string{}
+	result := workerResult{Vendor: group.Vendor, WorkerID: workerID, OutputPath: outputPath, SessionFile: request.BrowserOptions.SessionFile, ProfileDir: request.BrowserOptions.UserDataDir, URLCount: len(group.Items), LogFile: request.LogFile}
 	localReporter := func(event Event) {
+		if event["event"] == "url_quality_failed" {
+			result.QualityFailedURLs++
+		}
 		event["vendor"] = group.Vendor
 		event["worker_id"] = workerID
 		event["output_path"] = outputPath
 		event["log_file"] = request.LogFile
 		reporter(event)
 	}
-	rows := []map[string]string{}
-	result := workerResult{Vendor: group.Vendor, WorkerID: workerID, OutputPath: outputPath, SessionFile: request.BrowserOptions.SessionFile, ProfileDir: request.BrowserOptions.UserDataDir, URLCount: len(group.Items), LogFile: request.LogFile}
 	scraper := newTripScraper(request, localReporter, group.Vendor, workerID, globalTotal)
 	if registerForceClose != nil {
 		registerForceClose(scraper.close)
