@@ -28,7 +28,11 @@ func exportRows(rows []map[string]string, outputPath string, ratingOnly bool, ex
 	}
 
 	maxSKULayers := 0
+	hasScrapeNote := false
 	for _, row := range rows {
+		if strings.TrimSpace(row["抓取备注"]) != "" {
+			hasScrapeNote = true
+		}
 		for key := range row {
 			if strings.HasPrefix(key, "SKU层级") {
 				n, err := strconv.Atoi(strings.TrimPrefix(key, "SKU层级"))
@@ -61,6 +65,9 @@ func exportRows(rows []map[string]string, outputPath string, ratingOnly bool, ex
 		fields = append(fields, "商品资讯")
 	}
 	fields = append(fields, "预定数", "评价数", "评分", "客户服务", "方便程度", "讯号状态", "中差评价数")
+	if hasScrapeNote {
+		fields = append(fields, "抓取备注")
+	}
 
 	for col, field := range fields {
 		cell, _ := excelize.CoordinatesToCellName(col+1, 1)

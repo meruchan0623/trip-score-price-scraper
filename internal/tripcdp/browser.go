@@ -37,6 +37,7 @@ type tripScraper struct {
 	restartAfterURL   bool
 	restartReason     string
 	riskProtection    bool
+	currentScrapeNote string
 }
 
 type skuLayerInfo struct {
@@ -106,6 +107,7 @@ type pageSnapshot struct {
 	HasScore        bool   `json:"has_score"`
 	RiskChallenge   bool   `json:"risk_challenge"`
 	RiskKind        string `json:"risk_kind"`
+	CloudflareBlock bool   `json:"cloudflare_block"`
 	HTTPStatus      int    `json:"http_status"`
 	ResponseURL     string `json:"response_url"`
 	BodyPreview     string `json:"body_preview"`
@@ -479,6 +481,7 @@ func (s *tripScraper) scrapeOne(ctx context.Context, item ScrapeItem, index int,
 	target := newNavigationTarget(item.URL)
 	s.restartAfterURL = false
 	s.restartReason = ""
+	s.currentScrapeNote = ""
 	s.emit(mergeEvent(Event{"event": "url_started", "first_trip_navigation_url": target.NavigateURL, "navigation_locale": target.Locale, "navigation_currency": target.Currency, "accept_language": target.AcceptLanguage, "session_nav_skipped": true}, base))
 	var lastSnapshot pageSnapshot
 	for attempt := 1; attempt <= 2; attempt++ {
@@ -569,6 +572,7 @@ func (s *tripScraper) scrapeOneAttempt(ctx context.Context, item ScrapeItem, tar
 	}
 	snapshot, waitMS := s.waitProductPageReady(ctx, 12*time.Second)
 	snapshot.withNavigationStatus(navStatus, navURL)
+	s.recordCloudflareIfPresent("page_open", base)
 	if isWhaleguardSnapshot(snapshot) {
 		s.emit(mergeEvent(Event{"event": "risk_challenge_detected", "stage": "page_open", "message": "whaleguard block detected during navigation", "risk_kind": snapshot.RiskKind, "http_status": snapshot.HTTPStatus, "body_preview": snapshot.BodyPreview, "final_url": snapshot.URL}, base))
 		return nil, snapshot, true, nil
@@ -580,6 +584,7 @@ func (s *tripScraper) scrapeOneAttempt(ctx context.Context, item ScrapeItem, tar
 	if !sleepDelay(ctx, s.emit, "page_open", "page", s.request.DelayOptions.Page) {
 		return nil, snapshot, false, ctx.Err()
 	}
+	s.recordCloudflareIfPresent("after_page_delay", base)
 	risk := s.detectRiskChallenge()
 	if len(risk.Scripts) > 0 {
 		s.emit(mergeEvent(Event{"event": "log", "stage": "risk", "message": "risk scripts detected", "risk_scripts_detected": risk.Scripts}, base))
@@ -589,15 +594,23 @@ func (s *tripScraper) scrapeOneAttempt(ctx context.Context, item ScrapeItem, tar
 		snapshot.applyRisk(risk)
 		snapshot.withNavigationStatus(navStatus, navURL)
 		s.emit(mergeEvent(Event{"event": "risk_challenge_detected", "stage": "risk", "message": risk.Reason, "risk_kind": risk.Kind, "http_status": snapshot.HTTPStatus, "body_preview": risk.BodyPreview, "risk_scripts_detected": risk.Scripts, "final_url": snapshot.URL}, base))
-		if risk.Kind == "whaleguard" {
-			return nil, snapshot, true, nil
+		if risk.Kind == "cloudflare" {
+			s.markCloudflareBlocked("risk", base, risk.Reason, risk.BodyPreview)
+			snapshot.RiskChallenge = false
+			snapshot.RiskKind = ""
+		} else {
+			if risk.Kind == "whaleguard" {
+				return nil, snapshot, true, nil
+			}
+			return []map[string]string{s.errorRow(item, risk.Reason)}, snapshot, false, nil
 		}
-		return []map[string]string{s.errorRow(item, risk.Reason)}, snapshot, false, nil
 	}
 	s.emit(mergeEvent(Event{"event": "log", "stage": "lazy_load", "message": "scrolling page"}, base))
 	s.scrollPage(ctx)
+	s.recordCloudflareIfPresent("after_scroll", base)
 	snapshot, waitMS = s.waitProductPageExtractable(ctx, 12*time.Second, s.request.RatingOnly)
 	snapshot.withNavigationStatus(navStatus, navURL)
+	s.recordCloudflareIfPresent("before_extract", base)
 	if snapshot.RiskChallenge {
 		risk := s.detectRiskChallenge()
 		if risk.Challenge {
@@ -605,10 +618,16 @@ func (s *tripScraper) scrapeOneAttempt(ctx context.Context, item ScrapeItem, tar
 			snapshot.applyRisk(risk)
 			snapshot.withNavigationStatus(navStatus, navURL)
 			s.emit(mergeEvent(Event{"event": "risk_challenge_detected", "stage": "risk", "message": reason, "risk_kind": risk.Kind, "http_status": snapshot.HTTPStatus, "body_preview": risk.BodyPreview, "risk_scripts_detected": risk.Scripts, "final_url": snapshot.URL}, base))
-			if risk.Kind == "whaleguard" {
-				return nil, snapshot, true, nil
+			if risk.Kind == "cloudflare" {
+				s.markCloudflareBlocked("lazy_load", base, reason, risk.BodyPreview)
+				snapshot.RiskChallenge = false
+				snapshot.RiskKind = ""
+			} else {
+				if risk.Kind == "whaleguard" {
+					return nil, snapshot, true, nil
+				}
+				return []map[string]string{s.errorRow(item, reason)}, snapshot, false, nil
 			}
-			return []map[string]string{s.errorRow(item, reason)}, snapshot, false, nil
 		}
 		snapshot.RiskChallenge = false
 		snapshot.RiskKind = ""
@@ -619,6 +638,8 @@ func (s *tripScraper) scrapeOneAttempt(ctx context.Context, item ScrapeItem, tar
 	}
 	s.emit(mergeEvent(Event{"event": "log", "stage": "extract", "message": "extracting page"}, base))
 	rows, valid := s.extractRows(ctx, item, snapshot)
+	s.recordCloudflareIfPresent("after_extract", base)
+	s.applyCurrentScrapeNoteToRows(rows)
 	if !valid {
 		snapshot = s.currentPageSnapshot()
 		s.emit(mergeEvent(Event{"event": "page_unhealthy", "stage": "extract", "message": "product DOM unavailable during extraction", "snapshot": snapshot}, base))
@@ -634,6 +655,7 @@ func (s *tripScraper) errorRows(item ScrapeItem, err error, started time.Time, b
 
 func (s *tripScraper) extractRows(ctx context.Context, item ScrapeItem, snapshot pageSnapshot) ([]map[string]string, bool) {
 	baseRow := s.extractBaseRow(ctx, item)
+	s.applyCurrentScrapeNote(baseRow)
 	if s.request.RatingOnly {
 		s.emit(Event{"event": "log", "stage": "sku", "message": "rating-only mode; skipping SKU price extraction"})
 		return []map[string]string{baseRow}, isProductPageExtractable(snapshot, true)
@@ -1575,6 +1597,8 @@ func (s *tripScraper) currentPageSnapshot() pageSnapshot {
 		const hasAny = (selectors) => selectors.some(selector => Array.from(document.querySelectorAll(selector)).some(visible));
 		const hasText = (patterns) => patterns.some(pattern => bodyText.includes(pattern));
 		const title = document.title || '';
+		const explicitCloudflareOverlay = document.querySelector('#guestLogin-sliderTntLoginBanneribu_nonmemberlogin_online_pic_cf_container');
+		const cloudflareOverlay = !!explicitCloudflareOverlay && visible(explicitCloudflareOverlay);
 		const whaleguard = lower.includes('whaleguard');
 		const riskChallenge = whaleguard || lower.includes('verify you are human') || lower.includes('captcha') || lower.includes('security verification') || bodyText.includes('安全验证') || bodyText.includes('安全驗證') || bodyText.includes('人机验证') || bodyText.includes('人機驗證') || bodyText.includes('請完成驗證') || bodyText.includes('请完成验证');
 		return {
@@ -1587,7 +1611,8 @@ func (s *tripScraper) currentPageSnapshot() pageSnapshot {
 			has_price: hasAny(['span[currency="HKD"]', 'span[testid*="price"]', 'div[class*="price"]']) || /HK\$\s*[0-9,]+(?:\.\d+)?/.test(bodyText),
 			has_score: hasAny(['span[testid="productdetail-productInfo-commentScore"]', '[class*="commentScore"]']),
 			risk_challenge: riskChallenge,
-			risk_kind: whaleguard ? 'whaleguard' : (riskChallenge ? 'challenge' : ''),
+			risk_kind: whaleguard ? 'whaleguard' : (cloudflareOverlay ? 'cloudflare' : (riskChallenge ? 'challenge' : '')),
+			cloudflare_block: cloudflareOverlay,
 			body_preview: bodyText.slice(0, 200),
 		};
 	}`)
@@ -1907,6 +1932,89 @@ func (s *tripScraper) detectRiskChallenge() riskDiagnostics {
 	return classifyRiskChallenge(payload.Body, payload.URL, payload.Scripts, payload.HasSKU, 0)
 }
 
+type cloudflareOverlayDiagnostics struct {
+	Detected    bool
+	Reason      string
+	BodyPreview string
+}
+
+func (s *tripScraper) detectCloudflareOverlay() cloudflareOverlayDiagnostics {
+	var payload struct {
+		Detected bool   `json:"detected"`
+		Reason   string `json:"reason"`
+		Body     string `json:"body"`
+	}
+	_ = s.evalJSON(&payload, `() => {
+		const body = (document.body && (document.body.innerText || document.body.textContent) || '').trim().replace(/\s+/g, ' ');
+		const visible = (el) => {
+			if (!el) return false;
+			const style = window.getComputedStyle(el);
+			if (!style || style.display === 'none' || style.visibility === 'hidden') return false;
+			return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+		};
+		const explicit = document.querySelector('#guestLogin-sliderTntLoginBanneribu_nonmemberlogin_online_pic_cf_container');
+		if (visible(explicit)) {
+			return {detected: true, reason: 'cloudflare overlay: guestLogin-sliderTntLoginBanneribu_nonmemberlogin_online_pic_cf_container', body};
+		}
+		const close = document.querySelector('#guestLogin-sliderTntLoginBanneribu_nonmemberlogin_online_pic_cf_container .cf-close-container .cf-close, .cf-close-container .cf-close');
+		if (visible(close) && body.toLowerCase().includes('cloudflare')) {
+			return {detected: true, reason: 'cloudflare overlay close control visible', body};
+		}
+		const turnstileLink = document.querySelector('a[href*="cloudflare.com/products/turnstile"], a[href*="/cdn-cgi/challenge-platform/help"]');
+		if (visible(turnstileLink)) {
+			return {detected: true, reason: 'cloudflare turnstile widget link visible', body};
+		}
+		const humanVerifyCheckbox = Array.from(document.querySelectorAll('label input[type="checkbox"]')).find(input => {
+			const label = input.closest('label');
+			const text = label ? ((label.innerText || label.textContent || '').trim()) : '';
+			return visible(input) && (text.includes('驗證您是人類') || text.includes('验证您是人类') || text.toLowerCase().includes('verify you are human'));
+		});
+		if (humanVerifyCheckbox) {
+			return {detected: true, reason: 'cloudflare human verification checkbox visible', body};
+		}
+		const challengeError = document.querySelector('#challenge-error-text');
+		if (visible(challengeError)) {
+			return {detected: true, reason: 'cloudflare challenge error element visible', body};
+		}
+		const iframe = Array.from(document.querySelectorAll('iframe')).find(f => ((f.src || '') + ' ' + (f.title || '')).toLowerCase().includes('cloudflare') || (f.src || '').toLowerCase().includes('challenges.cloudflare.com'));
+		if (visible(iframe)) {
+			return {detected: true, reason: 'cloudflare iframe visible', body};
+		}
+		const lower = body.toLowerCase();
+		if (body.includes('驗證您是人類') || body.includes('验证您是人类') || body.includes('正在驗證') || body.includes('正在验证') || body.includes('驗證失敗') || body.includes('验证失败') || body.includes('驗證已過期') || body.includes('验证已过期')) {
+			return {detected: true, reason: 'cloudflare turnstile verification text visible', body};
+		}
+		if (lower.includes('cloudflare') && (lower.includes('verify you are human') || lower.includes('just a moment') || lower.includes('checking if the site connection is secure'))) {
+			return {detected: true, reason: 'cloudflare challenge text visible', body};
+		}
+		return {detected: false, reason: '', body};
+	}`)
+	if !payload.Detected {
+		return cloudflareOverlayDiagnostics{}
+	}
+	return cloudflareOverlayDiagnostics{Detected: true, Reason: firstNonEmpty(payload.Reason, "cloudflare overlay detected"), BodyPreview: previewText(payload.Body, 200)}
+}
+
+func (s *tripScraper) recordCloudflareIfPresent(stage string, base Event) bool {
+	diag := s.detectCloudflareOverlay()
+	if !diag.Detected {
+		return false
+	}
+	s.markCloudflareBlocked(stage, base, diag.Reason, diag.BodyPreview)
+	return true
+}
+
+func (s *tripScraper) markCloudflareBlocked(stage string, base Event, reason string, bodyPreview string) {
+	s.currentScrapeNote = "被Cloudflare拦截"
+	s.emit(mergeEvent(Event{
+		"event":        "cloudflare_overlay_detected",
+		"stage":        stage,
+		"message":      firstNonEmpty(reason, "Cloudflare overlay detected; note only, continuing scrape"),
+		"scrape_note":  s.currentScrapeNote,
+		"body_preview": bodyPreview,
+	}, base))
+}
+
 func classifyRiskChallenge(body string, pageURL string, scripts []string, hasSKU bool, httpStatus int) riskDiagnostics {
 	lowerBody := strings.ToLower(body)
 	lowerURL := strings.ToLower(pageURL)
@@ -1915,6 +2023,9 @@ func classifyRiskChallenge(body string, pageURL string, scripts []string, hasSKU
 	if httpStatus == 432 || strings.Contains(lowerURL, "whaleguard") || strings.Contains(lowerBody, "whaleguard") {
 		reason = "risk challenge detected: whaleguard"
 		kind = "whaleguard"
+	} else if strings.Contains(lowerURL, "cloudflare") || strings.Contains(lowerURL, "cdn-cgi/challenge-platform") || strings.Contains(lowerBody, "cloudflare") || strings.Contains(lowerBody, "checking if the site connection is secure") || strings.Contains(lowerBody, "just a moment") || strings.Contains(body, "驗證您是人類") || strings.Contains(body, "验证您是人类") || strings.Contains(body, "正在驗證") || strings.Contains(body, "正在验证") || strings.Contains(body, "驗證失敗") || strings.Contains(body, "验证失败") || strings.Contains(body, "驗證已過期") || strings.Contains(body, "验证已过期") || strings.Contains(body, "challenge-error-text") || strings.Contains(body, "turnstile") {
+		reason = "cloudflare challenge detected"
+		kind = "cloudflare"
 	}
 	challengeMarkers := []string{
 		"verify you are human",
@@ -2301,8 +2412,32 @@ func (s *tripScraper) errorRow(item ScrapeItem, message string) map[string]strin
 			row["实价"] = ""
 		}
 	}
+	s.applyCurrentScrapeNote(row)
 	s.ensurePriceFields(row)
 	return row
+}
+
+func (s *tripScraper) applyCurrentScrapeNote(row map[string]string) {
+	note := strings.TrimSpace(s.currentScrapeNote)
+	if note == "" || row == nil {
+		return
+	}
+	if existing := strings.TrimSpace(row["抓取备注"]); existing != "" {
+		if !strings.Contains(existing, note) {
+			row["抓取备注"] = existing + "；" + note
+		}
+		return
+	}
+	row["抓取备注"] = note
+}
+
+func (s *tripScraper) applyCurrentScrapeNoteToRows(rows []map[string]string) {
+	if strings.TrimSpace(s.currentScrapeNote) == "" {
+		return
+	}
+	for _, row := range rows {
+		s.applyCurrentScrapeNote(row)
+	}
 }
 
 func (s *tripScraper) evalString(js string, args ...any) string {
