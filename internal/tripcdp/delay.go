@@ -28,13 +28,13 @@ func defaultDelayOptions() DelayOptions {
 func delayProfileOptions(profile string) (DelayOptions, error) {
 	switch profile {
 	case "", "normal":
-		return DelayOptions{Profile: "normal", Page: secondsRange(0.8, 1.5), Scroll: secondsRange(0.2, 0.45), SKUClick: secondsRange(0.15, 0.35), SKUPrice: secondsRange(0.25, 0.55), SKUBetween: secondsRange(0.12, 0.3)}, nil
+		return DelayOptions{Profile: "normal", Page: secondsRange(0.8, 1.5), Scroll: secondsRange(0.2, 0.45), SKUClick: secondsRange(0.25, 0.45), SKUPrice: secondsRange(0.35, 0.65), SKUBetween: secondsRange(0.22, 0.4)}, nil
 	case "fast":
-		return DelayOptions{Profile: "fast", Page: secondsRange(0.4, 0.9), Scroll: secondsRange(0.1, 0.25), SKUClick: secondsRange(0.04, 0.12), SKUPrice: secondsRange(0.08, 0.22), SKUBetween: secondsRange(0, 0.06)}, nil
+		return DelayOptions{Profile: "fast", Page: secondsRange(0.4, 0.9), Scroll: secondsRange(0.1, 0.25), SKUClick: secondsRange(0.14, 0.22), SKUPrice: secondsRange(0.18, 0.32), SKUBetween: secondsRange(0.1, 0.16)}, nil
 	case "safe":
-		return DelayOptions{Profile: "safe", Page: secondsRange(1.5, 3), Scroll: secondsRange(0.3, 0.7), SKUClick: secondsRange(0.25, 0.6), SKUPrice: secondsRange(0.4, 0.8), SKUBetween: secondsRange(0.2, 0.5)}, nil
+		return DelayOptions{Profile: "safe", Page: secondsRange(1.5, 3), Scroll: secondsRange(0.3, 0.7), SKUClick: secondsRange(0.35, 0.7), SKUPrice: secondsRange(0.5, 0.9), SKUBetween: secondsRange(0.3, 0.6)}, nil
 	case "slow":
-		return DelayOptions{Profile: "slow", Page: secondsRange(1.5, 3), Scroll: secondsRange(0.6, 1.2), SKUClick: secondsRange(0.6, 1.2), SKUPrice: secondsRange(0.8, 1.6), SKUBetween: secondsRange(0.4, 0.9)}, nil
+		return DelayOptions{Profile: "slow", Page: secondsRange(1.5, 3), Scroll: secondsRange(0.6, 1.2), SKUClick: secondsRange(0.7, 1.3), SKUPrice: secondsRange(0.9, 1.7), SKUBetween: secondsRange(0.5, 1.0)}, nil
 	default:
 		return DelayOptions{}, fmt.Errorf("--delay-profile must be fast, normal, safe, or slow")
 	}

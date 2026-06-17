@@ -15,10 +15,10 @@ func TestDelayProfileOptions(t *testing.T) {
 		skuPriceMin   time.Duration
 		skuBetweenMax time.Duration
 	}{
-		{profile: "fast", pageMin: 400 * time.Millisecond, pageMax: 900 * time.Millisecond, skuClickMin: 40 * time.Millisecond, skuPriceMin: 80 * time.Millisecond, skuBetweenMax: 60 * time.Millisecond},
-		{profile: "normal", pageMin: 800 * time.Millisecond, pageMax: 1500 * time.Millisecond, skuClickMin: 150 * time.Millisecond, skuPriceMin: 250 * time.Millisecond, skuBetweenMax: 300 * time.Millisecond},
-		{profile: "safe", pageMin: 1500 * time.Millisecond, pageMax: 3 * time.Second, skuClickMin: 250 * time.Millisecond, skuPriceMin: 400 * time.Millisecond, skuBetweenMax: 500 * time.Millisecond},
-		{profile: "slow", pageMin: 1500 * time.Millisecond, pageMax: 3 * time.Second, skuClickMin: 600 * time.Millisecond, skuPriceMin: 800 * time.Millisecond, skuBetweenMax: 900 * time.Millisecond},
+		{profile: "fast", pageMin: 400 * time.Millisecond, pageMax: 900 * time.Millisecond, skuClickMin: 140 * time.Millisecond, skuPriceMin: 180 * time.Millisecond, skuBetweenMax: 160 * time.Millisecond},
+		{profile: "normal", pageMin: 800 * time.Millisecond, pageMax: 1500 * time.Millisecond, skuClickMin: 250 * time.Millisecond, skuPriceMin: 350 * time.Millisecond, skuBetweenMax: 400 * time.Millisecond},
+		{profile: "safe", pageMin: 1500 * time.Millisecond, pageMax: 3 * time.Second, skuClickMin: 350 * time.Millisecond, skuPriceMin: 500 * time.Millisecond, skuBetweenMax: 600 * time.Millisecond},
+		{profile: "slow", pageMin: 1500 * time.Millisecond, pageMax: 3 * time.Second, skuClickMin: 700 * time.Millisecond, skuPriceMin: 900 * time.Millisecond, skuBetweenMax: 1000 * time.Millisecond},
 	}
 	for _, tt := range tests {
 		options, err := delayProfileOptions(tt.profile)
