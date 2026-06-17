@@ -104,6 +104,49 @@ func TestExportRowsFieldShape(t *testing.T) {
 	}
 }
 
+func TestExportRowsAddsScrapeNoteColumnOnlyWhenPresent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "note.xlsx")
+	rows := []map[string]string{{
+		"厂商":     "Vendor",
+		"商品ID":   "12345",
+		"URL":    "https://www.trip.com/detail/12345",
+		"商品名称":   "Product",
+		"SKU层级1": "1日",
+		"货币":     "HKD",
+		"外显价格":   "10",
+		"实价":     "8",
+		"促销标签":   "Save",
+		"预定数":    "1",
+		"评价数":    "2",
+		"评分":     "4.8",
+		"客户服务":   "4.7",
+		"方便程度":   "4.6",
+		"讯号状态":   "4.5",
+		"中差评价数":  "0",
+		"抓取备注":   "被Cloudflare拦截",
+	}}
+
+	if _, err := exportRows(rows, path, false, true, false, true); err != nil {
+		t.Fatal(err)
+	}
+	file, err := excelize.OpenFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	sheet := file.GetSheetName(file.GetActiveSheetIndex())
+	gotRows, err := file.GetRows(sheet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotRows[0][len(gotRows[0])-1] != "抓取备注" {
+		t.Fatalf("last header = %q, want 抓取备注; headers=%#v", gotRows[0][len(gotRows[0])-1], gotRows[0])
+	}
+	if gotRows[1][len(gotRows[0])-1] != "被Cloudflare拦截" {
+		t.Fatalf("scrape note value = %q", gotRows[1][len(gotRows[0])-1])
+	}
+}
+
 func TestExportRowsRatingOnlyProductInfoShapeMatchesLegacyGUI(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "rating-only.xlsx")
 	rows := []map[string]string{{

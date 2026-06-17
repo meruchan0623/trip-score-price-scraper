@@ -34,6 +34,38 @@ func TestClassifyRiskChallengeWithoutSKU(t *testing.T) {
 	}
 }
 
+func TestClassifyCloudflareChallengeKind(t *testing.T) {
+	result := classifyRiskChallenge(
+		"Cloudflare Just a moment Checking if the site connection is secure",
+		"https://hk.trip.com/things-to-do/detail/92237157/",
+		nil,
+		false,
+		0,
+	)
+	if !result.Challenge {
+		t.Fatalf("cloudflare page should be a challenge diagnostic: %+v", result)
+	}
+	if result.Kind != "cloudflare" {
+		t.Fatalf("cloudflare kind = %q", result.Kind)
+	}
+}
+
+func TestClassifyCloudflareTurnstileTraditionalChineseKind(t *testing.T) {
+	result := classifyRiskChallenge(
+		`<label><input type="checkbox"><span>驗證您是人類</span></label><span id="LLoRg3">正在驗證...</span><a href="/cdn-cgi/challenge-platform/help">說明</a>`,
+		"https://hk.trip.com/things-to-do/detail/92237157/",
+		nil,
+		false,
+		0,
+	)
+	if !result.Challenge {
+		t.Fatalf("cloudflare turnstile page should be a challenge diagnostic: %+v", result)
+	}
+	if result.Kind != "cloudflare" {
+		t.Fatalf("cloudflare turnstile kind = %q", result.Kind)
+	}
+}
+
 func TestClassifyWhaleguardAlwaysChallenge(t *testing.T) {
 	result := classifyRiskChallenge(
 		"套餐與價格",
