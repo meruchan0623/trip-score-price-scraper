@@ -65,6 +65,7 @@ go build -o /tmp/trip-score-cdp ./cmd/trip-score-cdp
   --run-mode mode1 \
   --no-headless \
   --delay-profile normal \
+  --timeout 1800 \
   --input "https://www.trip.com/things-to-do/detail/..." \
   --output ./trip_product.xlsx
 ```
@@ -78,6 +79,7 @@ go build -o /tmp/trip-score-cdp ./cmd/trip-score-cdp
   --run-mode mode1 \
   --no-headless \
   --delay-profile normal \
+  --timeout 1800 \
   --urls-file ./urls.txt \
   --output ./trip_products.xlsx
 ```
@@ -102,8 +104,9 @@ mkdir -p "$RUN_DIR"
   --run-mode mode1 \
   --no-headless \
   --delay-profile normal \
+  --timeout 1800 \
   --excel-input ./vendors.xlsx \
-  --workers 5 \
+  --workers 3 \
   --log-level verbose \
   --compare-vendor "TSIM 網址" \
   --output-dir "$RUN_DIR"
@@ -117,15 +120,17 @@ mkdir -p "$RUN_DIR"
 --run-mode mode1
 --no-headless
 --delay-profile normal
---workers 5
+--timeout 1800
+--workers 3
 --compare-vendor "TSIM 網址"
 ```
 
 说明：
 
-- `normal` 是当前默认安全档位；不要默认使用 `fast`，它更容易触发 Trip whaleguard 风控。
+- `normal` 已由用户更新为默认；`safe` 用于风控场景。
+- `--timeout 1800` 用于降低复杂多 SKU 商品在 worker/session 超时下半截漏抓的风险。
 - `--no-headless` 使用可见 Chrome，默认更稳定。
-- `--workers 5` 是厂商 Excel 模式的默认上限。
+- `--workers 3` 是当前每日厂商 Excel 模式的默认上限。
 - `--compare-vendor` 可指定任意输入表头作为基准厂商；当前日常任务使用 `TSIM 網址`。
 
 ## 输出文件
@@ -210,7 +215,7 @@ safe
 slow
 ```
 
-日常任务推荐 `normal`。如果出现风控、页面加载慢、SKU 点击失败，可临时改为 `safe` 或 `slow`。
+日常任务默认推荐 `normal`，并配合 `--timeout 1800`、`--workers 3`。如果仍出现风控、页面加载慢、SKU 点击失败，可临时改为 `safe` 或 `slow`；不要默认使用 `fast`。
 
 ## 浏览器与状态
 
