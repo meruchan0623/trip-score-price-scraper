@@ -38,16 +38,17 @@ func Run(argv []string) int {
 	renderer := newRenderer(request.LogFile, logLevel, jsonLines)
 	result := scrape(request, renderer.emit, runMode)
 	renderer.emit(Event{
-		"event":               "run_done",
-		"success":             result.Success,
-		"exit_code":           result.ExitCode,
-		"processed_count":     result.ProcessedCount,
-		"output_path":         absPath(result.OutputPath),
-		"output_paths":        absPaths(result.OutputPaths),
-		"failed_vendors":      result.FailedVendors,
-		"log_file":            absPath(result.LogFile),
-		"error":               result.Error,
-		"quality_failed_urls": result.QualityFailedURLs,
+		"event":                  "run_done",
+		"success":                result.Success,
+		"exit_code":              result.ExitCode,
+		"processed_count":        result.ProcessedCount,
+		"output_path":            absPath(result.OutputPath),
+		"output_paths":           absPaths(result.OutputPaths),
+		"failed_vendors":         result.FailedVendors,
+		"log_file":               absPath(result.LogFile),
+		"error":                  result.Error,
+		"quality_failed_urls":    result.QualityFailedURLs,
+		"quality_recovered_urls": result.QualityRecoveredURLs,
 	})
 	return result.ExitCode
 }
@@ -87,6 +88,7 @@ func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bo
 	var skuPriceDelayMax float64 = -1
 	var skuBetweenDelayMin float64 = -1
 	var skuBetweenDelayMax float64 = -1
+	var priceQualityRetries int = -1
 
 	var compareVendor string
 
@@ -131,6 +133,7 @@ func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bo
 	fs.Float64Var(&skuPriceDelayMax, "sku-price-delay-max", -1, "Maximum seconds to wait before reading a SKU price bundle. Default -1 uses delay profile default.")
 	fs.Float64Var(&skuBetweenDelayMin, "sku-between-delay-min", -1, "Minimum seconds to wait between SKU combinations. Default -1 uses delay profile default.")
 	fs.Float64Var(&skuBetweenDelayMax, "sku-between-delay-max", -1, "Maximum seconds to wait between SKU combinations. Default -1 uses delay profile default.")
+	fs.IntVar(&priceQualityRetries, "price-quality-retries", -1, "Retry a URL this many times when SKU price quality fails. Default -1 uses mode defaults.")
 	fs.BoolFunc("rating-only", "Only scrape rating-related fields.", func(string) error { ratingOnly = triState{set: true, value: true}; return nil })
 	fs.BoolFunc("no-rating-only", "Scrape SKU and price fields as well as rating fields.", func(string) error { ratingOnly = triState{set: true, value: false}; return nil })
 	fs.BoolFunc("real-price", "Scrape dynamic real-price fields.", func(string) error { realPrice = triState{set: true, value: true}; return nil })
@@ -151,6 +154,9 @@ func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bo
 	if logLevel != "quiet" && logLevel != "normal" && logLevel != "verbose" {
 		return TaskRequest{}, "", "", false, false, fmt.Errorf("--log-level must be quiet, normal, or verbose")
 	}
+	if priceQualityRetries < -1 {
+		return TaskRequest{}, "", "", false, false, fmt.Errorf("--price-quality-retries must be >= 0, or -1 for mode default")
+	}
 
 	options := resolveRunOptions(runMode, headless, ratingOnly, realPrice, productInfo)
 	delayOverrides, err := buildDelayOverrides(pageDelayMin, pageDelayMax, scrollDelayMin, scrollDelayMax, skuClickDelayMin, skuClickDelayMax, skuPriceDelayMin, skuPriceDelayMax, skuBetweenDelayMin, skuBetweenDelayMax)
@@ -163,6 +169,9 @@ func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bo
 	delayOptions, err := resolveDelayOptions(delayProfile, delayOverrides)
 	if err != nil {
 		return TaskRequest{}, "", "", false, false, err
+	}
+	if priceQualityRetries == -1 {
+		priceQualityRetries = defaultPriceQualityRetries(runMode, options)
 	}
 	return TaskRequest{
 		InputPaths:          []string(inputs),
@@ -179,6 +188,7 @@ func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bo
 		ExtractRealPrice:    options.realPrice,
 		ExtractProductInfo:  options.productInfo,
 		DelayOptions:        delayOptions,
+		PriceQualityRetry:   PriceQualityRetryOptions{MaxRetries: priceQualityRetries},
 		BrowserOptions: BrowserOptions{
 			Browser:            browser,
 			Headless:           options.headless,
@@ -227,6 +237,13 @@ func resolveRunOptions(runMode string, headless triState, ratingOnly triState, r
 		options.productInfo = productInfo.value
 	}
 	return options
+}
+
+func defaultPriceQualityRetries(runMode string, options runOptions) int {
+	if runMode == "mode2" || options.ratingOnly {
+		return 0
+	}
+	return 2
 }
 
 func stringFlagPassed(argv []string, name string) bool {
