@@ -42,6 +42,41 @@ func TestLoadExcelItemsFiltersTripLinksAndPreservesVendorMetadata(t *testing.T) 
 	}
 }
 
+func TestLoadExcelItemsScansPastInteriorBlankRows(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sparse-vendors.xlsx")
+	file := excelize.NewFile()
+	sheet := file.GetSheetName(file.GetActiveSheetIndex())
+	_ = file.SetCellValue(sheet, "A1", "Vendor A")
+	_ = file.SetCellValue(sheet, "A2", "https://www.trip.com/detail/111")
+	_ = file.SetCellValue(sheet, "A12", "https://www.trip.com/detail/222")
+	if err := file.SaveAs(path); err != nil {
+		t.Fatal(err)
+	}
+
+	items, warnings, err := loadExcelItems(path, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(warnings) != 0 {
+		t.Fatalf("unexpected warnings: %v", warnings)
+	}
+	if len(items) != 2 {
+		t.Fatalf("expected 2 Trip items across blank rows, got %d: %+v", len(items), items)
+	}
+	if *items[1].SourceRow != 12 || items[1].URL != "https://www.trip.com/detail/222" {
+		t.Fatalf("sparse row metadata mismatch: %+v", items[1])
+	}
+
+	audit, err := auditExcelInput(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if audit.TripURLCount != 2 || audit.InteriorEmptyRows != 9 {
+		t.Fatalf("audit = %+v, want 2 URLs and 9 interior empty rows", audit)
+	}
+}
+
 func TestVendorGroupsSeparatesDuplicateVendorColumns(t *testing.T) {
 	col1 := 1
 	col2 := 2
@@ -607,12 +642,42 @@ func TestPriceQualityTrackerStopsOnDominantFallbackPrice(t *testing.T) {
 	}
 }
 
-func TestWritePriceQualityDiagnostic(t *testing.T) {
-	dir := t.TempDir()
+func TestShouldRetryPriceQualityHonorsModeAndReason(t *testing.T) {
 	tracker := newPriceQualityTracker()
 	for i := 0; i < 5; i++ {
 		tracker.observe(map[string]string{
+			"price_status":       priceStatusUntrustedResourceMiss,
+			"raw_captured_price": "33",
+		})
+	}
+	scraper := &tripScraper{request: TaskRequest{PriceQualityRetry: PriceQualityRetryOptions{MaxRetries: 2}}}
+	if !scraper.shouldRetryPriceQuality(tracker, 0, 0) {
+		t.Fatal("expected retry for zero trusted retryable resource miss")
+	}
+	if scraper.shouldRetryPriceQuality(tracker, 1, 0) {
+		t.Fatal("trusted rows should not trigger price quality retry")
+	}
+	if scraper.shouldRetryPriceQuality(tracker, 0, 2) {
+		t.Fatal("used retry budget should not trigger retry")
+	}
+	scraper.request.RatingOnly = true
+	if scraper.shouldRetryPriceQuality(tracker, 0, 0) {
+		t.Fatal("rating-only mode should not trigger price quality retry")
+	}
+	if priceQualityReasonRetryable("untrusted_price_missing") {
+		t.Fatal("non-resource-miss reasons should not be retryable")
+	}
+}
+
+func TestWritePriceQualityDiagnostic(t *testing.T) {
+	dir := t.TempDir()
+	tracker := newPriceQualityTracker()
+	tracker.retryAttempt = 2
+	tracker.diagnostics = productPackageDiagnostics{NextDataPresent: true, PackageCount: 3, ResourceCount: 9, BatchResponseCount: 2, LastResponseStatus: 200}
+	for i := 0; i < 5; i++ {
+		tracker.observe(map[string]string{
 			"combination":        "1天 | 每日-1GB",
+			"selected_texts":     "1天 | 每日-1GB",
 			"price_status":       priceStatusUntrustedResourceMiss,
 			"resource_id":        "0",
 			"item_id":            "0",
@@ -632,7 +697,7 @@ func TestWritePriceQualityDiagnostic(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(raw)
-	for _, want := range []string{`"event":"price_quality_failure"`, `"product_id":"85483615"`, `"reason":"consecutive_resource_miss"`, `"raw_captured_price":"22"`} {
+	for _, want := range []string{`"event":"price_quality_failure"`, `"product_id":"85483615"`, `"reason":"consecutive_resource_miss"`, `"raw_captured_price":"22"`, `"retry_attempt":2`, `"next_data_present":true`, `"package_count":3`, `"resource_count":9`, `"batch_response_count":2`, `"last_response_status":200`, `"selected_texts":["1天 | 每日-1GB"]`, `"recovered":false`} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("diagnostic missing %s: %s", want, text)
 		}
@@ -687,6 +752,40 @@ func TestWaitForBatchPromotionPriceBundleFastReturnsOnCompleteNoPromoPrice(t *te
 	}
 	if waitMS != 0 || sleeps != 0 {
 		t.Fatalf("fast complete no-promo price should not wait: waitMS=%d sleeps=%d", waitMS, sleeps)
+	}
+}
+
+func TestWaitForBatchPromotionPriceBundleWaitsForResourceID(t *testing.T) {
+	baseTime := time.Unix(100, 0)
+	now := baseTime
+	calls := 0
+	bundle, waitMS := waitForBatchPromotionPriceBundle(
+		context.Background(),
+		[]skuOption{{Text: "1天", Layer: 1}, {Text: "每日-1GB", Layer: 2}},
+		func([]string) batchPromotionPriceBundle {
+			calls++
+			if calls < 4 {
+				return batchPromotionPriceBundle{Currency: "HKD", OriginalPrice: 33}
+			}
+			return batchPromotionPriceBundle{ResourceID: 123, ItemID: 123, Currency: "HKD", OriginalPrice: 33, PromoMatched: true}
+		},
+		batchPromotionWaitOptions{
+			MaxWait:             5 * time.Second,
+			PollInterval:        150 * time.Millisecond,
+			NoPromoFallbackWait: 2500 * time.Millisecond,
+			FastNoPromoReturn:   true,
+			Now:                 func() time.Time { return now },
+			Sleep: func(context.Context, time.Duration) bool {
+				now = now.Add(150 * time.Millisecond)
+				return true
+			},
+		},
+	)
+	if bundle.ResourceID != 123 || bundle.ItemID != 123 || !bundle.PromoMatched {
+		t.Fatalf("wait did not return recovered resource bundle: %+v", bundle)
+	}
+	if calls != 4 || waitMS != 450 {
+		t.Fatalf("calls/waitMS = %d/%d, want 4/450", calls, waitMS)
 	}
 }
 
