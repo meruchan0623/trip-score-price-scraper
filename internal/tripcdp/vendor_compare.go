@@ -191,9 +191,19 @@ func parseInputConfig(excelPath string, baseVendor string) ([]regionGroup, error
 		colIdx int
 	}
 	vendorCols := []vendorCol{}
+	categoryColIdx := -1
+	destinationColIdx := -1
 	for i, h := range rows[0] {
 		h = strings.TrimSpace(h)
-		if h == "" || h == "分類" || h == "分类" || h == "目的地" {
+		switch h {
+		case "分類", "分类":
+			categoryColIdx = i
+			continue
+		case "目的地":
+			destinationColIdx = i
+			continue
+		}
+		if h == "" || isInputMetadataHeader(h) {
 			continue
 		}
 		vendorCols = append(vendorCols, vendorCol{h, i})
@@ -217,11 +227,11 @@ func parseInputConfig(excelPath string, baseVendor string) ([]regionGroup, error
 			continue
 		}
 		category, destination := "", ""
-		if len(row) > 0 {
-			category = strings.TrimSpace(row[0])
+		if categoryColIdx >= 0 && categoryColIdx < len(row) {
+			category = strings.TrimSpace(row[categoryColIdx])
 		}
-		if len(row) > 1 {
-			destination = strings.TrimSpace(row[1])
+		if destinationColIdx >= 0 && destinationColIdx < len(row) {
+			destination = strings.TrimSpace(row[destinationColIdx])
 		}
 		compURLs := map[string]string{}
 		for _, vc := range vendorCols {
@@ -241,6 +251,16 @@ func parseInputConfig(excelPath string, baseVendor string) ([]regionGroup, error
 		groups = append(groups, regionGroup{rowIndex: rowIdx + 1, category: category, destination: destination, baseURL: strings.TrimSpace(row[baseColIdx]), baseVendor: baseVendorName, competitorURLs: compURLs})
 	}
 	return groups, nil
+}
+
+func isInputMetadataHeader(header string) bool {
+	header = strings.TrimSpace(header)
+	switch header {
+	case "TSIM ID", "商品ID", "产品ID", "產品ID", "ID", "区域", "地區", "地区", "Region", "region":
+		return true
+	default:
+		return false
+	}
 }
 
 func loadVendorProducts(xlsxPath string) (map[string][]productSKU, error) {
