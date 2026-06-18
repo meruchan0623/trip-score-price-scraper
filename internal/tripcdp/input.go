@@ -9,6 +9,28 @@ import (
 	"github.com/xuri/excelize/v2"
 )
 
+type excelScan struct {
+	Sheet     string
+	Dimension string
+	Rows      [][]string
+	MaxRows   int
+	MaxCols   int
+}
+
+type inputAudit struct {
+	SheetName          string
+	Dimension          string
+	TripURLCount       int
+	VendorCount        int
+	VendorURLCounts    map[string]int
+	EmptyRows          int
+	InteriorEmptyRows  int
+	NonTripLinkCount   int
+	BlankVendorColumns int
+	MaxRows            int
+	MaxCols            int
+}
+
 func loadItems(request TaskRequest) ([]ScrapeItem, []string, error) {
 	items := make([]ScrapeItem, 0)
 	order := 0
@@ -51,47 +73,28 @@ func loadItems(request TaskRequest) ([]ScrapeItem, []string, error) {
 }
 
 func loadExcelItems(path string, startOrder int) ([]ScrapeItem, []string, error) {
-	file, err := excelize.OpenFile(expandPath(path))
+	scan, err := scanExcelWorkbook(path)
 	if err != nil {
 		return nil, nil, err
-	}
-	defer file.Close()
-
-	sheet := file.GetSheetName(file.GetActiveSheetIndex())
-	if sheet == "" {
-		sheets := file.GetSheetList()
-		if len(sheets) > 0 {
-			sheet = sheets[0]
-		}
-	}
-	rows, err := file.GetRows(sheet)
-	if err != nil {
-		return nil, nil, err
-	}
-	maxCols := 0
-	for _, row := range rows {
-		if len(row) > maxCols {
-			maxCols = len(row)
-		}
 	}
 
 	items := []ScrapeItem{}
 	warnings := []string{}
 	order := startOrder
-	for col := 0; col < maxCols; col++ {
+	for col := 0; col < scan.MaxCols; col++ {
 		vendor := ""
-		if len(rows) > 0 && col < len(rows[0]) {
-			vendor = strings.TrimSpace(rows[0][col])
+		if scan.MaxRows > 0 && col < len(scan.Rows[0]) {
+			vendor = strings.TrimSpace(scan.Rows[0][col])
 		}
 		if vendor == "" {
 			continue
 		}
 		found := 0
-		for rowIndex := 1; rowIndex < len(rows); rowIndex++ {
-			if col >= len(rows[rowIndex]) {
-				continue
+		for rowIndex := 1; rowIndex < scan.MaxRows; rowIndex++ {
+			url := ""
+			if rowIndex < len(scan.Rows) && col < len(scan.Rows[rowIndex]) {
+				url = strings.TrimSpace(scan.Rows[rowIndex][col])
 			}
-			url := strings.TrimSpace(rows[rowIndex][col])
 			if url == "" {
 				continue
 			}
@@ -117,6 +120,145 @@ func loadExcelItems(path string, startOrder int) ([]ScrapeItem, []string, error)
 		}
 	}
 	return items, warnings, nil
+}
+
+func scanExcelWorkbook(path string) (*excelScan, error) {
+	file, err := excelize.OpenFile(expandPath(path))
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	sheet := file.GetSheetName(file.GetActiveSheetIndex())
+	if sheet == "" {
+		sheets := file.GetSheetList()
+		if len(sheets) > 0 {
+			sheet = sheets[0]
+		}
+	}
+	maxRows, maxCols := 0, 0
+	dimension := ""
+	if sheet != "" {
+		if dim, err := file.GetSheetDimension(sheet); err == nil {
+			dimension = dim
+			if row, col := boundsFromDimension(dim); row > 0 && col > 0 {
+				maxRows, maxCols = row, col
+			}
+		}
+	}
+	rows, err := file.GetRows(sheet)
+	if err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		maxRows = max(maxRows, len(rows))
+		if len(row) > maxCols {
+			maxCols = len(row)
+		}
+	}
+	if maxRows == 0 {
+		maxRows = len(rows)
+	}
+	grid := make([][]string, maxRows)
+	for rowIndex := 0; rowIndex < maxRows; rowIndex++ {
+		grid[rowIndex] = make([]string, maxCols)
+		for col := 0; col < maxCols; col++ {
+			cell, _ := excelize.CoordinatesToCellName(col+1, rowIndex+1)
+			value, err := file.GetCellValue(sheet, cell)
+			if err != nil {
+				return nil, err
+			}
+			grid[rowIndex][col] = strings.TrimSpace(value)
+		}
+	}
+	return &excelScan{Sheet: sheet, Dimension: dimension, Rows: grid, MaxRows: maxRows, MaxCols: maxCols}, nil
+}
+
+func boundsFromDimension(dimension string) (int, int) {
+	dimension = strings.TrimSpace(dimension)
+	if dimension == "" {
+		return 0, 0
+	}
+	parts := strings.Split(dimension, ":")
+	last := parts[len(parts)-1]
+	colName, row, err := excelize.SplitCellName(last)
+	if err != nil {
+		return 0, 0
+	}
+	col, err := excelize.ColumnNameToNumber(colName)
+	if err != nil {
+		return 0, 0
+	}
+	return row, col
+}
+
+func auditExcelInput(path string) (*inputAudit, error) {
+	scan, err := scanExcelWorkbook(path)
+	if err != nil {
+		return nil, err
+	}
+	audit := &inputAudit{
+		SheetName:       scan.Sheet,
+		Dimension:       scan.Dimension,
+		VendorURLCounts: map[string]int{},
+		MaxRows:         scan.MaxRows,
+		MaxCols:         scan.MaxCols,
+	}
+	vendorCols := map[int]string{}
+	for col := 0; col < scan.MaxCols; col++ {
+		vendor := ""
+		if scan.MaxRows > 0 {
+			vendor = strings.TrimSpace(scan.Rows[0][col])
+		}
+		if vendor == "" {
+			audit.BlankVendorColumns++
+			continue
+		}
+		vendorCols[col] = vendor
+		audit.VendorCount++
+	}
+	lastNonEmptyRow := -1
+	firstDataRowWithValue := -1
+	for rowIndex := 1; rowIndex < scan.MaxRows; rowIndex++ {
+		rowHasValue := false
+		for col, vendor := range vendorCols {
+			value := strings.TrimSpace(scan.Rows[rowIndex][col])
+			if value == "" {
+				continue
+			}
+			rowHasValue = true
+			lowered := strings.ToLower(value)
+			if strings.Contains(lowered, "http") && strings.Contains(lowered, "trip.com") {
+				audit.TripURLCount++
+				audit.VendorURLCounts[vendor]++
+			} else {
+				audit.NonTripLinkCount++
+			}
+		}
+		if rowHasValue {
+			if firstDataRowWithValue == -1 {
+				firstDataRowWithValue = rowIndex
+			}
+			lastNonEmptyRow = rowIndex
+		} else {
+			audit.EmptyRows++
+		}
+	}
+	if firstDataRowWithValue >= 0 {
+		for rowIndex := firstDataRowWithValue; rowIndex < lastNonEmptyRow; rowIndex++ {
+			rowHasValue := false
+			for col := range vendorCols {
+				if strings.TrimSpace(scan.Rows[rowIndex][col]) != "" {
+					rowHasValue = true
+					break
+				}
+			}
+			if !rowHasValue {
+				audit.InteriorEmptyRows++
+			}
+		}
+	}
+	return audit, nil
 }
 
 func vendorGroups(items []ScrapeItem) []vendorGroup {
