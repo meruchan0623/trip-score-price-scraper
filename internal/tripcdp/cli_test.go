@@ -8,8 +8,8 @@ import (
 
 func TestResolveRunOptionsAppliesModeThenExplicitFlags(t *testing.T) {
 	mode1 := resolveRunOptions("mode1", triState{}, triState{}, triState{}, triState{})
-	if mode1.headless {
-		t.Fatal("mode1 should be headed by default")
+	if !mode1.headless {
+		t.Fatal("mode1 should be headless by default")
 	}
 	if mode1.ratingOnly || !mode1.realPrice || !mode1.productInfo {
 		t.Fatalf("mode1 should be full scrape with real price and product info: %+v", mode1)
@@ -23,8 +23,8 @@ func TestResolveRunOptionsAppliesModeThenExplicitFlags(t *testing.T) {
 		triState{},
 	)
 
-	if options.headless {
-		t.Fatal("mode2 should remain headed unless explicitly overridden")
+	if !options.headless {
+		t.Fatal("mode2 should remain headless unless explicitly overridden")
 	}
 	if !options.ratingOnly {
 		t.Fatal("mode2 must remain rating-only even if --no-rating-only is passed")
@@ -45,8 +45,11 @@ func TestParseRunModeDelayDefaults(t *testing.T) {
 	if runMode != "mode1" {
 		t.Fatalf("run mode = %q, want mode1", runMode)
 	}
-	if mode1.BrowserOptions.Headless || mode1.RatingOnly || !mode1.ExtractRealPrice || !mode1.ExtractProductInfo {
+	if !mode1.BrowserOptions.Headless || mode1.RatingOnly || !mode1.ExtractRealPrice || !mode1.ExtractProductInfo {
 		t.Fatalf("unexpected mode1 request: %+v", mode1)
+	}
+	if !mode1.QualityRerun.Enabled || mode1.QualityRerun.Headless || mode1.QualityRerun.DelayProfile != "safe" {
+		t.Fatalf("mode1 quality rerun defaults = %+v, want enabled headed safe", mode1.QualityRerun)
 	}
 	if mode1.DelayOptions.Profile != "normal" {
 		t.Fatalf("mode1 delay profile = %q, want normal", mode1.DelayOptions.Profile)
@@ -62,8 +65,11 @@ func TestParseRunModeDelayDefaults(t *testing.T) {
 	if runMode != "mode2" {
 		t.Fatalf("run mode = %q, want mode2", runMode)
 	}
-	if mode2.BrowserOptions.Headless || !mode2.RatingOnly || mode2.ExtractRealPrice || !mode2.ExtractProductInfo {
+	if !mode2.BrowserOptions.Headless || !mode2.RatingOnly || mode2.ExtractRealPrice || !mode2.ExtractProductInfo {
 		t.Fatalf("unexpected mode2 request: %+v", mode2)
+	}
+	if mode2.QualityRerun.Enabled {
+		t.Fatalf("mode2 quality rerun should be disabled: %+v", mode2.QualityRerun)
 	}
 	if mode2.DelayOptions.Profile != "fast" {
 		t.Fatalf("mode2 delay profile = %q, want fast", mode2.DelayOptions.Profile)
