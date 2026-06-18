@@ -44,6 +44,10 @@ type DelayOptions struct {
 	SKUBetween DelayRange
 }
 
+type PriceQualityRetryOptions struct {
+	MaxRetries int
+}
+
 type TaskRequest struct {
 	InputPaths          []string
 	URLsFile            string
@@ -59,21 +63,23 @@ type TaskRequest struct {
 	ExtractRealPrice    bool
 	ExtractProductInfo  bool
 	DelayOptions        DelayOptions
+	PriceQualityRetry   PriceQualityRetryOptions
 	BrowserOptions      BrowserOptions
 	CompareVendor       string // If set, run vendor comparison against this base vendor after scrape
 }
 
 type TaskResult struct {
-	Success           bool
-	OutputPath        string
-	OutputPaths       []string
-	ProcessedCount    int
-	Warnings          []string
-	FailedVendors     []string
-	LogFile           string
-	Error             string
-	ExitCode          int
-	QualityFailedURLs int
+	Success              bool
+	OutputPath           string
+	OutputPaths          []string
+	ProcessedCount       int
+	Warnings             []string
+	FailedVendors        []string
+	LogFile              string
+	Error                string
+	ExitCode             int
+	QualityFailedURLs    int
+	QualityRecoveredURLs int
 }
 
 type Event map[string]any
