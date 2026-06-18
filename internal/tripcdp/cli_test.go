@@ -51,6 +51,9 @@ func TestParseRunModeDelayDefaults(t *testing.T) {
 	if mode1.DelayOptions.Profile != "normal" {
 		t.Fatalf("mode1 delay profile = %q, want normal", mode1.DelayOptions.Profile)
 	}
+	if mode1.PriceQualityRetry.MaxRetries != 2 {
+		t.Fatalf("mode1 price quality retries = %d, want 2", mode1.PriceQualityRetry.MaxRetries)
+	}
 
 	mode2, runMode, _, _, _, err := parseArgs([]string{"--run-mode", "mode2", "--input", "https://www.trip.com/detail/12345"}, &bytes.Buffer{})
 	if err != nil {
@@ -65,6 +68,9 @@ func TestParseRunModeDelayDefaults(t *testing.T) {
 	if mode2.DelayOptions.Profile != "fast" {
 		t.Fatalf("mode2 delay profile = %q, want fast", mode2.DelayOptions.Profile)
 	}
+	if mode2.PriceQualityRetry.MaxRetries != 0 {
+		t.Fatalf("mode2 price quality retries = %d, want 0", mode2.PriceQualityRetry.MaxRetries)
+	}
 
 	overridden, _, _, _, _, err := parseArgs([]string{"--run-mode", "mode2", "--delay-profile", "slow", "--input", "https://www.trip.com/detail/12345"}, &bytes.Buffer{})
 	if err != nil {
@@ -72,6 +78,14 @@ func TestParseRunModeDelayDefaults(t *testing.T) {
 	}
 	if overridden.DelayOptions.Profile != "slow" {
 		t.Fatalf("explicit delay profile should override mode2 default, got %q", overridden.DelayOptions.Profile)
+	}
+
+	retryOverride, _, _, _, _, err := parseArgs([]string{"--run-mode", "mode2", "--price-quality-retries", "3", "--input", "https://www.trip.com/detail/12345"}, &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("retry override parse failed: %v", err)
+	}
+	if retryOverride.PriceQualityRetry.MaxRetries != 3 {
+		t.Fatalf("explicit price quality retries = %d, want 3", retryOverride.PriceQualityRetry.MaxRetries)
 	}
 }
 
