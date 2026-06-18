@@ -48,6 +48,12 @@ type PriceQualityRetryOptions struct {
 	MaxRetries int
 }
 
+type QualityRerunOptions struct {
+	Enabled      bool
+	Headless     bool
+	DelayProfile string
+}
+
 type TaskRequest struct {
 	InputPaths          []string
 	URLsFile            string
@@ -64,22 +70,26 @@ type TaskRequest struct {
 	ExtractProductInfo  bool
 	DelayOptions        DelayOptions
 	PriceQualityRetry   PriceQualityRetryOptions
+	QualityRerun        QualityRerunOptions
 	BrowserOptions      BrowserOptions
 	CompareVendor       string // If set, run vendor comparison against this base vendor after scrape
 }
 
 type TaskResult struct {
-	Success              bool
-	OutputPath           string
-	OutputPaths          []string
-	ProcessedCount       int
-	Warnings             []string
-	FailedVendors        []string
-	LogFile              string
-	Error                string
-	ExitCode             int
-	QualityFailedURLs    int
-	QualityRecoveredURLs int
+	Success                   bool
+	OutputPath                string
+	OutputPaths               []string
+	ProcessedCount            int
+	Warnings                  []string
+	FailedVendors             []string
+	LogFile                   string
+	Error                     string
+	ExitCode                  int
+	QualityFailedURLs         int
+	QualityRecoveredURLs      int
+	QualityRerunAttemptedURLs int
+	QualityRerunRecoveredURLs int
+	FinalQualityFailedURLs    int
 }
 
 type Event map[string]any

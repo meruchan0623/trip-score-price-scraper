@@ -38,17 +38,20 @@ func Run(argv []string) int {
 	renderer := newRenderer(request.LogFile, logLevel, jsonLines)
 	result := scrape(request, renderer.emit, runMode)
 	renderer.emit(Event{
-		"event":                  "run_done",
-		"success":                result.Success,
-		"exit_code":              result.ExitCode,
-		"processed_count":        result.ProcessedCount,
-		"output_path":            absPath(result.OutputPath),
-		"output_paths":           absPaths(result.OutputPaths),
-		"failed_vendors":         result.FailedVendors,
-		"log_file":               absPath(result.LogFile),
-		"error":                  result.Error,
-		"quality_failed_urls":    result.QualityFailedURLs,
-		"quality_recovered_urls": result.QualityRecoveredURLs,
+		"event":                        "run_done",
+		"success":                      result.Success,
+		"exit_code":                    result.ExitCode,
+		"processed_count":              result.ProcessedCount,
+		"output_path":                  absPath(result.OutputPath),
+		"output_paths":                 absPaths(result.OutputPaths),
+		"failed_vendors":               result.FailedVendors,
+		"log_file":                     absPath(result.LogFile),
+		"error":                        result.Error,
+		"quality_failed_urls":          result.QualityFailedURLs,
+		"quality_recovered_urls":       result.QualityRecoveredURLs,
+		"quality_rerun_attempted_urls": result.QualityRerunAttemptedURLs,
+		"quality_rerun_recovered_urls": result.QualityRerunRecoveredURLs,
+		"final_quality_failed_urls":    result.FinalQualityFailedURLs,
 	})
 	return result.ExitCode
 }
@@ -89,6 +92,9 @@ func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bo
 	var skuBetweenDelayMin float64 = -1
 	var skuBetweenDelayMax float64 = -1
 	var priceQualityRetries int = -1
+	var noQualityRerun bool
+	var qualityRerunHeadless triState
+	var qualityRerunDelayProfile string
 
 	var compareVendor string
 
@@ -109,7 +115,7 @@ func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bo
 	fs.IntVar(&workers, "workers", 0, "Concurrent browser workers, 1-5. Defaults to min(vendor count, 5).")
 	fs.Float64Var(&startupStagger, "startup-stagger", 0.5, "Seconds to wait between starting vendor browser workers. Use 0 to disable staggering.")
 	fs.IntVar(&stopGrace, "stop-grace-seconds", 30, "Seconds to wait for partial exports after SIGINT/SIGTERM before terminating workers.")
-	fs.StringVar(&runMode, "run-mode", "", "Preset run mode: mode1=headed full SKU/price/rating scrape; mode2=headed rating-only + product-info scrape (no SKU, no price columns).")
+	fs.StringVar(&runMode, "run-mode", "", "Preset run mode: mode1=headless full SKU/price/rating scrape; mode2=headless rating-only + product-info scrape (no SKU, no price columns).")
 	fs.StringVar(&browser, "browser", "chrome", "Browser to use. Only chrome is supported.")
 	fs.BoolFunc("headless", "Run Chrome in headless mode.", func(string) error { headless = triState{set: true, value: true}; return nil })
 	fs.BoolFunc("no-headless", "Run Chrome with a visible browser window.", func(string) error { headless = triState{set: true, value: false}; return nil })
@@ -134,6 +140,10 @@ func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bo
 	fs.Float64Var(&skuBetweenDelayMin, "sku-between-delay-min", -1, "Minimum seconds to wait between SKU combinations. Default -1 uses delay profile default.")
 	fs.Float64Var(&skuBetweenDelayMax, "sku-between-delay-max", -1, "Maximum seconds to wait between SKU combinations. Default -1 uses delay profile default.")
 	fs.IntVar(&priceQualityRetries, "price-quality-retries", -1, "Retry a URL this many times when SKU price quality fails. Default -1 uses mode defaults.")
+	fs.BoolVar(&noQualityRerun, "no-quality-rerun", false, "Disable post-scrape low-quality URL reruns.")
+	fs.BoolFunc("quality-rerun-headless", "Run low-quality URL reruns in headless mode.", func(string) error { qualityRerunHeadless = triState{set: true, value: true}; return nil })
+	fs.BoolFunc("quality-rerun-no-headless", "Run low-quality URL reruns with a visible browser window.", func(string) error { qualityRerunHeadless = triState{set: true, value: false}; return nil })
+	fs.StringVar(&qualityRerunDelayProfile, "quality-rerun-delay-profile", "safe", "Delay preset for post-scrape low-quality URL reruns: fast, normal, safe, or slow.")
 	fs.BoolFunc("rating-only", "Only scrape rating-related fields.", func(string) error { ratingOnly = triState{set: true, value: true}; return nil })
 	fs.BoolFunc("no-rating-only", "Scrape SKU and price fields as well as rating fields.", func(string) error { ratingOnly = triState{set: true, value: false}; return nil })
 	fs.BoolFunc("real-price", "Scrape dynamic real-price fields.", func(string) error { realPrice = triState{set: true, value: true}; return nil })
@@ -159,19 +169,26 @@ func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bo
 	}
 
 	options := resolveRunOptions(runMode, headless, ratingOnly, realPrice, productInfo)
-	delayOverrides, err := buildDelayOverrides(pageDelayMin, pageDelayMax, scrollDelayMin, scrollDelayMax, skuClickDelayMin, skuClickDelayMax, skuPriceDelayMin, skuPriceDelayMax, skuBetweenDelayMin, skuBetweenDelayMax)
+	overrides, err := buildDelayOverrides(pageDelayMin, pageDelayMax, scrollDelayMin, scrollDelayMax, skuClickDelayMin, skuClickDelayMax, skuPriceDelayMin, skuPriceDelayMax, skuBetweenDelayMin, skuBetweenDelayMax)
 	if err != nil {
 		return TaskRequest{}, "", "", false, false, err
 	}
 	if delayProfile == "normal" && !stringFlagPassed(argv, "delay-profile") && runMode == "mode2" {
 		delayProfile = "fast"
 	}
-	delayOptions, err := resolveDelayOptions(delayProfile, delayOverrides)
+	delayOptions, err := resolveDelayOptions(delayProfile, overrides)
 	if err != nil {
 		return TaskRequest{}, "", "", false, false, err
 	}
+	if _, err := resolveDelayOptions(qualityRerunDelayProfile, delayOverrides{}); err != nil {
+		return TaskRequest{}, "", "", false, false, fmt.Errorf("--quality-rerun-delay-profile %w", err)
+	}
 	if priceQualityRetries == -1 {
 		priceQualityRetries = defaultPriceQualityRetries(runMode, options)
+	}
+	qualityRerun := QualityRerunOptions{Enabled: !noQualityRerun && runMode != "mode2" && !options.ratingOnly, Headless: false, DelayProfile: qualityRerunDelayProfile}
+	if qualityRerunHeadless.set {
+		qualityRerun.Headless = qualityRerunHeadless.value
 	}
 	return TaskRequest{
 		InputPaths:          []string(inputs),
@@ -189,6 +206,7 @@ func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bo
 		ExtractProductInfo:  options.productInfo,
 		DelayOptions:        delayOptions,
 		PriceQualityRetry:   PriceQualityRetryOptions{MaxRetries: priceQualityRetries},
+		QualityRerun:        qualityRerun,
 		BrowserOptions: BrowserOptions{
 			Browser:            browser,
 			Headless:           options.headless,
@@ -210,12 +228,12 @@ type runOptions struct {
 }
 
 func resolveRunOptions(runMode string, headless triState, ratingOnly triState, realPrice triState, productInfo triState) runOptions {
-	options := runOptions{headless: false, ratingOnly: false, realPrice: true, productInfo: true}
+	options := runOptions{headless: true, ratingOnly: false, realPrice: true, productInfo: true}
 	switch runMode {
 	case "mode1":
-		options = runOptions{headless: false, ratingOnly: false, realPrice: true, productInfo: true}
+		options = runOptions{headless: true, ratingOnly: false, realPrice: true, productInfo: true}
 	case "mode2":
-		options = runOptions{headless: false, ratingOnly: true, realPrice: false, productInfo: true}
+		options = runOptions{headless: true, ratingOnly: true, realPrice: false, productInfo: true}
 	}
 	if headless.set {
 		options.headless = headless.value
