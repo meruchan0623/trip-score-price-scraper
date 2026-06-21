@@ -127,7 +127,6 @@ def format_final(run_dir: Path, run_id: str, state: dict, done: dict, vendor_tot
     if trend.get('missing_sku_rows') is not None:
         lines.append(f'缺失SKU: {trend["missing_sku_rows"]} | 新增: {trend.get("new_rows", 0)}')
 
-    # Find ZIP package
     pkgs = sorted(run_dir.glob('Trip_SKU厂商价格趋势_*.zip'))
     if not pkgs:
         pkgs = sorted(run_dir.glob('Trip_SKU非TSIM厂商价格趋势_*.zip'))
@@ -154,6 +153,7 @@ def main():
     shutil.copy2(CONFIG_INPUT, input_path)
     vendors = count_vendors(input_path)
     total_urls = sum(vendors.values())
+    workers = min(MAX_WORKERS, len(vendors))
     summary = {
         'run_id': run_dir.name,
         'run_dir': str(run_dir),
@@ -161,9 +161,17 @@ def main():
         'config_input': str(CONFIG_INPUT),
         'vendors': vendors,
         'total_urls': total_urls,
-        'config': {'run_mode': 'mode1', 'headless': True, 'delay_profile': DEFAULT_DELAY_PROFILE,
-                    'timeout': DEFAULT_TIMEOUT_SECONDS, 'workers': min(MAX_WORKERS, len(vendors)), 'log_level': 'verbose',
-                    'default_compare_vendor': DEFAULT_COMPARE_VENDOR},
+        'config': {
+            'run_mode': 'mode1',
+            'headless': True,
+            'delay_profile': DEFAULT_DELAY_PROFILE,
+            'timeout': DEFAULT_TIMEOUT_SECONDS,
+            'workers': workers,
+            'log_level': 'verbose',
+            'json_log_file': 'run.jsonl',
+            'quality_rerun': 'enabled (default: visible-browser safe recovery)',
+            'default_compare_vendor': DEFAULT_COMPARE_VENDOR,
+        },
         'status': 'preparing',
         'created_at': time.strftime('%Y-%m-%d %H:%M:%S %z'),
     }
@@ -173,22 +181,19 @@ def main():
         f'- 任务：每天 UTC+8 08:00 抓取配置表中的 Trip.com SKU/外显价/实价/评分/预定数，并与前一次同厂商、同产品、同名 SKU 结果做趋势对比。\n'
         f'- 输入：`{input_path.name}`，来源 `{CONFIG_INPUT}`。\n'
         f'- 厂商范围：' + '，'.join(f'{v}({n})' for v, n in vendors.items()) + f'，合计 {total_urls} 条 URL。\n'
-        f'- 参数：`mode1`，无头浏览器，`normal` 延迟，`timeout={DEFAULT_TIMEOUT_SECONDS}`，`workers={summary["config"]["workers"]}`；低质量结果会自动用有头 safe 单工重跑补救。\n'
+        f'- 参数：`mode1`，无头主抓取，`{DEFAULT_DELAY_PROFILE}` 延迟，`timeout={DEFAULT_TIMEOUT_SECONDS}`，`workers={workers}`；低质量价格/SKU 结果自动走 CLI 默认质量重跑（有头浏览器 `safe` 单工补救）。\n'
+        f'- 日志：保留 `terminal_output.txt`，并通过 `--log-file run.jsonl` 写入机器可读事件，便于追踪 url_quality_failed / run_done / quality rerun。\n'
         f'- 默认日常比价标的：`{DEFAULT_COMPARE_VENDOR}`；这是默认基准厂商，不代表该 cron 只服务某一家厂商，后续可通过配置更换。\n'
         f'- 输出：每厂商原始 XLSX、每厂商含趋势 XLSX、SKU 厂商趋势总表、增强版 vendor_compare 横向比价表（总表为SKU粒度，单链接均价对比为目的地粒度）、趋势摘要 JSON、ZIP 包。\n'
         f'- 说明：预定数变化为两次抓取之间 Trip 页面累计预定数差值，可作为销量动态参考；SKU 比价按结构化规格解析匹配（有效期+总量/每日+流量MB），兼容總量-10GB/總量 10GB/5G-總量-10GB 等格式差异；比价差值只基于匹配SKU交集。\n',
         encoding='utf-8'
     )
 
-    # Build CLI
     subprocess.run(['go', 'build', '-o', str(BINARY), './cmd/trip-score-cdp'], cwd=str(REPO), check=True)
-    # Do not persist trip-score-cdp --help output in scheduled runs; it is
-    # stable CLI metadata and the user requested not to retain it.
 
     log_path = run_dir / 'terminal_output.txt'
     jsonl_log_path = run_dir / 'run.jsonl'
     runner = run_dir / 'run_daily_sku_vendor_trend.sh'
-    workers = summary['config']['workers']
     runner.write_text(f'''#!/bin/bash
 set -euo pipefail
 RUN_DIR={str(run_dir)!r}
@@ -238,19 +243,13 @@ exit $code
 ''', encoding='utf-8')
     runner.chmod(0o755)
 
-    # Launch scrape
     proc = subprocess.Popen([str(runner)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     summary.update({'status': 'launched', 'pid': proc.pid, 'runner': str(runner), 'log_path': str(log_path)})
     (run_dir / 'current_state.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
     (ROOT / 'current_state.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
 
-    print(f'SKU价格抓取已启动 [{run_id}] PID:{proc.pid} | ' +
+    print(f'SKU价格抓取已启动 [{run_dir.name}] PID:{proc.pid} | ' +
           ' '.join(f'{v}:{n}' for v, n in vendors.items()) + f' 合计{total_urls}条')
-
-    # Important: Hermes cron has a short per-run execution budget. The launcher must
-    # start the detached scrape and exit quickly; progress/final delivery is handled
-    # by the daily watcher on its own recurring cron.
-    return
 
 
 if __name__ == '__main__':
