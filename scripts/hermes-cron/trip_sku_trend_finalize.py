@@ -291,7 +291,7 @@ def main(run_dir_arg: str):
     report_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
     zip_path = run_dir / f'Trip_SKU厂商价格趋势_{run_dir.name}.zip'
     if zip_path.exists(): zip_path.unlink()
-    exclude_from_package = {'terminal_output.txt', 'trip-score-cdp-help.txt', 'finalize_output.json'}
+    exclude_from_package = {'trip-score-cdp-help.txt', 'finalize_output.json'}
     with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as z:
         for pattern in ('*.xlsx','*.md','*.json','*.txt'):
             for p in sorted(run_dir.glob(pattern)):
