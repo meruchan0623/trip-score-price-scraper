@@ -19,6 +19,8 @@ go run ./cmd/trip-score-cdp --help
 go build -o /tmp/trip-score-cdp ./cmd/trip-score-cdp
 ```
 
+Hermes Remote Debugging allocation: this daily SKU/price cron does not reserve a fixed shared `--remote-debugging-port` such as `9222`, `9223`, or `9224`. Keep those ports for signed-in Ctrip/Tripcom browser sessions; this workflow should continue using its own Go CDP browser management and run-directory artifacts.
+
 Do not restore or recommend the removed Python CLI, Python GUI, Selenium/undetected-chromedriver workflow, or PyInstaller spec as project entry points. If maintaining the repository, keep README focused on Go CDP-only usage and keep the operational skill synced into the project-local `.hermes/skills/trip-sku-price-scraper-operations/` directory. See `references/go-cdp-only-repository-consolidation-2026-06-02.md`.
 
 ## Canonical paths
