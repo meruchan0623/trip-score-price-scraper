@@ -238,9 +238,11 @@ func scrapeVendorBatches(request TaskRequest, reporter Reporter, runMode string)
 	force := make(chan struct{}, 1)
 	stopCtl := installStopHandlers(request.StopGraceSeconds, reporter, cancel, func() { signalOnce(force) })
 	defer stopCtl.restore()
+	pressure := newAntiBotPressureController(request.Runtime, reporter)
 	riskPause := newGlobalRiskPause(request.DelayOptions.Profile, reporter)
 	workerReporter := func(event Event) {
 		riskPause.observe(event)
+		pressure.Observe(event)
 		reporter(event)
 	}
 
@@ -261,6 +263,9 @@ func scrapeVendorBatches(request TaskRequest, reporter Reporter, runMode string)
 			return false
 		}
 		if !riskPause.wait(ctx) {
+			return false
+		}
+		if !pressure.DelayBeforeNextStart(ctx) {
 			return false
 		}
 		nextID++
@@ -303,7 +308,7 @@ func scrapeVendorBatches(request TaskRequest, reporter Reporter, runMode string)
 		return ctx.Err() == nil
 	}
 
-	for canStartWorker(ctx, len(pending), active, workers) {
+	for canStartWorker(ctx, len(pending), active, pressure.EffectiveWorkerLimit(workers)) {
 		group := pending[0]
 		pending = pending[1:]
 		if !startNext(group) {
@@ -347,7 +352,7 @@ func scrapeVendorBatches(request TaskRequest, reporter Reporter, runMode string)
 			reporter(Event{"event": "global_api_blocked", "stage": "runtime", "api_blocked_urls": runtimeSummaryAPIBlocked(results), "processed_urls": urlsDone, "threshold": request.Runtime.GlobalAPIBlockRatio})
 			cancel()
 		}
-		if canStartWorker(ctx, len(pending), active, workers) {
+		if canStartWorker(ctx, len(pending), active, pressure.EffectiveWorkerLimit(workers)) {
 			group := pending[0]
 			pending = pending[1:]
 			_ = startNext(group)
