@@ -11,11 +11,45 @@ func TestQualityRerunCandidatesSkipTrustedNoSKUBaseRows(t *testing.T) {
 
 	candidates := collectQualityRerunCandidates(rows)
 
-	if len(candidates) != 2 {
-		t.Fatalf("candidates = %d, want 2: %+v", len(candidates), candidates)
+	if len(candidates) != 0 {
+		t.Fatalf("candidates = %d, want 0: %+v", len(candidates), candidates)
 	}
-	if candidates[0].URL != "https://hk.trip.com/things-to-do/detail/2/" || candidates[1].URL != "https://hk.trip.com/things-to-do/detail/3/" {
-		t.Fatalf("unexpected candidates: %+v", candidates)
+}
+
+func TestQualityRerunCandidatesSkipAPISuspectedResourceMiss(t *testing.T) {
+	rows := []map[string]string{}
+	for i := 0; i < minSamplesForResourceRate; i++ {
+		row := map[string]string{
+			"厂商":       "BC",
+			"商品ID":     "1",
+			"URL":      "https://hk.trip.com/things-to-do/detail/1/",
+			"价格状态":     priceStatusUntrustedResourceMiss,
+			"资源ID":     "0",
+			"接口ItemID": "0",
+			"抓取备注":     "价格质量检查失败: resource_miss_rate",
+		}
+		if i > 0 {
+			row["厂商"] = ""
+			row["商品ID"] = ""
+			row["URL"] = ""
+		}
+		rows = append(rows, row)
+	}
+
+	candidates := collectQualityRerunCandidates(rows)
+	if len(candidates) != 0 {
+		t.Fatalf("api-block suspected rows should not be quality rerun candidates: %+v", candidates)
+	}
+}
+
+func TestQualityRerunCandidatesKeepPageNotReady(t *testing.T) {
+	rows := []map[string]string{{"厂商": "BC", "商品ID": "2", "URL": "https://hk.trip.com/things-to-do/detail/2/", "抓取备注": "页面未加载有效商品内容"}}
+	candidates := collectQualityRerunCandidates(rows)
+	if len(candidates) != 1 {
+		t.Fatalf("page-not-ready rows should be rerun candidates: %+v", candidates)
+	}
+	if candidates[0].FailureClass != FailurePageNotReady {
+		t.Fatalf("class = %q", candidates[0].FailureClass)
 	}
 }
 
