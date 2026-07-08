@@ -510,6 +510,11 @@ func isBlankPageURL(pageURL string) bool {
 
 func (s *tripScraper) scrapeOne(ctx context.Context, item ScrapeItem, index int, total int) []map[string]string {
 	started := time.Now()
+	if s.request.Runtime.URLTotalTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.request.Runtime.URLTotalTimeout)
+		defer cancel()
+	}
 	base := Event{"vendor": s.vendor, "worker_id": s.workerID, "url_index": index, "url_total": total, "url": item.URL, "global_total": s.globalTotal}
 	target := newNavigationTarget(item.URL)
 	s.restartAfterURL = false
@@ -549,7 +554,7 @@ func (s *tripScraper) scrapeOne(ctx context.Context, item ScrapeItem, index int,
 				if priceQualityRetries >= 2 {
 					retryStrategy = "restart_browser"
 				}
-				s.emit(mergeEvent(Event{"event": "price_quality_retry", "stage": "sku", "message": "price quality failed; retrying URL", "reason": qualityFailure.failReason, "retry_attempt": priceQualityRetries, "max_retries": s.request.PriceQualityRetry.MaxRetries, "retry_strategy": retryStrategy, "trusted_rows": trustedRows, "untrusted_rows": untrustedRows, "top_fallback_prices": qualityFailure.topFallbackPrices(3)}, base))
+				s.emit(mergeEvent(Event{"event": "price_quality_retry", "stage": "sku", "message": "price quality failed; retrying URL", "reason": qualityFailure.failReason, "failure_class": qualityFailure.failureClass, "retry_attempt": priceQualityRetries, "max_retries": s.request.PriceQualityRetry.MaxRetries, "retry_strategy": retryStrategy, "trusted_rows": trustedRows, "untrusted_rows": untrustedRows, "top_fallback_prices": qualityFailure.topFallbackPrices(3)}, base))
 				s.currentScrapeNote = ""
 				s.currentQualityFailure = nil
 				s.clearBatchPromotionResponses()
@@ -631,7 +636,13 @@ func (s *tripScraper) scrapeOneAttempt(ctx context.Context, item ScrapeItem, tar
 	if monitor != nil {
 		defer monitor.close()
 	}
-	if err := s.page.Context(ctx).Navigate(target.NavigateURL); err != nil {
+	navCtx := ctx
+	var navCancel context.CancelFunc
+	if s.request.Runtime.NavigationTimeout > 0 {
+		navCtx, navCancel = context.WithTimeout(ctx, s.request.Runtime.NavigationTimeout)
+		defer navCancel()
+	}
+	if err := s.page.Context(navCtx).Navigate(target.NavigateURL); err != nil {
 		return nil, pageSnapshot{}, false, err
 	}
 	_ = s.page.WaitLoad()
@@ -755,10 +766,22 @@ func (s *tripScraper) shouldRetryPriceQuality(quality *priceQualityTracker, trus
 	if s == nil || s.request.RatingOnly || quality == nil || !quality.failed || trustedRows > 0 {
 		return false
 	}
-	if retriesUsed >= max(0, s.request.PriceQualityRetry.MaxRetries) {
+	class := quality.failureClass
+	if class == "" || class == FailureNone {
+		class = ClassifyQualityFailure(quality.failReason, quality.trustedRows, quality.untrustedRows, quality.resourceMissRows, quality.totalRows, quality.diagnostics)
+		quality.failureClass = class
+	}
+	if class != FailureBusinessUnavailable && !FailureClassRetryableByQualityRerun(class) || !priceQualityReasonRetryable(quality.failReason) {
 		return false
 	}
-	return priceQualityReasonRetryable(quality.failReason)
+	limit := s.request.PriceQualityRetry.MaxRetries
+	if s.request.Runtime != (RuntimeOptions{}) && s.request.Runtime.MaxQualityRetriesPerURL >= 0 && s.request.Runtime.MaxQualityRetriesPerURL < limit {
+		limit = s.request.Runtime.MaxQualityRetriesPerURL
+	}
+	if retriesUsed >= max(0, limit) {
+		return false
+	}
+	return true
 }
 
 func priceQualityReasonRetryable(reason string) bool {
@@ -784,6 +807,7 @@ func (s *tripScraper) extractRows(ctx context.Context, item ScrapeItem, snapshot
 	}
 	if len(combinations) == 0 {
 		if quality != nil && quality.failed {
+			quality.failureClass = ClassifyQualityFailure(quality.failReason, quality.trustedRows, quality.untrustedRows, quality.resourceMissRows, quality.totalRows, quality.diagnostics)
 			s.currentQualityFailure = quality
 			row := s.errorRow(item, "价格质量检查失败: "+quality.failReason)
 			row["价格状态"] = priceStatusUntrustedResourceMiss
@@ -847,9 +871,12 @@ func (s *tripScraper) extractRows(ctx context.Context, item ScrapeItem, snapshot
 		rows = append(rows, row)
 	}
 	if quality != nil && quality.failed {
+		quality.failureClass = ClassifyQualityFailure(quality.failReason, quality.trustedRows, quality.untrustedRows, quality.resourceMissRows, quality.totalRows, quality.diagnostics)
 		s.currentQualityFailure = quality
-		s.restartAfterURL = true
-		s.restartReason = "price quality failed: " + quality.failReason
+		if FailureClassAllowsBrowserRestart(quality.failureClass) {
+			s.restartAfterURL = true
+			s.restartReason = "price quality failed: " + quality.failReason
+		}
 	}
 	return rows, true
 }
@@ -887,6 +914,11 @@ func (s *tripScraper) emitURLQualityFailed(item ScrapeItem, quality *priceQualit
 		return
 	}
 	s.refreshPriceQualityDiagnostics(quality)
+	failureClass := quality.failureClass
+	if failureClass == "" || failureClass == FailureNone {
+		failureClass = ClassifyQualityFailure(quality.failReason, quality.trustedRows, quality.untrustedRows, quality.resourceMissRows, quality.totalRows, quality.diagnostics)
+		quality.failureClass = failureClass
+	}
 	diagnosticPath := s.writePriceQualityDiagnostic(item, quality)
 	s.emit(Event{
 		"event":                "url_quality_failed",
@@ -895,6 +927,7 @@ func (s *tripScraper) emitURLQualityFailed(item ScrapeItem, quality *priceQualit
 		"url":                  item.URL,
 		"product_id":           productID(item.URL),
 		"reason":               quality.failReason,
+		"failure_class":        failureClass,
 		"trusted_rows":         quality.trustedRows,
 		"untrusted_rows":       quality.untrustedRows,
 		"resource_miss_rows":   quality.resourceMissRows,
@@ -1221,6 +1254,7 @@ type priceQualityTracker struct {
 	retryAttempt            int
 	recovered               bool
 	diagnostics             productPackageDiagnostics
+	failureClass            FailureClass
 }
 
 func newPriceQualityTracker() *priceQualityTracker {
