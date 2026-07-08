@@ -61,7 +61,11 @@ func parseLocalDeadline(value string, now time.Time) (time.Time, bool, error) {
 	if hour < 0 || hour > 23 || minute < 0 || minute > 59 {
 		return time.Time{}, false, fmt.Errorf("deadline must be a valid local time")
 	}
-	return time.Date(now.Year(), now.Month(), now.Day(), hour, minute, 0, 0, now.Location()), true, nil
+	deadline := time.Date(now.Year(), now.Month(), now.Day(), hour, minute, 0, 0, now.Location())
+	if !deadline.After(now) {
+		deadline = deadline.Add(24 * time.Hour)
+	}
+	return deadline, true, nil
 }
 
 func ratioReached(count int, total int, ratio float64, minTotal int) bool {
