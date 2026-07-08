@@ -33,6 +33,18 @@ func TestParseLocalDeadlineSameDay(t *testing.T) {
 	}
 }
 
+func TestParseLocalDeadlineNextDayWhenAlreadyPassed(t *testing.T) {
+	now := time.Date(2026, 7, 8, 8, 0, 0, 0, time.Local)
+	deadline, ok, err := parseLocalDeadline("0530", now)
+	if err != nil || !ok {
+		t.Fatalf("deadline parse failed: ok=%v err=%v", ok, err)
+	}
+	want := time.Date(2026, 7, 9, 5, 30, 0, 0, time.Local)
+	if !deadline.Equal(want) {
+		t.Fatalf("deadline = %s, want %s", deadline, want)
+	}
+}
+
 func TestParseLocalDeadlineDisabled(t *testing.T) {
 	_, ok, err := parseLocalDeadline("", time.Now())
 	if err != nil {
