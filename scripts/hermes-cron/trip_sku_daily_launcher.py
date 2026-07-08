@@ -28,9 +28,9 @@ BINARY = Path('/tmp/trip-score-cdp')
 FINALIZER = REPO / 'scripts' / 'hermes-cron' / 'trip_sku_trend_finalize.py'
 FINAL_DELIVERY = Path('/Users/example/.hermes/scripts/trip_sku_non_tsim_final_delivery.py')
 DEFAULT_COMPARE_VENDOR = 'TSIM 網址'
-DEFAULT_DELAY_PROFILE = 'normal'
+DEFAULT_DELAY_PROFILE = 'safe'
 DEFAULT_TIMEOUT_SECONDS = 1800
-MAX_WORKERS = 3
+MAX_WORKERS = 2
 
 POLL_INTERVAL = 1200  # 20 minutes
 DONE_RE = re.compile(r'^\[(?P<v>[^\]]+)\] url done (?P<i>\d+)/(?P<t>\d+)')
@@ -163,7 +163,7 @@ def main():
         'total_urls': total_urls,
         'config': {
             'run_mode': 'mode1',
-            'headless': True,
+            'headless': False,
             'delay_profile': DEFAULT_DELAY_PROFILE,
             'timeout': DEFAULT_TIMEOUT_SECONDS,
             'workers': workers,
@@ -181,7 +181,7 @@ def main():
         f'- 任务：每天 UTC+8 08:00 抓取配置表中的 Trip.com SKU/外显价/实价/评分/预定数，并与前一次同厂商、同产品、同名 SKU 结果做趋势对比。\n'
         f'- 输入：`{input_path.name}`，来源 `{CONFIG_INPUT}`。\n'
         f'- 厂商范围：' + '，'.join(f'{v}({n})' for v, n in vendors.items()) + f'，合计 {total_urls} 条 URL。\n'
-        f'- 参数：`mode1`，无头主抓取，`{DEFAULT_DELAY_PROFILE}` 延迟，`timeout={DEFAULT_TIMEOUT_SECONDS}`，`workers={workers}`；低质量价格/SKU 结果自动走 CLI 默认质量重跑（有头浏览器 `safe` 单工补救）。\n'
+        f'- 参数：`mode1`，有头主抓取，`{DEFAULT_DELAY_PROFILE}` 延迟，`timeout={DEFAULT_TIMEOUT_SECONDS}`，`workers={workers}`，`deadline=0530`；低质量价格/SKU 结果自动走 CLI 默认质量重跑（有头浏览器 `safe` 单工补救）。\n'
         f'- 日志：保留 `terminal_output.txt`，并通过 `--log-file run.jsonl` 写入机器可读事件，便于追踪 url_quality_failed / run_done / quality rerun。\n'
         f'- 默认日常比价标的：`{DEFAULT_COMPARE_VENDOR}`；这是默认基准厂商，不代表该 cron 只服务某一家厂商，后续可通过配置更换。\n'
         f'- 输出：每厂商原始 XLSX、每厂商含趋势 XLSX、SKU 厂商趋势总表、增强版 vendor_compare 横向比价表（总表为SKU粒度，单链接均价对比为目的地粒度）、趋势摘要 JSON、ZIP 包。\n'
@@ -210,7 +210,7 @@ state.update({{'status':'running','start_time':time.time(),'pid':int((run/'runne
 Path('/Users/example/Documents/trip-sku-price-scrape/current_state.json').write_text(json.dumps(state,ensure_ascii=False,indent=2),encoding='utf-8')
 PY
 set +e
-{str(BINARY)!r} --run-mode mode1 --headless --delay-profile {DEFAULT_DELAY_PROFILE} --timeout {DEFAULT_TIMEOUT_SECONDS} --excel-input "$INPUT" --workers {workers} --log-level verbose --log-file {str(jsonl_log_path)!r} --compare-vendor {DEFAULT_COMPARE_VENDOR!r} --output-dir "$RUN_DIR" > "$LOG" 2>&1
+{str(BINARY)!r} --run-mode mode1 --no-headless --workers {workers} --delay-profile {DEFAULT_DELAY_PROFILE} --deadline 0530 --url-total-timeout 300 --navigation-timeout 120 --worker-stall-timeout 600 --max-quality-retries 2 --max-browser-restarts-per-vendor 2 --vendor-api-block-ratio 0.70 --vendor-api-block-min-attempts 10 --global-api-block-ratio 0.60 --global-api-block-min-processed 50 --fast-url-threshold 30 --risk-to-safe-threshold 10 --checkpoint-every-urls 10 --timeout {DEFAULT_TIMEOUT_SECONDS} --excel-input "$INPUT" --log-level verbose --log-file {str(jsonl_log_path)!r} --compare-vendor {DEFAULT_COMPARE_VENDOR!r} --output-dir "$RUN_DIR" > "$LOG" 2>&1
 code=$?
 set -e
 echo "$code" > "$RUN_DIR/exit_code.txt"
