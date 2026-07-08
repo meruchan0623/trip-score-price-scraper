@@ -95,6 +95,11 @@ func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bo
 	var noQualityRerun bool
 	var qualityRerunHeadless triState
 	var qualityRerunDelayProfile string
+	runtimeOptions := defaultRuntimeOptions()
+	urlTotalTimeoutSeconds := int(runtimeOptions.URLTotalTimeout / time.Second)
+	navigationTimeoutSeconds := int(runtimeOptions.NavigationTimeout / time.Second)
+	workerStallTimeoutSeconds := int(runtimeOptions.WorkerStallTimeout / time.Second)
+	fastURLThresholdSeconds := int(runtimeOptions.FastURLThreshold / time.Second)
 
 	var compareVendor string
 
@@ -144,6 +149,19 @@ func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bo
 	fs.BoolFunc("quality-rerun-headless", "Run low-quality URL reruns in headless mode.", func(string) error { qualityRerunHeadless = triState{set: true, value: true}; return nil })
 	fs.BoolFunc("quality-rerun-no-headless", "Run low-quality URL reruns with a visible browser window.", func(string) error { qualityRerunHeadless = triState{set: true, value: false}; return nil })
 	fs.StringVar(&qualityRerunDelayProfile, "quality-rerun-delay-profile", "safe", "Delay preset for post-scrape low-quality URL reruns: fast, normal, safe, or slow.")
+	fs.StringVar(&runtimeOptions.DeadlineHHMM, "deadline", runtimeOptions.DeadlineHHMM, "Local hard deadline as HHMM or HH:MM. Use none/off/empty to disable.")
+	fs.IntVar(&urlTotalTimeoutSeconds, "url-total-timeout", urlTotalTimeoutSeconds, "Maximum seconds for one URL including SKU traversal.")
+	fs.IntVar(&navigationTimeoutSeconds, "navigation-timeout", navigationTimeoutSeconds, "Maximum seconds for one navigation attempt.")
+	fs.IntVar(&workerStallTimeoutSeconds, "worker-stall-timeout", workerStallTimeoutSeconds, "Seconds without worker progress before the worker is considered stalled.")
+	fs.IntVar(&runtimeOptions.MaxQualityRetriesPerURL, "max-quality-retries", runtimeOptions.MaxQualityRetriesPerURL, "Maximum quality retry attempts per URL.")
+	fs.IntVar(&runtimeOptions.MaxBrowserRestartsPerVendor, "max-browser-restarts-per-vendor", runtimeOptions.MaxBrowserRestartsPerVendor, "Maximum browser restarts per vendor before failing that vendor.")
+	fs.Float64Var(&runtimeOptions.VendorAPIBlockRatio, "vendor-api-block-ratio", runtimeOptions.VendorAPIBlockRatio, "Vendor API-block ratio threshold after minimum attempts.")
+	fs.IntVar(&runtimeOptions.VendorAPIBlockMinAttempts, "vendor-api-block-min-attempts", runtimeOptions.VendorAPIBlockMinAttempts, "Minimum attempted URLs before vendor API-block ratio applies.")
+	fs.Float64Var(&runtimeOptions.GlobalAPIBlockRatio, "global-api-block-ratio", runtimeOptions.GlobalAPIBlockRatio, "Global API-block ratio threshold after minimum processed URLs.")
+	fs.IntVar(&runtimeOptions.GlobalAPIBlockMinProcessed, "global-api-block-min-processed", runtimeOptions.GlobalAPIBlockMinProcessed, "Minimum processed URLs before global API-block ratio applies.")
+	fs.IntVar(&fastURLThresholdSeconds, "fast-url-threshold", fastURLThresholdSeconds, "URL elapsed seconds below this value increases anti-bot pressure.")
+	fs.IntVar(&runtimeOptions.RiskToSafeThreshold, "risk-to-safe-threshold", runtimeOptions.RiskToSafeThreshold, "Consecutive risk events before safe mode.")
+	fs.IntVar(&runtimeOptions.CheckpointEveryURLs, "checkpoint-every-urls", runtimeOptions.CheckpointEveryURLs, "Write partial checkpoint after this many URLs per vendor; 0 disables URL checkpoints.")
 	fs.BoolFunc("rating-only", "Only scrape rating-related fields.", func(string) error { ratingOnly = triState{set: true, value: true}; return nil })
 	fs.BoolFunc("no-rating-only", "Scrape SKU and price fields as well as rating fields.", func(string) error { ratingOnly = triState{set: true, value: false}; return nil })
 	fs.BoolFunc("real-price", "Scrape dynamic real-price fields.", func(string) error { realPrice = triState{set: true, value: true}; return nil })
@@ -167,6 +185,49 @@ func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bo
 	if priceQualityRetries < -1 {
 		return TaskRequest{}, "", "", false, false, fmt.Errorf("--price-quality-retries must be >= 0, or -1 for mode default")
 	}
+	if _, _, err := parseLocalDeadline(runtimeOptions.DeadlineHHMM, time.Now()); err != nil {
+		return TaskRequest{}, "", "", false, false, err
+	}
+	if urlTotalTimeoutSeconds < 1 {
+		return TaskRequest{}, "", "", false, false, fmt.Errorf("--url-total-timeout must be >= 1")
+	}
+	if navigationTimeoutSeconds < 1 {
+		return TaskRequest{}, "", "", false, false, fmt.Errorf("--navigation-timeout must be >= 1")
+	}
+	if workerStallTimeoutSeconds < 1 {
+		return TaskRequest{}, "", "", false, false, fmt.Errorf("--worker-stall-timeout must be >= 1")
+	}
+	if fastURLThresholdSeconds < 1 {
+		return TaskRequest{}, "", "", false, false, fmt.Errorf("--fast-url-threshold must be >= 1")
+	}
+	if runtimeOptions.MaxQualityRetriesPerURL < 0 {
+		return TaskRequest{}, "", "", false, false, fmt.Errorf("--max-quality-retries must be >= 0")
+	}
+	if runtimeOptions.MaxBrowserRestartsPerVendor < 0 {
+		return TaskRequest{}, "", "", false, false, fmt.Errorf("--max-browser-restarts-per-vendor must be >= 0")
+	}
+	if runtimeOptions.VendorAPIBlockRatio <= 0 || runtimeOptions.VendorAPIBlockRatio > 1 {
+		return TaskRequest{}, "", "", false, false, fmt.Errorf("--vendor-api-block-ratio must be > 0 and <= 1")
+	}
+	if runtimeOptions.GlobalAPIBlockRatio <= 0 || runtimeOptions.GlobalAPIBlockRatio > 1 {
+		return TaskRequest{}, "", "", false, false, fmt.Errorf("--global-api-block-ratio must be > 0 and <= 1")
+	}
+	if runtimeOptions.VendorAPIBlockMinAttempts < 1 {
+		return TaskRequest{}, "", "", false, false, fmt.Errorf("--vendor-api-block-min-attempts must be >= 1")
+	}
+	if runtimeOptions.GlobalAPIBlockMinProcessed < 1 {
+		return TaskRequest{}, "", "", false, false, fmt.Errorf("--global-api-block-min-processed must be >= 1")
+	}
+	if runtimeOptions.RiskToSafeThreshold < 1 {
+		return TaskRequest{}, "", "", false, false, fmt.Errorf("--risk-to-safe-threshold must be >= 1")
+	}
+	if runtimeOptions.CheckpointEveryURLs < 0 {
+		return TaskRequest{}, "", "", false, false, fmt.Errorf("--checkpoint-every-urls must be >= 0")
+	}
+	runtimeOptions.URLTotalTimeout = time.Duration(urlTotalTimeoutSeconds) * time.Second
+	runtimeOptions.NavigationTimeout = time.Duration(navigationTimeoutSeconds) * time.Second
+	runtimeOptions.WorkerStallTimeout = time.Duration(workerStallTimeoutSeconds) * time.Second
+	runtimeOptions.FastURLThreshold = time.Duration(fastURLThresholdSeconds) * time.Second
 
 	options := resolveRunOptions(runMode, headless, ratingOnly, realPrice, productInfo)
 	overrides, err := buildDelayOverrides(pageDelayMin, pageDelayMax, scrollDelayMin, scrollDelayMax, skuClickDelayMin, skuClickDelayMax, skuPriceDelayMin, skuPriceDelayMax, skuBetweenDelayMin, skuBetweenDelayMax)
@@ -207,6 +268,7 @@ func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bo
 		DelayOptions:        delayOptions,
 		PriceQualityRetry:   PriceQualityRetryOptions{MaxRetries: priceQualityRetries},
 		QualityRerun:        qualityRerun,
+		Runtime:             runtimeOptions,
 		BrowserOptions: BrowserOptions{
 			Browser:            browser,
 			Headless:           options.headless,

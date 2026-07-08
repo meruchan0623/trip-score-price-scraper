@@ -2,6 +2,7 @@ package tripcdp
 
 import (
 	"bytes"
+	"io"
 	"testing"
 	"time"
 )
@@ -171,5 +172,34 @@ func TestParseRejectsInvalidDelayOptions(t *testing.T) {
 	}
 	if _, _, _, _, _, err := parseArgs([]string{"--input", "https://www.trip.com/detail/12345", "--scroll-delay-min", "-0.5"}, &bytes.Buffer{}); err == nil {
 		t.Fatal("negative delay override should fail")
+	}
+}
+
+func TestParseArgsRuntimeOptions(t *testing.T) {
+	request, _, _, _, _, err := parseArgs([]string{
+		"--input", "https://hk.trip.com/things-to-do/detail/1/",
+		"--deadline", "0530",
+		"--url-total-timeout", "240",
+		"--navigation-timeout", "90",
+		"--worker-stall-timeout", "600",
+		"--max-quality-retries", "1",
+		"--max-browser-restarts-per-vendor", "2",
+		"--vendor-api-block-ratio", "0.75",
+		"--global-api-block-ratio", "0.65",
+	}, io.Discard)
+	if err != nil {
+		t.Fatalf("parseArgs failed: %v", err)
+	}
+	if request.Runtime.DeadlineHHMM != "0530" {
+		t.Fatalf("deadline = %q", request.Runtime.DeadlineHHMM)
+	}
+	if request.Runtime.URLTotalTimeout != 240*time.Second {
+		t.Fatalf("url timeout = %s", request.Runtime.URLTotalTimeout)
+	}
+	if request.Runtime.MaxQualityRetriesPerURL != 1 {
+		t.Fatalf("max quality retries = %d", request.Runtime.MaxQualityRetriesPerURL)
+	}
+	if request.Runtime.VendorAPIBlockRatio != 0.75 {
+		t.Fatalf("vendor ratio = %.2f", request.Runtime.VendorAPIBlockRatio)
 	}
 }
