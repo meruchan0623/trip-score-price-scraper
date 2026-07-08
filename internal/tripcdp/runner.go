@@ -246,7 +246,7 @@ func scrapeVendorBatches(request TaskRequest, reporter Reporter, runMode string)
 		reporter(event)
 	}
 
-	pending := append([]vendorGroup(nil), groups...)
+	scheduler := newVendorScheduler(groups)
 	results := []workerResult{}
 	outputPaths := []string{}
 	active := 0
@@ -308,9 +308,11 @@ func scrapeVendorBatches(request TaskRequest, reporter Reporter, runMode string)
 		return ctx.Err() == nil
 	}
 
-	for canStartWorker(ctx, len(pending), active, pressure.EffectiveWorkerLimit(workers)) {
-		group := pending[0]
-		pending = pending[1:]
+	for canStartWorker(ctx, scheduler.PendingCount(), active, pressure.EffectiveWorkerLimit(workers)) {
+		group, ok := scheduler.Next(time.Now())
+		if !ok {
+			break
+		}
 		if !startNext(group) {
 			break
 		}
@@ -352,10 +354,15 @@ func scrapeVendorBatches(request TaskRequest, reporter Reporter, runMode string)
 			reporter(Event{"event": "global_api_blocked", "stage": "runtime", "api_blocked_urls": runtimeSummaryAPIBlocked(results), "processed_urls": urlsDone, "threshold": request.Runtime.GlobalAPIBlockRatio})
 			cancel()
 		}
-		if canStartWorker(ctx, len(pending), active, pressure.EffectiveWorkerLimit(workers)) {
-			group := pending[0]
-			pending = pending[1:]
-			_ = startNext(group)
+		scheduler.Complete(result, request.Runtime, time.Now())
+		for canStartWorker(ctx, scheduler.PendingCount(), active, pressure.EffectiveWorkerLimit(workers)) {
+			group, ok := scheduler.Next(time.Now())
+			if !ok {
+				break
+			}
+			if !startNext(group) {
+				break
+			}
 		}
 	}
 
