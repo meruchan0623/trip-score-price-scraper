@@ -639,6 +639,11 @@ func runtimeSummaryAPIBlocked(results []workerResult) int {
 	return total
 }
 
+func checkpointOutputPath(outputPath string, vendor string, done int) string {
+	dir := filepath.Dir(outputPath)
+	return filepath.Join(dir, fmt.Sprintf("%s_partial_%03d.xlsx", safeFilename(vendor), done))
+}
+
 func cancellableSleep(ctx context.Context, duration time.Duration) bool {
 	if duration <= 0 {
 		return ctx.Err() == nil
@@ -767,6 +772,14 @@ func runVendorWorker(ctx context.Context, workerID int, group vendorGroup, reque
 		itemRows := scraper.scrapeOne(workerCtx, item, index+1, len(group.Items))
 		rows = append(rows, itemRows...)
 		result.URLsDone++
+		if request.Runtime.CheckpointEveryURLs > 0 && result.URLsDone%request.Runtime.CheckpointEveryURLs == 0 && len(rows) > 0 {
+			checkpointPath := checkpointOutputPath(outputPath, group.FileVendor, result.URLsDone)
+			if savedPath, err := exportRows(rows, checkpointPath, request.RatingOnly, request.ExtractRealPrice, request.ExtractProductInfo, true); err == nil {
+				localReporter(Event{"event": "partial_checkpoint_done", "stage": "export", "rows": len(rows), "urls_done": result.URLsDone, "output_path": savedPath})
+			} else {
+				localReporter(Event{"event": "warning", "stage": "export", "message": "partial checkpoint failed", "error": err.Error(), "urls_done": result.URLsDone})
+			}
+		}
 		if index < len(group.Items)-1 {
 			scraper.cleanupAfterURL()
 			_ = scraper.maybeRestart(workerCtx)
