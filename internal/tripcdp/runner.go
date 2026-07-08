@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -217,6 +218,23 @@ func scrapeVendorBatches(request TaskRequest, reporter Reporter, runMode string)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	var deadlineExpired atomic.Bool
+	if deadline, ok, err := parseLocalDeadline(request.Runtime.DeadlineHHMM, time.Now()); err == nil && ok {
+		if time.Now().Before(deadline) {
+			deadlineTimer := time.AfterFunc(time.Until(deadline), func() {
+				deadlineExpired.Store(true)
+				reporter(Event{"event": "runtime_deadline_expired", "stage": "runtime", "deadline": request.Runtime.DeadlineHHMM, "message": "time window expired; shutting down gracefully"})
+				cancel()
+			})
+			defer deadlineTimer.Stop()
+		} else {
+			deadlineExpired.Store(true)
+			reporter(Event{"event": "runtime_deadline_expired", "stage": "runtime", "deadline": request.Runtime.DeadlineHHMM, "message": "deadline already expired; shutting down gracefully"})
+			cancel()
+		}
+	} else if err != nil {
+		reporter(Event{"event": "warning", "stage": "runtime", "message": "deadline ignored", "error": err.Error()})
+	}
 	force := make(chan struct{}, 1)
 	stopCtl := installStopHandlers(request.StopGraceSeconds, reporter, cancel, func() { signalOnce(force) })
 	defer stopCtl.restore()
@@ -302,6 +320,11 @@ func scrapeVendorBatches(request TaskRequest, reporter Reporter, runMode string)
 		result := <-resultCh
 		active--
 		completed++
+		if vendorAPIBlockedByResult(result, request.Runtime) {
+			result.FinalState = "api_blocked"
+			result.FinalReason = "vendor API block threshold reached"
+			reporter(Event{"event": "vendor_api_blocked", "stage": "runtime", "vendor": result.Vendor, "worker_id": result.WorkerID, "api_blocked_urls": result.APIBlockedURLs, "urls_done": result.URLsDone, "url_count": result.URLCount, "threshold": request.Runtime.VendorAPIBlockRatio})
+		}
 		results = append(results, result)
 		urlsDone += result.URLsDone
 		if !result.Success {
@@ -320,6 +343,10 @@ func scrapeVendorBatches(request TaskRequest, reporter Reporter, runMode string)
 			"active":       []string{},
 			"failed":       failures,
 		})
+		if globalAPIBlocked(urlsDone, runtimeSummaryAPIBlocked(results), request.Runtime) {
+			reporter(Event{"event": "global_api_blocked", "stage": "runtime", "api_blocked_urls": runtimeSummaryAPIBlocked(results), "processed_urls": urlsDone, "threshold": request.Runtime.GlobalAPIBlockRatio})
+			cancel()
+		}
 		if canStartWorker(ctx, len(pending), active, workers) {
 			group := pending[0]
 			pending = pending[1:]
@@ -365,6 +392,34 @@ func scrapeVendorBatches(request TaskRequest, reporter Reporter, runMode string)
 	}
 	summary := newQualityRunSummary(qualityFailures, qualityRecoveredURLs)
 	emitQualityRunSummary(outputDir, summary, reporter)
+	runtimeSummary := runtimeRunSummary{Event: "runtime_summary", GlobalState: "done", ProcessedURLs: urlsDone, URLCount: len(items), DeadlineExpired: deadlineExpired.Load()}
+	for _, result := range results {
+		state := "done"
+		reason := ""
+		if result.Stopped {
+			state = "partial"
+			reason = result.Error
+		} else if !result.Success {
+			state = "failed"
+			reason = result.Error
+		}
+		if result.FinalState != "" {
+			state = result.FinalState
+			reason = result.FinalReason
+		}
+		runtimeSummary.APIBlockedURLs += result.APIBlockedURLs
+		runtimeSummary.RiskEvents += result.RiskEvents
+		runtimeSummary.Vendors = append(runtimeSummary.Vendors, vendorRuntimeSummary{Vendor: result.Vendor, State: state, Reason: reason, URLsDone: result.URLsDone, URLCount: result.URLCount, Rows: result.Rows, APIBlockedURLs: result.APIBlockedURLs, RiskEvents: result.RiskEvents, OutputPath: result.OutputPath})
+	}
+	if ctx.Err() != nil {
+		runtimeSummary.GlobalState = "partial"
+		runtimeSummary.Reason = "stopped"
+	}
+	if deadlineExpired.Load() {
+		runtimeSummary.GlobalState = "partial"
+		runtimeSummary.Reason = "deadline"
+	}
+	writeRuntimeSummary(outputDir, runtimeSummary, reporter)
 	if ctx.Err() != nil {
 		return TaskResult{Success: false, OutputPath: outputDir, OutputPaths: outputPaths, ProcessedCount: rows, Warnings: warnings, FailedVendors: failedVendors, LogFile: request.LogFile, Error: "stopped by signal", ExitCode: 130, QualityFailedURLs: finalQualityFailedURLs, QualityRecoveredURLs: qualityRecoveredURLs, QualityRerunAttemptedURLs: qualityRerunAttemptedURLs, QualityRerunRecoveredURLs: qualityRerunRecoveredURLs, FinalQualityFailedURLs: finalQualityFailedURLs}
 	}
@@ -556,6 +611,22 @@ func canStartWorker(ctx context.Context, pending int, active int, workers int) b
 	return ctx.Err() == nil && pending > 0 && active < workers
 }
 
+func vendorAPIBlockedByResult(result workerResult, options RuntimeOptions) bool {
+	return ratioReached(result.APIBlockedURLs, result.URLsDone, options.VendorAPIBlockRatio, options.VendorAPIBlockMinAttempts)
+}
+
+func globalAPIBlocked(processed int, apiBlocked int, options RuntimeOptions) bool {
+	return ratioReached(apiBlocked, processed, options.GlobalAPIBlockRatio, options.GlobalAPIBlockMinProcessed)
+}
+
+func runtimeSummaryAPIBlocked(results []workerResult) int {
+	total := 0
+	for _, result := range results {
+		total += result.APIBlockedURLs
+	}
+	return total
+}
+
 func cancellableSleep(ctx context.Context, duration time.Duration) bool {
 	if duration <= 0 {
 		return ctx.Err() == nil
@@ -591,6 +662,10 @@ type workerResult struct {
 	QualityRerunRecoveredURLs int
 	FinalQualityFailedURLs    int
 	QualityFailures           []qualityFailureSummary
+	APIBlockedURLs            int
+	RiskEvents                int
+	FinalState                string
+	FinalReason               string
 }
 
 func (r workerResult) Event() Event {
@@ -615,6 +690,10 @@ func (r workerResult) Event() Event {
 		"quality_rerun_attempted_urls": r.QualityRerunAttemptedURLs,
 		"quality_rerun_recovered_urls": r.QualityRerunRecoveredURLs,
 		"final_quality_failed_urls":    r.FinalQualityFailedURLs,
+		"api_blocked_urls":             r.APIBlockedURLs,
+		"risk_events":                  r.RiskEvents,
+		"final_state":                  r.FinalState,
+		"final_reason":                 r.FinalReason,
 	}
 }
 
@@ -626,7 +705,20 @@ func runVendorWorker(ctx context.Context, workerID int, group vendorGroup, reque
 	watchdog := newWorkerProgressWatchdog(request.Runtime.WorkerStallTimeout, reporter, group.Vendor, workerID, workerCancel)
 	defer watchdog.stop()
 	localReporter := func(event Event) {
+		if event["event"] != "url_quality_failed" && (event["failure_class"] == FailureAPIBlockedSuspected || event["failure_class"] == string(FailureAPIBlockedSuspected)) {
+			result.APIBlockedURLs++
+		}
+		if event["event"] == "risk_challenge_detected" {
+			result.RiskEvents++
+		}
 		if event["event"] == "url_quality_failed" {
+			class := FailureClass(fmt.Sprint(event["failure_class"]))
+			if class == "" {
+				class = ClassifyError(nil, fmt.Sprint(event["reason"]))
+			}
+			if class == FailureAPIBlockedSuspected {
+				result.APIBlockedURLs++
+			}
 			result.QualityFailedURLs++
 			result.QualityFailures = append(result.QualityFailures, qualityFailureSummaryFromEvent(event))
 		}
