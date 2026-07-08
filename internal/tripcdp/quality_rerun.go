@@ -10,10 +10,11 @@ import (
 )
 
 type qualityRerunCandidate struct {
-	URL       string
-	Vendor    string
-	ProductID string
-	Reason    string
+	URL          string
+	Vendor       string
+	ProductID    string
+	Reason       string
+	FailureClass FailureClass
 }
 
 type qualityRerunStats struct {
@@ -35,12 +36,17 @@ func collectQualityRerunCandidates(rows []map[string]string) []qualityRerunCandi
 		}
 		score := qualityScoreRows(block)
 		if score.needsRerun {
+			failureClass := ClassifyRows(block)
+			if !FailureClassRetryableByQualityRerun(failureClass) {
+				continue
+			}
 			seen[normalizeURL(url)] = true
 			candidates = append(candidates, qualityRerunCandidate{
-				URL:       url,
-				Vendor:    firstNonEmptyRowValue(block, "厂商"),
-				ProductID: firstNonEmptyRowValue(block, "商品ID"),
-				Reason:    score.reason,
+				URL:          url,
+				Vendor:       firstNonEmptyRowValue(block, "厂商"),
+				ProductID:    firstNonEmptyRowValue(block, "商品ID"),
+				Reason:       score.reason,
+				FailureClass: failureClass,
 			})
 		}
 	}
@@ -97,7 +103,7 @@ func qualityScoreRows(rows []map[string]string) qualityScore {
 			}
 		}
 		note := strings.ToLower(strings.TrimSpace(row["抓取备注"] + " " + row["评分"]))
-		if strings.Contains(note, "处理错误") || strings.Contains(note, "页面未加载") || strings.Contains(note, "whaleguard") || strings.Contains(note, "cloudflare") || strings.Contains(note, "价格质量检查失败") {
+		if strings.Contains(note, "处理错误") || strings.Contains(note, "页面未加载") || strings.Contains(note, "product dom not ready") || strings.Contains(note, "whaleguard") || strings.Contains(note, "cloudflare") || strings.Contains(note, "价格质量检查失败") {
 			hasError = true
 		}
 	}
@@ -215,7 +221,7 @@ func runQualityReruns(ctx context.Context, rows []map[string]string, request Tas
 			break
 		}
 		if reporter != nil {
-			reporter(Event{"event": "quality_rerun_started", "stage": "quality_rerun", "vendor": vendor, "url": candidate.URL, "product_id": candidate.ProductID, "reason": candidate.Reason, "url_index": index + 1, "url_total": len(candidates), "headless": rerunRequest.BrowserOptions.Headless, "delay_profile": rerunRequest.DelayOptions.Profile})
+			reporter(Event{"event": "quality_rerun_started", "stage": "quality_rerun", "vendor": vendor, "url": candidate.URL, "product_id": candidate.ProductID, "reason": candidate.Reason, "failure_class": candidate.FailureClass, "url_index": index + 1, "url_total": len(candidates), "headless": rerunRequest.BrowserOptions.Headless, "delay_profile": rerunRequest.DelayOptions.Profile})
 		}
 		item := ScrapeItem{URL: candidate.URL, Vendor: vendor, InputOrder: index}
 		rerunRows := scraper.scrapeOne(ctx, item, index+1, len(candidates))
