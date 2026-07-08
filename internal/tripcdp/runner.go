@@ -621,6 +621,10 @@ func (r workerResult) Event() Event {
 func runVendorWorker(ctx context.Context, workerID int, group vendorGroup, request TaskRequest, outputPath string, globalTotal int, reporter Reporter, resultCh chan<- workerResult, registerForceClose func(func()), qualityRerunLimiter chan struct{}) {
 	rows := []map[string]string{}
 	result := workerResult{Vendor: group.Vendor, WorkerID: workerID, OutputPath: outputPath, SessionFile: request.BrowserOptions.SessionFile, ProfileDir: request.BrowserOptions.UserDataDir, URLCount: len(group.Items), LogFile: request.LogFile}
+	workerCtx, workerCancel := context.WithCancel(ctx)
+	defer workerCancel()
+	watchdog := newWorkerProgressWatchdog(request.Runtime.WorkerStallTimeout, reporter, group.Vendor, workerID, workerCancel)
+	defer watchdog.stop()
 	localReporter := func(event Event) {
 		if event["event"] == "url_quality_failed" {
 			result.QualityFailedURLs++
@@ -633,6 +637,7 @@ func runVendorWorker(ctx context.Context, workerID int, group vendorGroup, reque
 		event["worker_id"] = workerID
 		event["output_path"] = outputPath
 		event["log_file"] = request.LogFile
+		watchdog.mark(fmt.Sprint(event["event"]))
 		reporter(event)
 	}
 	scraper := newTripScraper(request, localReporter, group.Vendor, workerID, globalTotal)
@@ -643,7 +648,7 @@ func runVendorWorker(ctx context.Context, workerID int, group vendorGroup, reque
 	defer scraper.close()
 	localReporter(Event{"event": "process_started", "stage": "process_started", "message": "worker process started", "url_count": len(group.Items)})
 	localReporter(Event{"event": "runtime_init_started", "stage": "runtime_init", "message": "initializing worker runtime"})
-	if err := scraper.start(ctx); err != nil {
+	if err := scraper.start(workerCtx); err != nil {
 		result.Error = err.Error()
 		result.ErrorType = fmt.Sprintf("%T", err)
 		result.Stage = "browser_start"
@@ -651,23 +656,23 @@ func runVendorWorker(ctx context.Context, workerID int, group vendorGroup, reque
 		return
 	}
 	for index, item := range group.Items {
-		if ctx.Err() != nil {
+		if workerCtx.Err() != nil {
 			result.Stopped = true
 			break
 		}
-		itemRows := scraper.scrapeOne(ctx, item, index+1, len(group.Items))
+		itemRows := scraper.scrapeOne(workerCtx, item, index+1, len(group.Items))
 		rows = append(rows, itemRows...)
 		result.URLsDone++
 		if index < len(group.Items)-1 {
 			scraper.cleanupAfterURL()
-			_ = scraper.maybeRestart(ctx)
+			_ = scraper.maybeRestart(workerCtx)
 		}
 	}
 	if !scraper.saveSession() {
 		localReporter(Event{"event": "warning", "stage": "session_save", "message": "session save failed"})
 	}
 	scraper.close()
-	rows, rerunStats := runQualityReruns(ctx, rows, request, group.Vendor, outputPath, globalTotal, localReporter, qualityRerunLimiter)
+	rows, rerunStats := runQualityReruns(workerCtx, rows, request, group.Vendor, outputPath, globalTotal, localReporter, qualityRerunLimiter)
 	result.QualityRerunAttemptedURLs = rerunStats.Attempted
 	result.QualityRerunRecoveredURLs = rerunStats.Recovered
 	result.FinalQualityFailedURLs = rerunStats.FinalFailed
@@ -684,14 +689,14 @@ func runVendorWorker(ctx context.Context, workerID int, group vendorGroup, reque
 		result.OutputPath = savedPath
 		result.Rows = len(rows)
 		eventName := "export_done"
-		if result.Stopped || ctx.Err() != nil {
+		if result.Stopped || workerCtx.Err() != nil {
 			eventName = "partial_export_done"
 		}
 		localReporter(Event{"event": eventName, "rows": len(rows), "output_path": savedPath})
 	}
-	if result.Stopped || ctx.Err() != nil {
+	if result.Stopped || workerCtx.Err() != nil {
 		result.Stopped = true
-		result.Error = "stopped by signal"
+		result.Error = "stopped by signal or watchdog"
 		result.Stage = "stopped"
 		return
 	}
