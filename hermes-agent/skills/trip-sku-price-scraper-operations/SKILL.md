@@ -1,6 +1,6 @@
 ---
 name: trip-sku-price-scraper-operations
-description: "Operate the Go Trip.com SKU price scraper: stop/resume vendor runs, rebuild the CLI, benchmark speed changes, merge partial XLSX outputs, validate URL coverage, and package deliverables."
+description: "Use when running, resuming, stopping, validating, diagnosing, or packaging Trip.com SKU, price, rating, or vendor scraping on the Hermes Agent host."
 ---
 
 # Trip SKU Price Scraper Operations
@@ -21,7 +21,7 @@ go build -o /tmp/trip-score-cdp ./cmd/trip-score-cdp
 
 Hermes Remote Debugging allocation: this daily SKU/price cron does not reserve a fixed shared `--remote-debugging-port` such as `9222`, `9223`, or `9224`. Keep those ports for signed-in Ctrip/Tripcom browser sessions; this workflow should continue using its own Go CDP browser management and run-directory artifacts.
 
-Do not restore or recommend the removed Python CLI, Python GUI, Selenium/undetected-chromedriver workflow, or PyInstaller spec as project entry points. If maintaining the repository, keep README focused on Go CDP-only usage and keep the operational skill synced into the project-local `.hermes/skills/trip-sku-price-scraper-operations/` directory. See `references/go-cdp-only-repository-consolidation-2026-06-02.md`.
+Do not restore or recommend the removed Python CLI, Python GUI, Selenium/undetected-chromedriver workflow, or PyInstaller spec as project entry points. This project-local file is the only authoritative Hermes operations skill; do not copy it into or load an older version from `~/.hermes/skills/`. Keep README focused on Go CDP-only usage.
 
 ## Canonical paths
 
@@ -113,9 +113,26 @@ When the user asks for a narrow price grab such as “抓取BC日本的產品價
 4. Generate a minimal one-column input workbook whose row 1 is the vendor header and row 2 is the resolved Trip URL.
 5. Run the Go CLI with `--run-mode mode1 --no-headless --delay-profile normal --excel-input <input.xlsx> --workers 1 --log-level verbose --output-dir <run_dir> --json-lines --no-color`.
 6. Verify completion from the final `run_done` JSON event and the vendor XLSX row count.
-7. For user delivery, create a cleaned XLSX with at least `摘要` and `SKU价格明细` sheets; fill down product metadata from the first SKU row so continuation rows are self-contained. Report SKU count, min/max real price, run dir, and attach the cleaned XLSX via `MEDIA:`.
+7. Deliver the Go CLI native vendor workbook itself: `<run_dir>/<vendor>_<YYMMDD-HHMM>.xlsx`. Attach that exact file via `MEDIA:` and report its SKU row count, minimum/maximum `实价`, and run directory.
 
-Session example and helper pattern: `references/ad-hoc-single-vendor-destination-price-scrape-2026-06-03.md`.
+### Native single-product workbook contract
+
+The delivered workbook is the unmodified Go CLI output. It has exactly one worksheet named `Trip商品数据`. Keep the native row values and native column order; do not fill down, delete, rename, reorder, or summarize fields.
+
+The native columns are:
+
+```text
+厂商, 商品ID, URL, 商品名称, SKU层级1...N, 货币, 外显价格, 实价, 促销标签,
+[价格状态, 资源ID, 接口ItemID, 促销命中, 价格来源, 原始捕获价格 when present],
+商品资讯, 预定数, 评价数, 评分, 客户服务, 方便程度, 讯号状态, 中差评价数,
+[抓取备注 when present]
+```
+
+`SKU层级1...N` expands to the actual maximum SKU depth. The six price-quality columns appear together only when the native export has price-quality data; `抓取备注` appears only when at least one row has a note.
+
+The following are not single-product deliverables: a two-column `套餐组合/价格` workbook, a cleaned workbook, or a workbook with Agent-created `摘要` / `SKU价格明细` sheets.
+
+Validate the workbook with normal `openpyxl.load_workbook(path)` mode before delivery. If the native workbook exists but has no data rows, missing required columns, an unexpected sheet, or other anomalies, attach the existing native workbook and state the exact warning in the delivery message. If the native workbook does not exist, report the run as failed with its run directory and log path; do not create a replacement workbook from terminal or JSONL logs.
 
 ## Ad-hoc multi-destination price scrape
 
@@ -386,7 +403,7 @@ Canonical daily setup:
   1. 用户明确要求整体默认策略切换（如 `normal` -> `safe`）。
   2. 团队把历史策略作为长期参数落盘更新（如写入 cron/launcher 或新一轮日常任务规范）。
 - **执行顺序（必须同时覆盖）**：
-  1) `~/.hermes/skills/local/trip-sku-price-scraper-operations/SKILL.md` 的任务模板（`任务说明.md`示例）
+  1) `hermes-agent/skills/trip-sku-price-scraper-operations/SKILL.md` 的任务模板（`任务说明.md`示例）
   2) 项目 launcher 的默认常量与 CLI f-string（`scripts/hermes-cron/trip_sku_daily_launcher.py`）
   3) 本地快速验证（`go build` + `--help`，必要时跑一次 smoke 跑）
 - 不要为了“把默认改回来”去改动正在进行中的 run。当前任务只在新建任务生效：
@@ -599,7 +616,9 @@ Keep the final human summary concise:
 - validation coverage by vendor
 - package path/media attachment
 
-## XLSX export may be empty while logs contain data
+## Batch/historical XLSX export may be empty while logs contain data
+
+This section applies only to batch or historical diagnostic recovery. It does not apply to the ad-hoc single vendor / destination workflow: that workflow always delivers the native workbook unchanged, or reports that the native workbook is missing.
 
 Observed in the 2026-05-29 smoke test: the Go CLI completed successfully and logged thousands of `combination price` records, but the per-vendor XLSX files contained only the header row `厂商` and no detail rows.
 
@@ -608,14 +627,14 @@ Do **not** conclude that the scrape failed solely from empty XLSX output. Verify
 - `url_done` events contain completed URL counts and row counts.
 - `combination price:` log messages contain SKU combination, display price, real price, promo label, price source, resourceId, and itemId.
 
-If XLSX output is empty, reconstruct a usable workbook from `run.jsonl`:
+If a batch or historical XLSX output is empty, reconstruct a diagnostic workbook from `run.jsonl`:
 
 - Track current URL by `(worker_id, vendor)` from `url_started`.
 - Parse `log` messages starting with `combination price:`.
 - Extract fields: 厂商, URL, 导航URL, SKU组合, 外显价格, 实价, 促销标签, price_source, resourceId, itemId, promo_matched, 时间, worker_id.
 - Add sheets for URL completion summary, vendor summary, and error events.
 
-This reconstruction is a valid fallback for delivering price content until the Go CLI XLSX writer is fixed. For the current daily diagnostic workflow, JSONL logging (`--json-lines`) is enabled by default and `terminal_output.txt` is retained; for ad-hoc non-diagnostic runs, enable JSONL when explicitly requested or when reconstructing from logs is necessary after a failed/empty export.
+This reconstruction is a diagnostic fallback for batch or historical artifacts, not a single-product user-delivery format. For the current daily diagnostic workflow, JSONL logging (`--json-lines`) is enabled by default and `terminal_output.txt` is retained.
 
 ## Project Markdown handoff
 
