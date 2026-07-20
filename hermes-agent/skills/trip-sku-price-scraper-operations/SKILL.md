@@ -107,9 +107,35 @@ Reference examples:
 
 Use this workflow whenever the user supplies, names, or asks Hermes to resolve one product or a small set of specific products. This includes requests such as “抓这个链接”, “抓取 BC 日本的产品价格”, or “只抓这几个指定产品”.
 
+### Hard trigger and user-visible output contract
+
+Treat these operations prompts as direct triggers for this workflow:
+
+```text
+【請抓取產品價格71827107】
+請抓取產品價格71827107
+请抓取产品价格71827107
+```
+
+Extract the decimal product ID following `產品價格` / `产品价格`. If the prompt contains several IDs separated by `、`, comma, or whitespace, preserve their order and run them together. For an ID-only prompt, construct the input URL exactly as:
+
+```text
+https://hk.trip.com/things-to-do/detail/<product-id>/?locale=zh-HK&curr=HKD
+```
+
+The user-visible success response has exactly one line:
+
+```text
+MEDIA:<absolute-path-to-native-trip_scoreandprice_results_xlsx>
+```
+
+Before this line, send no acknowledgement, progress message, product title, price, SKU count, minimum/maximum price, Markdown table, plain-text list, run summary, or output-path explanation. After this line, send nothing else. Tool/runtime logs remain internal and are not copied into the user-facing response.
+
+The delivered file is always the Go CLI native workbook. Never create or attach a secondary workbook named like `product_<id>_pricelist_HKD.xlsx`. A workbook with a `價格清單` sheet, top summary fields such as `產品名稱 / 產品ID / 幣種 / 最低價 / SKU總數`, or a rebuilt `套餐名稱 / 實價 / 原價 / resourceId` table is an invalid Agent-generated deliverable.
+
 1. Treat the request as a direct-input Go CDP SKU-price scrape, not an Excel-vendor batch and not the Trip outerlist scraper.
 2. Resolve every requested product to its exact Trip.com detail URL. Pass one `-input` argument per product, preserving the user's order. Do not generate an input workbook or URL-list file for this workflow.
-3. Use an explicit manual output directory under `/Users/example/Documents/trip-sku-price-scrape/`, named `manual-<product-id>` for one product or `manual-<short-label>` for several products.
+3. Use an explicit manual output directory under `/Users/example/Documents/trip-sku-price-scrape/`. Name it `manual-<product-id>` for one product. For several products, join all requested IDs in order with `-`, producing `manual-<id-1>-<id-2>-...`.
 4. From the repository root, build the project-local manual binary before the run:
 
 ```bash
@@ -136,7 +162,7 @@ For several selected products, the command shape is:
   -delay-profile fast \
   -input "<product-url-1>" \
   -input "<product-url-2>" \
-  -output-dir /Users/example/Documents/trip-sku-price-scrape/manual-<short-label> \
+  -output-dir /Users/example/Documents/trip-sku-price-scrape/manual-<id-1>-<id-2> \
   -product-info \
   -no-quality-rerun
 ```
@@ -144,7 +170,8 @@ For several selected products, the command shape is:
 Do not replace these manual-task defaults with `-headless`, another delay profile, `-excel-input`, `-urls-file`, `-output`, or quality-rerun flags. Batch and scheduled workflows keep their separate parameters elsewhere in this skill.
 
 6. Verify the final `run_done` event and the generated workbook at `<output-dir>/trip_scoreandprice_results_<YYMMDD-HHMM>.xlsx`.
-7. Attach that exact native workbook via `MEDIA:` and report the requested product count, captured SKU row count, minimum/maximum `实价`, and output directory.
+7. Verify that the workbook has exactly one sheet named `Trip商品数据` and that its header follows the native field contract below.
+8. On valid success, emit only `MEDIA:<absolute-native-workbook-path>` as specified above.
 
 ### Native manual-product workbook contract
 
@@ -161,9 +188,9 @@ The native columns are:
 
 `SKU层级1...N` expands to the actual maximum SKU depth. The six price-quality columns appear together only when the native export has price-quality data; `抓取备注` appears only when at least one row has a note.
 
-The following are not manual-product deliverables: one workbook per requested URL, a two-column `套餐组合/价格` workbook, a cleaned workbook, or a workbook with Agent-created `摘要` / `SKU价格明细` sheets.
+The following are not manual-product deliverables: one workbook per requested URL, `product_<id>_pricelist_HKD.xlsx`, a `價格清單` sheet, a two/four-column rebuilt price list, a cleaned workbook, or a workbook with Agent-created `摘要` / `SKU价格明细` sheets.
 
-Validate the workbook with normal `openpyxl.load_workbook(path)` mode before delivery. If the native workbook exists but has no data rows, missing required columns, an unexpected sheet, or other anomalies, attach the existing native workbook and state the exact warning in the delivery message. If the native workbook does not exist, report the run as failed with its run directory and log path; do not create a replacement workbook from terminal or JSONL logs.
+Validate the workbook with normal `openpyxl.load_workbook(path)` mode before delivery. If the native workbook exists but has no data rows, missing required columns, an unexpected sheet, or other anomalies, the response may contain exactly two lines: `抓取结果异常：<short reason>` followed by `MEDIA:<absolute-native-workbook-path>`. Do not include any captured prices. If the native workbook does not exist, report `抓取失败：未生成原生Excel` and the run directory; do not create a replacement workbook from terminal or JSONL logs.
 
 ## Ad-hoc multi-destination price scrape
 
@@ -214,6 +241,8 @@ To continue from where a stopped full run left off:
 5. Launch a new run against the resume input and new output folder.
 
 ## Progress updates for long runs
+
+This section applies to long-running batch, resume, and scheduled workflows only. It does not apply to `Manual single or selected products price scrape`, which sends no user-visible acknowledgement, progress, or summary before its final `MEDIA:` line.
 
 The daily launcher script is now long-running and handles progress reporting internally. For ad-hoc manual runs outside the launcher, use the same pattern: keep a monitoring loop that parses `terminal_output.txt` every 20 minutes and prints concise per-vendor progress to stdout.
 
@@ -632,6 +661,8 @@ FR | 85地区 1935SKU匹配 | 均价差: +18.24 | 基准更优: 66% | 基准更�
 - **Implemented layout**: Per-SKU price gap fields are written into `vendor_compare_<run>.xlsx` as horizontal vendor column blocks. Use `总表_横向比价` for SKU-level all-vendor comparison, `<vendor>_vs_<base>` sheets for pair-specific SKU review, and `单链接均价对比` for one-row-per-input-destination matched-SKU average-price vendor-level assessment.
 
 ## Delivery format
+
+This section applies to batch, comparison, trend, and scheduled deliveries only. It does not override the exact one-line success response required by `Manual single or selected products price scrape`.
 
 The user prefers XLSX deliverables. Keep all generated files for this workflow under `/Users/example/Documents/trip-sku-price-scrape/YYMMDD-HHMM/`, with `任务说明.md` in the run folder. Cron/default scheduled runs for SKU 实价抓取 should use `--delay-profile normal`, `--timeout 1800`, and `--workers 3` unless the user explicitly asks for a different mode. For delivery, send a ZIP containing XLSX files and concise validation artifacts. In Telegram, include the final package as:
 
