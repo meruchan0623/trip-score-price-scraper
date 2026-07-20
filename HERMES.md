@@ -6,7 +6,7 @@
 
 任务路由：
 
-- 单个产品或数个指定产品的价格抓取：使用 Skill 的 `Manual single or selected products price scrape`。
+- 单个产品或数个指定产品的价格抓取（包括运营提示词 `【請抓取產品價格71827107】`）：使用 Skill 的 `Manual single or selected products price scrape`。成功时只发送 Skill 规定的原生 Excel `MEDIA:` 行，不先发送平文本结果。
 - URL 列表评分与商品信息抓取：使用 `Ad-hoc rating-only score/sales scrape via --urls-file`。
 - 多厂商、批量、趋势、比价、恢复或定时任务：使用 Skill 中对应的批量与 cron 章节。
 
