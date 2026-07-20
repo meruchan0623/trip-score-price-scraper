@@ -197,7 +197,7 @@ codex_notes:
 ├── internal/tripcdp/runner.go
 ├── internal/tripcdp/cli.go
 ├── internal/tripcdp/export.go
-├── .hermes/skills/trip-sku-price-scraper-operations/SKILL.md
+├── hermes-agent/skills/trip-sku-price-scraper-operations/SKILL.md
 ├── docs/sku-dynamic-report-operations-optimization-2026-06-20.md
 └── .codex-handoff/current-hermes-cron-jobs-2026-06-20.md
 ```

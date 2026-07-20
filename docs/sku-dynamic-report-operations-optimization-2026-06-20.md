@@ -753,6 +753,6 @@ scripts/hermes-cron/trip_sku_trend_finalize.py
 ~/.hermes/scripts/trip_sku_non_tsim_daily_watcher.py
 ~/.hermes/scripts/trip_sku_non_tsim_final_delivery.py
 internal/tripcdp/vendor_compare.go
-.hermes/skills/trip-sku-price-scraper-operations/SKILL.md
+hermes-agent/skills/trip-sku-price-scraper-operations/SKILL.md
 docs/sku-dynamic-report-operations-optimization-2026-06-20.md
 ```

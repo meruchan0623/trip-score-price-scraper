@@ -33,8 +33,9 @@ go build -o /tmp/trip-score-cdp ./cmd/trip-score-cdp
 ```text
 cmd/trip-score-cdp/main.go        # 唯一可执行入口
 internal/tripcdp/                 # Go CDP 抓取、浏览器控制、导出、比价逻辑
-.hermes/skills/trip-sku-price-scraper-operations/
-                                  # 项目内同步的 Hermes 操作 skill
+HERMES.md                         # Hermes Agent 项目入口
+hermes-agent/skills/trip-sku-price-scraper-operations/
+                                  # 项目内唯一 Hermes 操作 skill
 ```
 
 已移除的旧组件：
@@ -250,11 +251,11 @@ scripts/hermes-cron/trip_sku_trend_finalize.py               # project-tracked t
 操作说明已同步到项目：
 
 ```text
-.hermes/skills/trip-sku-price-scraper-operations/SKILL.md
-.hermes/skills/trip-sku-price-scraper-operations/references/
+HERMES.md
+hermes-agent/skills/trip-sku-price-scraper-operations/SKILL.md
 ```
 
-当修改抓取、比价、cron 或报告逻辑时，应同步更新该 skill 和相关 references。
+Hermes Agent 应先读取 `HERMES.md`，再完整读取其中指定的 Skill。项目不再维护用户目录下的 Skill 副本。当修改抓取、比价、cron 或报告逻辑时，应同步更新该 Skill。
 
 ## 验证
 

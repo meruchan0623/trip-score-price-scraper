@@ -19,7 +19,7 @@ temp/
 *.zip
 *.jsonl
 
-# Hermes local planning cache; project skills are intentionally tracked under .hermes/skills/
+# Hermes local planning cache; the project skill is tracked under hermes-agent/skills/
 .hermes/plans/
 
 # Editor / OS
