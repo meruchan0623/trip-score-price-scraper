@@ -28,9 +28,9 @@ BINARY = Path('/tmp/trip-score-cdp')
 FINALIZER = REPO / 'scripts' / 'hermes-cron' / 'trip_sku_trend_finalize.py'
 FINAL_DELIVERY = Path('/Users/example/.hermes/scripts/trip_sku_non_tsim_final_delivery.py')
 DEFAULT_COMPARE_VENDOR = 'TSIM 網址'
-DEFAULT_DELAY_PROFILE = 'safe'
+DEFAULT_DELAY_PROFILE = 'normal'
 DEFAULT_TIMEOUT_SECONDS = 1800
-MAX_WORKERS = 2
+MAX_WORKERS = 3
 
 POLL_INTERVAL = 1200  # 20 minutes
 DONE_RE = re.compile(r'^\[(?P<v>[^\]]+)\] url done (?P<i>\d+)/(?P<t>\d+)')
