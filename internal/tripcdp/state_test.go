@@ -30,6 +30,17 @@ func TestDefaultOutputPathsUseVendorResultsRunFolder(t *testing.T) {
 	}
 }
 
+func TestDefaultSingleOutputPathHonorsOutputDir(t *testing.T) {
+	outputDir := filepath.Join(t.TempDir(), "manual-109223304")
+	request := TaskRequest{OutputDir: outputDir}
+
+	path := defaultSingleOutputPath(request, "260720-1200")
+	want := filepath.Join(outputDir, "trip_scoreandprice_results_260720-1200.xlsx")
+	if path != want {
+		t.Fatalf("default single output = %q, want output-dir path %q", path, want)
+	}
+}
+
 func TestDefaultSessionPathUsesStateFolder(t *testing.T) {
 	home := t.TempDir()
 	setTestHome(t, home)

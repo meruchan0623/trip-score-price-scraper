@@ -257,6 +257,8 @@ hermes-agent/skills/trip-sku-price-scraper-operations/SKILL.md
 
 Hermes Agent 应先读取 `HERMES.md`，再完整读取其中指定的 Skill。项目不再维护用户目录下的 Skill 副本。当修改抓取、比价、cron 或报告逻辑时，应同步更新该 Skill。
 
+Hermes 手动抓取单个或数个指定产品时，固定使用项目根目录构建的 `./trip-score-price-scraper`，以重复 `-input` 传入产品，并使用 `-no-headless -delay-profile fast -product-info -no-quality-rerun -output-dir <manual-dir>`。批量和 cron 任务继续使用各自章节的参数。
+
 ## 验证
 
 ```bash

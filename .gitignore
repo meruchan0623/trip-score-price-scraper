@@ -1,5 +1,6 @@
 # Go build artifacts
 /trip-score-cdp
+/trip-score-price-scraper
 *.exe
 *.test
 *.out
