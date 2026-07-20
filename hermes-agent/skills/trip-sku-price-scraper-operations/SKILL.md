@@ -21,7 +21,7 @@ go build -o /tmp/trip-score-cdp ./cmd/trip-score-cdp
 
 Hermes Remote Debugging allocation: this daily SKU/price cron does not reserve a fixed shared `--remote-debugging-port` such as `9222`, `9223`, or `9224`. Keep those ports for signed-in Ctrip/Tripcom browser sessions; this workflow should continue using its own Go CDP browser management and run-directory artifacts.
 
-Do not restore or recommend the removed Python CLI, Python GUI, Selenium/undetected-chromedriver workflow, or PyInstaller spec as project entry points. This project-local file is the only authoritative Hermes operations skill; do not copy it into or load an older version from `~/.hermes/skills/`. Keep README focused on Go CDP-only usage.
+Do not restore or recommend the removed Python CLI, Python GUI, Selenium/undetected-chromedriver workflow, or PyInstaller spec as project entry points. This project-local file is the only authoritative Hermes operations skill. The Hermes host must discover it through `skills.external_dirs`; do not copy it into or load an older version from `~/.hermes/skills/`, because a same-name local skill shadows the project version. Keep README focused on Go CDP-only usage.
 
 ## Canonical paths
 
@@ -123,13 +123,15 @@ Extract the decimal product ID following `產品價格` / `产品价格`. If the
 https://hk.trip.com/things-to-do/detail/<product-id>/?locale=zh-HK&curr=HKD
 ```
 
-The user-visible success response has exactly one line:
+The valid success response contains only the native workbook's bare absolute path:
 
 ```text
-MEDIA:<absolute-path-to-native-trip_scoreandprice_results_xlsx>
+/Users/example/Documents/trip-sku-price-scrape/manual-<ids>/trip_scoreandprice_results_<YYMMDD-HHMM>.xlsx
 ```
 
-Before this line, send no acknowledgement, progress message, product title, price, SKU count, minimum/maximum price, Markdown table, plain-text list, run summary, or output-path explanation. After this line, send nothing else. Tool/runtime logs remain internal and are not copied into the user-facing response.
+Hermes Gateway converts the bare path into a native attachment and removes the path from visible chat text. Before the path, send no acknowledgement, progress message, product title, price, SKU count, minimum/maximum price, Markdown table, plain-text list, run summary, or output-path explanation. After it, send nothing else. Tool/runtime logs remain internal and are not copied into the user-facing response.
+
+The project plugin `hermes-agent/plugins/trip-manual-delivery-guard/` enforces this contract with `pre_llm_call` and `transform_llm_output`. It removes any Agent-generated summary immediately before delivery. Do not bypass, disable, or work around the guard. Workbook reads are permitted only for the structural validation required below; never inspect the workbook to compose product, price, rating, booking, promotion, SKU-count, minimum-price, or comparison prose.
 
 The delivered file is always the Go CLI native workbook. Never create or attach a secondary workbook named like `product_<id>_pricelist_HKD.xlsx`. A workbook with a `價格清單` sheet, top summary fields such as `產品名稱 / 產品ID / 幣種 / 最低價 / SKU總數`, or a rebuilt `套餐名稱 / 實價 / 原價 / resourceId` table is an invalid Agent-generated deliverable.
 
@@ -171,7 +173,7 @@ Do not replace these manual-task defaults with `-headless`, another delay profil
 
 6. Verify the final `run_done` event and the generated workbook at `<output-dir>/trip_scoreandprice_results_<YYMMDD-HHMM>.xlsx`.
 7. Verify that the workbook has exactly one sheet named `Trip商品数据` and that its header follows the native field contract below.
-8. On valid success, emit only `MEDIA:<absolute-native-workbook-path>` as specified above.
+8. On valid success, emit only the bare absolute native workbook path specified above. The delivery guard performs the final allowlist check.
 
 ### Native manual-product workbook contract
 
@@ -190,7 +192,7 @@ The native columns are:
 
 The following are not manual-product deliverables: one workbook per requested URL, `product_<id>_pricelist_HKD.xlsx`, a `價格清單` sheet, a two/four-column rebuilt price list, a cleaned workbook, or a workbook with Agent-created `摘要` / `SKU价格明细` sheets.
 
-Validate the workbook with normal `openpyxl.load_workbook(path)` mode before delivery. If the native workbook exists but has no data rows, missing required columns, an unexpected sheet, or other anomalies, the response may contain exactly two lines: `抓取结果异常：<short reason>` followed by `MEDIA:<absolute-native-workbook-path>`. Do not include any captured prices. If the native workbook does not exist, report `抓取失败：未生成原生Excel` and the run directory; do not create a replacement workbook from terminal or JSONL logs.
+Validate the workbook with normal `openpyxl.load_workbook(path)` mode before delivery. If the native workbook exists but has no data rows, missing required columns, an unexpected sheet, or other anomalies, the response may contain exactly two lines: `抓取结果异常：<short reason>` followed by the bare absolute native workbook path. If the scrape encountered partial SKU-level click failures, anti-bot/API blocking, timeout/interruption, or partial product failures, use one `抓取重要警告：<short reason>` line followed by the bare path. Never include captured prices, product names, ratings, bookings, promotions, SKU counts, minimum prices, or comparisons. If the native workbook does not exist, report exactly `抓取失败：未生成原生Excel（<run-dir>）`; do not create a replacement workbook from terminal or JSONL logs.
 
 ## Ad-hoc multi-destination price scrape
 
@@ -242,9 +244,9 @@ To continue from where a stopped full run left off:
 
 ## Progress updates for long runs
 
-This section applies to long-running batch, resume, and scheduled workflows only. It does not apply to `Manual single or selected products price scrape`, which sends no user-visible acknowledgement, progress, or summary before its final `MEDIA:` line.
+This section applies to long-running batch, resume, and scheduled workflows only. It does not apply to `Manual single or selected products price scrape`, which sends no user-visible acknowledgement, progress, or summary before its native attachment.
 
-The daily launcher script is now long-running and handles progress reporting internally. For ad-hoc manual runs outside the launcher, use the same pattern: keep a monitoring loop that parses `terminal_output.txt` every 20 minutes and prints concise per-vendor progress to stdout.
+The daily launcher script is now long-running and handles progress reporting internally. For ad-hoc batch runs outside the launcher, use the same pattern: keep a monitoring loop that parses `terminal_output.txt` every 20 minutes and prints concise per-vendor progress to stdout.
 
 Report format preference: concise plain text, high information density, minimal verbosity. One header line + one line per vendor. No verbose per-vendor breakdowns with elapsed times, row counts, and trend statistics — those belong in the final report only.
 
@@ -662,7 +664,7 @@ FR | 85地区 1935SKU匹配 | 均价差: +18.24 | 基准更优: 66% | 基准更�
 
 ## Delivery format
 
-This section applies to batch, comparison, trend, and scheduled deliveries only. It does not override the exact one-line success response required by `Manual single or selected products price scrape`.
+This section applies to batch, comparison, trend, and scheduled deliveries only. It does not override the attachment-only success response required by `Manual single or selected products price scrape`.
 
 The user prefers XLSX deliverables. Keep all generated files for this workflow under `/Users/example/Documents/trip-sku-price-scrape/YYMMDD-HHMM/`, with `任务说明.md` in the run folder. Cron/default scheduled runs for SKU 实价抓取 should use `--delay-profile normal`, `--timeout 1800`, and `--workers 3` unless the user explicitly asks for a different mode. For delivery, send a ZIP containing XLSX files and concise validation artifacts. In Telegram, include the final package as:
 

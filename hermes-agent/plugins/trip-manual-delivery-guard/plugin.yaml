@@ -1,0 +1,3 @@
+name: trip-manual-delivery-guard
+version: "1.0.0"
+description: Enforce quiet native-XLSX delivery for selected Trip product scrapes.

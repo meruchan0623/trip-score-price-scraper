@@ -36,6 +36,10 @@ internal/tripcdp/                 # Go CDP 抓取、浏览器控制、导出、�
 HERMES.md                         # Hermes Agent 项目入口
 hermes-agent/skills/trip-sku-price-scraper-operations/
                                   # 项目内唯一 Hermes 操作 skill
+hermes-agent/plugins/trip-manual-delivery-guard/
+                                  # 指定产品抓取发送前静默交付插件
+tests/test_trip_manual_delivery_guard.py
+                                  # Hermes 回复过滤回归测试
 ```
 
 已移除的旧组件：
@@ -48,7 +52,7 @@ trip_get_scoreandprice.pyw
 trip_get_scoreandprice.spec
 service.py / models.py / session_store.py / browser_startup.py / trip_cli_scraper.py / xlsx_export.py
 requirements.txt
-tests/test_*.py
+旧版 Python 抓取器对应的测试
 ```
 
 ## 快速开始
@@ -246,23 +250,48 @@ scripts/hermes-cron/trip_sku_trend_finalize.py               # project-tracked t
 5. 完成后执行趋势分析和打包
 6. 投递 ZIP
 
-## 项目内 skill
+## Hermes 项目集成
 
 操作说明已同步到项目：
 
 ```text
 HERMES.md
 hermes-agent/skills/trip-sku-price-scraper-operations/SKILL.md
+hermes-agent/plugins/trip-manual-delivery-guard/plugin.yaml
+hermes-agent/plugins/trip-manual-delivery-guard/__init__.py
 ```
 
-Hermes Agent 应先读取 `HERMES.md`，再完整读取其中指定的 Skill。项目不再维护用户目录下的 Skill 副本。当修改抓取、比价、cron 或报告逻辑时，应同步更新该 Skill。
+`HERMES.md` 是项目规范入口，但不是 Hermes 会按文件名自动加载的运行时规则。Hermes 主机必须在 `~/.hermes/config.yaml` 中把项目 Skill 目录加入外部 Skill 搜索路径，同时不得保留同名的 `~/.hermes/skills/` 旧副本，否则本地副本会遮蔽项目版本：
 
-Hermes 手动抓取单个或数个指定产品时，固定使用项目根目录构建的 `./trip-score-price-scraper`，以重复 `-input` 传入产品，并使用 `-no-headless -delay-profile fast -product-info -no-quality-rerun -output-dir <manual-dir>`。运营提示词如 `【請抓取產品價格71827107】` 会按产品 ID 构造香港站 HKD URL。有效成功时用户可见响应只能是原生 XLSX 的单行 `MEDIA:` 附件，不先发送平文本价格、摘要或二次整理表。批量和 cron 任务继续使用各自章节的参数。
+```yaml
+skills:
+  external_dirs:
+    - /Users/example/Develop/trip-score-price-scraper/hermes-agent/skills
+```
+
+指定产品抓取还必须启用发送前过滤插件。插件代码只保存在项目内；用户插件目录只放符号链接：
+
+```bash
+mkdir -p /Users/example/.hermes/plugins
+ln -s \
+  /Users/example/Develop/trip-score-price-scraper/hermes-agent/plugins/trip-manual-delivery-guard \
+  /Users/example/.hermes/plugins/trip-manual-delivery-guard
+hermes plugins enable trip-manual-delivery-guard
+hermes plugins list
+readlink /Users/example/.hermes/plugins/trip-manual-delivery-guard
+```
+
+如果链接已存在，先用 `readlink` 确认它指向上述项目目录，不要复制或覆盖成第二份代码。配置完成后通过 Hermes Dashboard 或主机当前的服务管理方式重启 Gateway，并从 Telegram 新建会话验收。
+
+Hermes Agent 发现 Skill 后，应完整读取其中对应章节。项目不再维护用户目录下的 Skill 或插件代码副本。当修改抓取、比价、cron 或报告逻辑时，应同步更新该 Skill。
+
+Hermes 手动抓取单个或数个指定产品时，固定使用项目根目录构建的 `./trip-score-price-scraper`，以重复 `-input` 传入产品，并使用 `-no-headless -delay-profile fast -product-info -no-quality-rerun -output-dir <manual-dir>`。运营提示词如 `【請抓取產品價格71827107】` 会按产品 ID 构造香港站 HKD URL。有效成功时只交付原生 XLSX 附件，不发送平文本价格、产品/SKU 摘要或二次整理表。只有失败、部分 SKU 点击失败、反爬/API 拦截、超时/中断、部分产品失败或原生 Excel 校验异常可以显示单行提示。批量和 cron 任务继续使用各自章节的参数。
 
 ## 验证
 
 ```bash
 go test ./...
+python3 -m unittest -v tests/test_trip_manual_delivery_guard.py
 go build -o /tmp/trip-score-cdp ./cmd/trip-score-cdp
 /tmp/trip-score-cdp --help
 ```
