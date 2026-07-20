@@ -116,7 +116,7 @@ func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bo
 	fs.StringVar(&urlsFile, "urls-file", "", "Text file containing one product URL per line.")
 	fs.StringVar(&excelInput, "excel-input", "", "Excel workbook. First row contains vendors; links start from row 2.")
 	fs.StringVar(&output, "output", "", "Excel output path.")
-	fs.StringVar(&outputDir, "output-dir", "", "Directory for vendor Excel outputs.")
+	fs.StringVar(&outputDir, "output-dir", "", "Directory for automatically named Excel outputs.")
 	fs.IntVar(&workers, "workers", 0, "Concurrent browser workers, 1-5. Defaults to min(vendor count, 5).")
 	fs.Float64Var(&startupStagger, "startup-stagger", 0.5, "Seconds to wait between starting vendor browser workers. Use 0 to disable staggering.")
 	fs.IntVar(&stopGrace, "stop-grace-seconds", 30, "Seconds to wait for partial exports after SIGINT/SIGTERM before terminating workers.")

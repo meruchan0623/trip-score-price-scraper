@@ -50,6 +50,9 @@ func defaultSingleOutputPath(request TaskRequest, stamp string) string {
 	if request.RatingOnly {
 		name = "trip_score_results_" + stamp + ".xlsx"
 	}
+	if outputDir := strings.TrimSpace(request.OutputDir); outputDir != "" {
+		return filepath.Join(expandPath(outputDir), name)
+	}
 	return filepath.Join(defaultRunOutputDir(stamp), name)
 }
 

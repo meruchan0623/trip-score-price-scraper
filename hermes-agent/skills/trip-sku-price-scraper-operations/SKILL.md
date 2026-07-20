@@ -103,26 +103,57 @@ Reference examples:
 - `references/2026-05-29-smoke-test.md` — first-5 headed/initial smoke and log reconstruction issue.
 - `references/2026-05-29-headless-first10.md` — first-10 headless smoke with minute-by-minute progress pattern.
 
-## Ad-hoc single vendor / destination price scrape
+## Manual single or selected products price scrape
 
-When the user asks for a narrow price grab such as “抓取BC日本的產品價格”:
+Use this workflow whenever the user supplies, names, or asks Hermes to resolve one product or a small set of specific products. This includes requests such as “抓这个链接”, “抓取 BC 日本的产品价格”, or “只抓这几个指定产品”.
 
-1. Treat it as this Go CDP SKU-price workflow, not the Trip outerlist scraper.
-2. Resolve the target row from the canonical config workbook (`config/非TSIM厂商价格抓取输入.xlsx` / same-region workbook): match destination names like `Japan`/`日本`, then take the named vendor column exactly (e.g. `BC`).
-3. Create a timestamped run folder under `/Users/example/Documents/trip-sku-price-scrape/YYMMDD-HHMM-<vendor>-<destination>/` and write `任务说明.md`.
-4. Generate a minimal one-column input workbook whose row 1 is the vendor header and row 2 is the resolved Trip URL.
-5. Run the Go CLI with `--run-mode mode1 --no-headless --delay-profile normal --excel-input <input.xlsx> --workers 1 --log-level verbose --output-dir <run_dir> --json-lines --no-color`.
-6. Verify completion from the final `run_done` JSON event and the vendor XLSX row count.
-7. Deliver the Go CLI native vendor workbook itself: `<run_dir>/<vendor>_<YYMMDD-HHMM>.xlsx`. Attach that exact file via `MEDIA:` and report its SKU row count, minimum/maximum `实价`, and run directory.
+1. Treat the request as a direct-input Go CDP SKU-price scrape, not an Excel-vendor batch and not the Trip outerlist scraper.
+2. Resolve every requested product to its exact Trip.com detail URL. Pass one `-input` argument per product, preserving the user's order. Do not generate an input workbook or URL-list file for this workflow.
+3. Use an explicit manual output directory under `/Users/example/Documents/trip-sku-price-scrape/`, named `manual-<product-id>` for one product or `manual-<short-label>` for several products.
+4. From the repository root, build the project-local manual binary before the run:
 
-### Native single-product workbook contract
+```bash
+go build -o ./trip-score-price-scraper ./cmd/trip-score-cdp
+```
 
-The delivered workbook is the unmodified Go CLI output. It has exactly one worksheet named `Trip商品数据`. Keep the native row values and native column order; do not fill down, delete, rename, reorder, or summarize fields.
+5. Run with this fixed parameter contract. Repeat only the `-input` line when several products are requested:
+
+```bash
+./trip-score-price-scraper \
+  -no-headless \
+  -delay-profile fast \
+  -input "https://hk.trip.com/things-to-do/detail/109223304/?locale=zh-HK&curr=HKD" \
+  -output-dir /Users/example/Documents/trip-sku-price-scrape/manual-109223304 \
+  -product-info \
+  -no-quality-rerun
+```
+
+For several selected products, the command shape is:
+
+```bash
+./trip-score-price-scraper \
+  -no-headless \
+  -delay-profile fast \
+  -input "<product-url-1>" \
+  -input "<product-url-2>" \
+  -output-dir /Users/example/Documents/trip-sku-price-scrape/manual-<short-label> \
+  -product-info \
+  -no-quality-rerun
+```
+
+Do not replace these manual-task defaults with `-headless`, another delay profile, `-excel-input`, `-urls-file`, `-output`, or quality-rerun flags. Batch and scheduled workflows keep their separate parameters elsewhere in this skill.
+
+6. Verify the final `run_done` event and the generated workbook at `<output-dir>/trip_scoreandprice_results_<YYMMDD-HHMM>.xlsx`.
+7. Attach that exact native workbook via `MEDIA:` and report the requested product count, captured SKU row count, minimum/maximum `实价`, and output directory.
+
+### Native manual-product workbook contract
+
+The delivered workbook is the unmodified Go CLI output for all requested products. It has exactly one worksheet named `Trip商品数据`. Keep the native row values and native column order; do not fill down, delete, rename, reorder, or summarize fields.
 
 The native columns are:
 
 ```text
-厂商, 商品ID, URL, 商品名称, SKU层级1...N, 货币, 外显价格, 实价, 促销标签,
+商品ID, URL, 商品名称, SKU层级1...N, 货币, 外显价格, 实价, 促销标签,
 [价格状态, 资源ID, 接口ItemID, 促销命中, 价格来源, 原始捕获价格 when present],
 商品资讯, 预定数, 评价数, 评分, 客户服务, 方便程度, 讯号状态, 中差评价数,
 [抓取备注 when present]
@@ -130,7 +161,7 @@ The native columns are:
 
 `SKU层级1...N` expands to the actual maximum SKU depth. The six price-quality columns appear together only when the native export has price-quality data; `抓取备注` appears only when at least one row has a note.
 
-The following are not single-product deliverables: a two-column `套餐组合/价格` workbook, a cleaned workbook, or a workbook with Agent-created `摘要` / `SKU价格明细` sheets.
+The following are not manual-product deliverables: one workbook per requested URL, a two-column `套餐组合/价格` workbook, a cleaned workbook, or a workbook with Agent-created `摘要` / `SKU价格明细` sheets.
 
 Validate the workbook with normal `openpyxl.load_workbook(path)` mode before delivery. If the native workbook exists but has no data rows, missing required columns, an unexpected sheet, or other anomalies, attach the existing native workbook and state the exact warning in the delivery message. If the native workbook does not exist, report the run as failed with its run directory and log path; do not create a replacement workbook from terminal or JSONL logs.
 
@@ -618,7 +649,7 @@ Keep the final human summary concise:
 
 ## Batch/historical XLSX export may be empty while logs contain data
 
-This section applies only to batch or historical diagnostic recovery. It does not apply to the ad-hoc single vendor / destination workflow: that workflow always delivers the native workbook unchanged, or reports that the native workbook is missing.
+This section applies only to batch or historical diagnostic recovery. It does not apply to the manual single or selected products workflow: that workflow always delivers the native workbook unchanged, or reports that the native workbook is missing.
 
 Observed in the 2026-05-29 smoke test: the Go CLI completed successfully and logged thousands of `combination price` records, but the per-vendor XLSX files contained only the header row `厂商` and no detail rows.
 

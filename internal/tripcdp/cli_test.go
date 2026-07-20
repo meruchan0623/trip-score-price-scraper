@@ -116,6 +116,42 @@ func TestBoolFlagsDoNotRequireValues(t *testing.T) {
 	}
 }
 
+func TestParseManualSelectedProductsContract(t *testing.T) {
+	request, runMode, _, _, _, err := parseArgs([]string{
+		"-no-headless",
+		"-delay-profile", "fast",
+		"-input", "https://hk.trip.com/things-to-do/detail/109223304/?locale=zh-HK&curr=HKD",
+		"-input", "https://hk.trip.com/things-to-do/detail/109223305/?locale=zh-HK&curr=HKD",
+		"-output-dir", "/Users/example/Documents/trip-sku-price-scrape/manual-selected",
+		"-product-info",
+		"-no-quality-rerun",
+	}, &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("parseArgs failed: %v", err)
+	}
+	if runMode != "" {
+		t.Fatalf("run mode = %q, want default full scrape", runMode)
+	}
+	if len(request.InputPaths) != 2 {
+		t.Fatalf("input paths = %#v, want 2 URLs", request.InputPaths)
+	}
+	if request.BrowserOptions.Headless {
+		t.Fatal("manual selected-product scrape should use a visible browser")
+	}
+	if request.DelayOptions.Profile != "fast" {
+		t.Fatalf("delay profile = %q, want fast", request.DelayOptions.Profile)
+	}
+	if request.OutputDir != "/Users/example/Documents/trip-sku-price-scrape/manual-selected" {
+		t.Fatalf("output dir = %q", request.OutputDir)
+	}
+	if request.RatingOnly || !request.ExtractRealPrice || !request.ExtractProductInfo {
+		t.Fatalf("unexpected manual scrape options: %+v", request)
+	}
+	if request.QualityRerun.Enabled {
+		t.Fatalf("quality rerun should be disabled: %+v", request.QualityRerun)
+	}
+}
+
 func TestParseDefaultsDoNotEnableLogFileOrExplicitSession(t *testing.T) {
 	request, _, _, _, _, err := parseArgs([]string{"--input", "https://www.trip.com/detail/12345"}, &bytes.Buffer{})
 	if err != nil {

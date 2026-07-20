@@ -6,7 +6,7 @@
 
 任务路由：
 
-- 单厂商、单目的地或单产品价格抓取：使用 Skill 的 `Ad-hoc single vendor / destination price scrape`。
+- 单个产品或数个指定产品的价格抓取：使用 Skill 的 `Manual single or selected products price scrape`。
 - URL 列表评分与商品信息抓取：使用 `Ad-hoc rating-only score/sales scrape via --urls-file`。
 - 多厂商、批量、趋势、比价、恢复或定时任务：使用 Skill 中对应的批量与 cron 章节。
 
