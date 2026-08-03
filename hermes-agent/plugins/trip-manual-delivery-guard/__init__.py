@@ -25,7 +25,7 @@ _TRIP_DETAIL_RE = re.compile(
     re.IGNORECASE,
 )
 _MANUAL_INTENT_RE = re.compile(
-    r"(?:請|请)?抓取(?:以下|這些|这些|這個|这个)?(?:產品|产品)?(?:的)?(?:價格|价格)",
+    r"(?:請|请)?(?:抓取|抓)(?:以下|這些|这些|這個|这个)?(?:產品|产品)?(?:的)?(?:價格|价格)",
     re.IGNORECASE,
 )
 _ID_LIST_SEPARATORS_RE = re.compile(r"[\s,，、;；|]+")
@@ -209,8 +209,9 @@ def _manual_context(turn: ManualTurn) -> str:
         / "SKILL.md"
     )
     return (
-        "本轮是单个或数个指定Trip产品的价格抓取。完整读取并遵守："
-        f"{skill_path}。使用其中固定的可视浏览器、fast、product-info、"
+        "本轮是单个或数个指定Trip产品的价格抓取。无论用户给出哪个Trip站点链接，"
+        "都必须导航到 hk.trip.com 并固定 locale=zh-HK、curr=HKD。完整读取并遵守："
+        f"{skill_path}。使用其中固定的可视浏览器、normal、product-info、"
         "no-quality-rerun和output-dir参数。完成后只交付原生Excel附件；"
         "禁止输出确认、进度、产品信息、价格、SKU数量、对比、总结或二次整理表。"
         "只有失败或影响结果完整性的异常可以使用Skill规定的单行前缀。"

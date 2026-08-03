@@ -281,6 +281,17 @@ class TripManualDeliveryGuardTests(unittest.TestCase):
 
             self.assertEqual(turn.product_ids, ("109223304",))
 
+    def test_short_price_request_with_id_is_a_manual_scrape_trigger(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            turn = self.plugin.detect_manual_request(
+                "抓價格 ID: 109223304（新加坡站連結）",
+                [],
+                output_root=Path(tmp),
+                started_at=100.0,
+            )
+
+            self.assertEqual(turn.product_ids, ("109223304",))
+
     def test_registered_hooks_filter_only_matching_turn(self):
         with tempfile.TemporaryDirectory() as tmp:
             output_root = Path(tmp)

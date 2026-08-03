@@ -21,6 +21,34 @@ func scrape(request TaskRequest, reporter Reporter, runMode string) TaskResult {
 	return scrapeSingle(request, reporter, runMode)
 }
 
+func validateSinglePriceScrapeRows(rows []map[string]string) (int, error) {
+	failures := []string{}
+	for _, group := range groupRowsByURL(rows) {
+		score := qualityScoreRows(group)
+		trusted, _, priceFailed := countPriceQualityRows(group)
+		if !score.needsRerun && trusted > 0 && !priceFailed {
+			continue
+		}
+
+		identifier := firstNonEmptyRowValue(group, "商品ID")
+		if identifier == "" {
+			identifier = productID(firstNonEmptyRowValue(group, "URL"))
+		}
+		if identifier == "" {
+			identifier = "未知产品"
+		}
+		reason := "结果质量校验未通过，未获得完整 SKU 价格。"
+		if ClassifyRows(group) == FailureRiskChallenge {
+			reason = "Trip.com/Cloudflare 风险拦截，未获得完整 SKU 价格。"
+		}
+		failures = append(failures, identifier+" 价格抓取失败，原因："+reason)
+	}
+	if len(failures) == 0 {
+		return 0, nil
+	}
+	return len(failures), fmt.Errorf("%s", strings.Join(failures, "；"))
+}
+
 func scrapeSingle(request TaskRequest, reporter Reporter, runMode string) TaskResult {
 	items, _, err := loadItems(request)
 	if err != nil {
@@ -131,16 +159,25 @@ func scrapeSingle(request TaskRequest, reporter Reporter, runMode string) TaskRe
 			_ = scraper.maybeRestart(ctx)
 		}
 	}
-	if !scraper.saveSession() {
+	validationFailures := 0
+	var validationErr error
+	if !request.RatingOnly && len(rows) > 0 {
+		validationFailures, validationErr = validateSinglePriceScrapeRows(rows)
+	}
+	if validationErr == nil && !scraper.saveSession() {
 		reporter(Event{"event": "warning", "stage": "session_save", "message": "session save failed"})
 	}
-	if state.SessionExplicit {
+	if validationErr == nil && state.SessionExplicit {
 		if raw, err := os.ReadFile(request.BrowserOptions.SessionFile); err == nil {
 			_ = ensureParent(state.SessionFile)
 			_ = os.WriteFile(state.SessionFile, raw, 0o644)
 		}
 	}
-	resultForState := workerResult{Vendor: defaultVendor, WorkerID: 1, Success: len(rows) > 0, Rows: len(rows), SessionFile: request.BrowserOptions.SessionFile, ProfileDir: request.BrowserOptions.UserDataDir}
+	stateRows := len(rows)
+	if validationErr != nil {
+		stateRows = 0
+	}
+	resultForState := workerResult{Vendor: defaultVendor, WorkerID: 1, Success: len(rows) > 0 && validationErr == nil, Rows: stateRows, SessionFile: request.BrowserOptions.SessionFile, ProfileDir: request.BrowserOptions.UserDataDir}
 	if err := consolidateRuntimeState([]workerResult{resultForState}, state, reporter); err != nil {
 		reporter(Event{"event": "warning", "stage": "state_consolidate", "message": "state consolidation failed", "error": err.Error()})
 	} else {
@@ -158,6 +195,11 @@ func scrapeSingle(request TaskRequest, reporter Reporter, runMode string) TaskRe
 			return TaskResult{Success: false, OutputPath: savedPath, ProcessedCount: len(rows), LogFile: request.LogFile, Error: "stopped by signal", ExitCode: 130, QualityFailedURLs: qualityFailedURLs, QualityRecoveredURLs: qualityRecoveredURLs}
 		}
 		reporter(Event{"event": "export_done", "vendor": defaultVendor, "rows": len(rows), "output_path": savedPath})
+		if validationErr != nil {
+			finalQualityFailedURLs := max(qualityFailedURLs, validationFailures)
+			reporter(Event{"event": "warning", "stage": "quality", "message": validationErr.Error(), "final_quality_failed_urls": finalQualityFailedURLs})
+			return TaskResult{Success: false, OutputPath: savedPath, ProcessedCount: len(rows), LogFile: request.LogFile, Error: validationErr.Error(), ExitCode: 4, QualityFailedURLs: finalQualityFailedURLs, QualityRecoveredURLs: qualityRecoveredURLs, FinalQualityFailedURLs: finalQualityFailedURLs}
+		}
 		return TaskResult{Success: true, OutputPath: savedPath, ProcessedCount: len(rows), LogFile: request.LogFile, ExitCode: 0, QualityFailedURLs: qualityFailedURLs, QualityRecoveredURLs: qualityRecoveredURLs}
 	}
 	if ctx.Err() != nil {

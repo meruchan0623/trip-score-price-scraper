@@ -136,3 +136,28 @@ func TestGlobalRiskPauseAfterMultipleWhaleguardEvents(t *testing.T) {
 		t.Fatal("multiple whaleguard events should trigger global cooldown")
 	}
 }
+
+func TestCloudflareNoteInvalidatesPreviouslyTrustedPrice(t *testing.T) {
+	scraper := &tripScraper{
+		request:           TaskRequest{ExtractRealPrice: true},
+		currentScrapeNote: "被Cloudflare拦截",
+	}
+	row := map[string]string{
+		"货币":   "HKD",
+		"外显价格": "20.00",
+		"实价":   "19.00",
+		"促销标签": "即减5%",
+		"价格状态": priceStatusTrustedPromo,
+	}
+
+	scraper.applyCurrentScrapeNote(row)
+
+	if row["价格状态"] != priceStatusRiskBlocked {
+		t.Fatalf("price status = %q, want %q", row["价格状态"], priceStatusRiskBlocked)
+	}
+	for _, key := range []string{"货币", "外显价格", "实价", "促销标签"} {
+		if row[key] != "" {
+			t.Fatalf("%s = %q, want blank after Cloudflare interception", key, row[key])
+		}
+	}
+}

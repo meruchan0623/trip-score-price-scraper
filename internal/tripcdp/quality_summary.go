@@ -6,8 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-
-	"github.com/xuri/excelize/v2"
 )
 
 type qualityFailureSummary struct {
@@ -93,65 +91,7 @@ func writeFailedQualityArtifacts(outputDir string, failures []qualityFailureSumm
 	if err == nil {
 		_ = os.WriteFile(jsonPath, raw, 0o644)
 	}
-	xlsxPath := filepath.Join(dir, "failed_quality_urls.xlsx")
-	if err := writeFailedQualityXLSX(xlsxPath, failures); err != nil {
-		xlsxPath = ""
-	}
-	return absPath(jsonPath), absPath(xlsxPath)
-}
-
-func writeFailedQualityXLSX(path string, failures []qualityFailureSummary) error {
-	file := excelize.NewFile()
-	defer file.Close()
-	sheet := "失败URL"
-	defaultSheet := file.GetSheetName(file.GetActiveSheetIndex())
-	if err := file.SetSheetName(defaultSheet, sheet); err != nil {
-		return err
-	}
-	headers := []string{"厂商", "商品ID", "URL", "失败原因", "可信行", "不可信行", "资源缺失行", "总行数", "重试次数", "Fallback价格", "样例SKU", "NEXT_DATA", "Package数", "Resource数", "Batch响应数", "最后响应状态", "建议重试命令"}
-	for col, header := range headers {
-		cell, _ := excelize.CoordinatesToCellName(col+1, 1)
-		_ = file.SetCellValue(sheet, cell, header)
-	}
-	for rowIndex, failure := range failures {
-		values := []any{
-			failure.Vendor,
-			failure.ProductID,
-			failure.URL,
-			failure.Reason,
-			failure.TrustedRows,
-			failure.UntrustedRows,
-			failure.ResourceMissRows,
-			failure.TotalRows,
-			failure.RetryAttempt,
-			strings.Join(failure.TopFallbackPrices, ", "),
-			strings.Join(failure.SelectedTexts, " / "),
-			failure.NextDataPresent,
-			failure.PackageCount,
-			failure.ResourceCount,
-			failure.BatchResponseCount,
-			failure.LastResponseStatus,
-			failure.RetryCommand,
-		}
-		for col, value := range values {
-			cell, _ := excelize.CoordinatesToCellName(col+1, rowIndex+2)
-			_ = file.SetCellValue(sheet, cell, value)
-		}
-	}
-	headerStyle, _ := file.NewStyle(&excelize.Style{Font: &excelize.Font{Bold: true}, Alignment: &excelize.Alignment{Horizontal: "center", Vertical: "center"}})
-	endHeader, _ := excelize.CoordinatesToCellName(len(headers), 1)
-	_ = file.SetCellStyle(sheet, "A1", endHeader, headerStyle)
-	for col, header := range headers {
-		name, _ := excelize.ColumnNumberToName(col + 1)
-		width := max(12, min(runeLen(header)+8, 40))
-		if header == "URL" || header == "建议重试命令" {
-			width = 60
-		}
-		_ = file.SetColWidth(sheet, name, name, float64(width))
-	}
-	lastCell, _ := excelize.CoordinatesToCellName(len(headers), len(failures)+1)
-	_ = file.SetSheetDimension(sheet, "A1:"+lastCell)
-	return file.SaveAs(path)
+	return absPath(jsonPath), ""
 }
 
 func qualityFailureSummaryFromEvent(event Event) qualityFailureSummary {

@@ -4,7 +4,7 @@ import "testing"
 
 func TestQualityRerunCandidatesSkipTrustedNoSKUBaseRows(t *testing.T) {
 	rows := []map[string]string{
-		{"厂商": "TGT", "商品ID": "1", "URL": "https://hk.trip.com/things-to-do/detail/1/", "SKU层级1": "无SKU选项", "价格状态": priceStatusTrustedBase, "外显价格": "49.13", "实价": "49.13"},
+		{"厂商": "TGT", "商品ID": "1", "URL": "https://hk.trip.com/things-to-do/detail/1/", "商品名称": "Product", "SKU层级1": "无SKU选项", "货币": "HKD", "价格状态": priceStatusTrustedBase, "外显价格": "49.13", "实价": "49.13"},
 		{"厂商": "JY", "商品ID": "2", "URL": "https://hk.trip.com/things-to-do/detail/2/", "价格状态": priceStatusUntrustedResourceMiss, "抓取备注": "价格质量检查失败: consecutive_resource_miss"},
 		{"厂商": "BC", "商品ID": "3", "URL": "https://hk.trip.com/things-to-do/detail/3/", "价格状态": priceStatusRiskBlocked, "抓取备注": "whaleguard block"},
 	}
@@ -13,6 +13,38 @@ func TestQualityRerunCandidatesSkipTrustedNoSKUBaseRows(t *testing.T) {
 
 	if len(candidates) != 0 {
 		t.Fatalf("candidates = %d, want 0: %+v", len(candidates), candidates)
+	}
+}
+
+func TestQualityScoreRowsRejectsTrustedCloudflareRows(t *testing.T) {
+	rows := []map[string]string{{
+		"商品名称":   "Product",
+		"SKU层级1": "1天",
+		"货币":     "HKD",
+		"价格状态":   priceStatusTrustedPromo,
+		"实价":     "19.90",
+		"抓取备注":   "被Cloudflare拦截",
+	}}
+
+	score := qualityScoreRows(rows)
+
+	if !score.needsRerun || score.reason != "risk_or_untrusted_price" {
+		t.Fatalf("score = %+v, want Cloudflare risk failure", score)
+	}
+}
+
+func TestQualityScoreRowsRejectsTrustedRowsMissingRequiredFields(t *testing.T) {
+	rows := []map[string]string{{
+		"商品名称":   "Product",
+		"SKU层级1": "1天",
+		"价格状态":   priceStatusTrustedBase,
+		"实价":     "19.90",
+	}}
+
+	score := qualityScoreRows(rows)
+
+	if !score.needsRerun || score.reason != "missing_required_price_fields" {
+		t.Fatalf("score = %+v, want missing required fields failure", score)
 	}
 }
 
