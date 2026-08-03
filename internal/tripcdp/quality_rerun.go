@@ -103,12 +103,12 @@ func qualityScoreRows(rows []map[string]string) qualityScore {
 			}
 		}
 		note := strings.ToLower(strings.TrimSpace(row["抓取备注"] + " " + row["评分"]))
+		if strings.Contains(note, "whaleguard") || strings.Contains(note, "cloudflare") {
+			hasRisk = true
+		}
 		if strings.Contains(note, "处理错误") || strings.Contains(note, "页面未加载") || strings.Contains(note, "product dom not ready") || strings.Contains(note, "whaleguard") || strings.Contains(note, "cloudflare") || strings.Contains(note, "价格质量检查失败") {
 			hasError = true
 		}
-	}
-	if trusted > 0 {
-		return qualityScore{score: 1000 + trusted}
 	}
 	if untrusted > 0 || hasRisk || hasError {
 		reason := "low_quality"
@@ -119,7 +119,40 @@ func qualityScoreRows(rows []map[string]string) qualityScore {
 		}
 		return qualityScore{score: max(1, len(rows)), needsRerun: true, reason: reason}
 	}
+	if trusted > 0 {
+		if !hasRequiredPriceFields(rows) {
+			return qualityScore{score: max(1, len(rows)), needsRerun: true, reason: "missing_required_price_fields"}
+		}
+		return qualityScore{score: 1000 + trusted}
+	}
 	return qualityScore{score: 100 + len(rows)}
+}
+
+func hasRequiredPriceFields(rows []map[string]string) bool {
+	if firstNonEmptyRowValue(rows, "商品名称") == "" || firstNonEmptyRowValue(rows, "货币") == "" {
+		return false
+	}
+	hasSKU := false
+	for _, row := range rows {
+		for key, value := range row {
+			if strings.HasPrefix(key, "SKU层级") && strings.TrimSpace(value) != "" {
+				hasSKU = true
+				break
+			}
+		}
+		if hasSKU {
+			break
+		}
+	}
+	if !hasSKU {
+		return false
+	}
+	for _, row := range rows {
+		if isTrustedPriceStatus(row["价格状态"]) && firstNonEmpty(row["实价"], row["外显价格"]) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func groupRowsByURL(rows []map[string]string) [][]map[string]string {

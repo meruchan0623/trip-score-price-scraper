@@ -135,6 +135,8 @@ The project plugin `hermes-agent/plugins/trip-manual-delivery-guard/` enforces t
 
 The delivered file is always the Go CLI native workbook. Never create or attach a secondary workbook named like `product_<id>_pricelist_HKD.xlsx`. A workbook with a `價格清單` sheet, top summary fields such as `產品名稱 / 產品ID / 幣種 / 最低價 / SKU總數`, or a rebuilt `套餐名稱 / 實價 / 原價 / resourceId` table is an invalid Agent-generated deliverable.
 
+For this manual workflow, every supplied Trip.com URL is a product identifier only. Before navigation, the Go CLI forcibly rewrites any Trip.com host and query to `https://hk.trip.com/...?...&locale=zh-HK&curr=HKD`. The native workbook must therefore record the canonical Hong Kong URL and HKD prices only; do not follow, preserve, compare, or export `CNY` / RMB prices even if the user supplied a mainland, Singapore, or another Trip.com URL. If a page/API still returns a non-HKD price, the CLI clears that row's price fields, marks it `currency_mismatch`, and the manual run must not be delivered as a success.
+
 1. Treat the request as a direct-input Go CDP SKU-price scrape, not an Excel-vendor batch and not the Trip outerlist scraper.
 2. Resolve every requested product to its exact Trip.com detail URL. Pass one `-input` argument per product, preserving the user's order. Do not generate an input workbook or URL-list file for this workflow.
 3. Use an explicit manual output directory under `/Users/example/Documents/trip-sku-price-scrape/`. Name it `manual-<product-id>` for one product. For several products, join all requested IDs in order with `-`, producing `manual-<id-1>-<id-2>-...`.
@@ -149,7 +151,7 @@ go build -o ./trip-score-price-scraper ./cmd/trip-score-cdp
 ```bash
 ./trip-score-price-scraper \
   -no-headless \
-  -delay-profile fast \
+  -delay-profile normal \
   -input "https://hk.trip.com/things-to-do/detail/109223304/?locale=zh-HK&curr=HKD" \
   -output-dir /Users/example/Documents/trip-sku-price-scrape/manual-109223304 \
   -product-info \
@@ -161,7 +163,7 @@ For several selected products, the command shape is:
 ```bash
 ./trip-score-price-scraper \
   -no-headless \
-  -delay-profile fast \
+  -delay-profile normal \
   -input "<product-url-1>" \
   -input "<product-url-2>" \
   -output-dir /Users/example/Documents/trip-sku-price-scrape/manual-<id-1>-<id-2> \
@@ -169,10 +171,10 @@ For several selected products, the command shape is:
   -no-quality-rerun
 ```
 
-Do not replace these manual-task defaults with `-headless`, another delay profile, `-excel-input`, `-urls-file`, `-output`, or quality-rerun flags. Batch and scheduled workflows keep their separate parameters elsewhere in this skill.
+Do not replace these manual-task defaults with `-headless`, another delay profile, `-excel-input`, `-urls-file`, `-output`, or quality-rerun flags. Run selected products sequentially with the CLI's single worker. Batch and scheduled workflows keep their separate parameters elsewhere in this skill.
 
-6. Verify the final `run_done` event and the generated workbook at `<output-dir>/trip_scoreandprice_results_<YYMMDD-HHMM>.xlsx`.
-7. Verify that the workbook has exactly one sheet named `Trip商品数据` and that its header follows the native field contract below.
+6. Verify the final `run_done` event and the generated workbook at `<output-dir>/trip_scoreandprice_results_<YYMMDD-HHMM>.xlsx`. Success requires `success=true`, exit code `0`, and at least one captured row for every requested product.
+7. Verify that the workbook has exactly one sheet named `Trip商品数据` and that its header follows the native field contract below. Every product must have a product name, at least one SKU level, currency, a non-empty display/real price, and only `trusted_base` or `trusted_promo` price statuses. Any `risk_blocked`, Cloudflare/Whaleguard note, unknown/untrusted status, missing required field, or visibly incomplete product makes the run unsuccessful even if the workbook exists.
 8. On valid success, emit only the bare absolute native workbook path specified above. The delivery guard performs the final allowlist check.
 
 ### Native manual-product workbook contract
@@ -513,9 +515,9 @@ Match priority:
 
 The map was built from a manually reviewed workbook (`廠商名稱未標注 回傳_Done.xlsx`, first sheet) and contains `商品ID / 完整网址 / 产品名称 -> 厂商名称` records. Preserve user-provided labels such as `TSim`, `BC`, `TGT`, `FR`, `JY`, and `OTH`; do not silently normalize them to a different spelling in outputs unless the user asks.
 
-## Cloudflare overlay note-only detection
+## Cloudflare/risk interception handling
 
-Trip SKU scraping may continue even when Trip displays a Cloudflare anti-bot overlay. The canonical DOM indicator observed by the user is:
+Trip may display a Cloudflare anti-bot overlay during SKU scraping. The canonical DOM indicator observed by the user is:
 
 ```html
 #guestLogin-sliderTntLoginBanneribu_nonmemberlogin_online_pic_cf_container
@@ -524,7 +526,7 @@ Trip SKU scraping may continue even when Trip displays a Cloudflare anti-bot ove
 
 Additional Turnstile widget indicators observed by the user include a checkbox label such as `驗證您是人類`, status text such as `正在驗證...`, failure/expiry text such as `驗證失敗` / `驗證已過期`, element `#challenge-error-text`, and links to `cloudflare.com/products/turnstile` or `/cdn-cgi/challenge-platform/help`.
 
-Operational rule: Cloudflare overlay detection is **note-only**. Do not auto-click the close button or checkbox, do not bypass the challenge, do not stop the URL, and do not change the normal row/export flow. The Go CDP CLI should only append `抓取备注=被Cloudflare拦截` to rows produced while/after the overlay was detected. If no overlay is detected, keep the XLSX shape unchanged; the `抓取备注` column is only appended when at least one row has a note.
+Operational rule: do not auto-click the close button or checkbox and do not bypass the challenge. Mark the affected product as `risk_blocked`, preserve the native workbook/diagnostic note, end the current browser session, and treat the overall selected-product run as unsuccessful. A row carrying `抓取备注=被Cloudflare拦截` must never remain eligible for successful delivery merely because it also contains a trusted price status.
 
 Log marker to inspect in `terminal_output.txt`:
 
@@ -532,7 +534,7 @@ Log marker to inspect in `terminal_output.txt`:
 cloudflare_overlay_detected
 ```
 
-Treat this separately from `risk challenge detected` / `whaleguard block`: Cloudflare overlay means “data may be abnormal; rows were still exported with a note”, not an automatic failed URL.
+Do not immediately loop on the same product. If an operator explicitly retries after a reasonable cooldown, keep `--no-headless --delay-profile normal --no-quality-rerun`; after another Cloudflare/risk interception, report `<产品ID> 价格抓取失败，原因：Trip.com/Cloudflare 风险拦截，未获得完整 SKU 价格。` and do not claim success.
 
 ## Run teardown and selective rerun
 
@@ -744,7 +746,7 @@ When the reported symptom is repeated prices such as many rows at HKD22/HKD33/HK
 - `references/standard-plaintext-report-regeneration-2026-06-16.md` — regenerate the scheduled SKU plaintext report in the user's standard format when a delivery accidentally contains only comparison lines; includes vendor order, Top5 sections, parsing cautions, and redelivery targets.
 - `references/ad-hoc-korea-sku-comparison-2026-06-16.md` — one-row fixed-list Korea SKU price scrape and `TSIM 網址` vendor comparison pattern, including source-row lookup, command, verification, and delivery package.
 - `references/default-delay-profile-defaults-2026-06-17.md` — current daily default policy (`normal`/`timeout`/`workers`) and the required cross-file update sequence for safe persistence.
-- `references/cloudflare-note-only-and-safe-delay-tuning-2026-06-17.md` — Cloudflare/Turnstile DOM indicators, note-only export behavior, and the planned safe-mode daily cron + SKU delay tuning migration checklist.
+- `references/cloudflare-note-only-and-safe-delay-tuning-2026-06-17.md` — historical Cloudflare/Turnstile DOM indicators and delay-tuning notes; its note-only success semantics are superseded by the current interception handling section.
 - `references/mode2-rating-product-info-contract-2026-06.md` — exact Mode2 contract, output columns, guardrails, and XLSX dimension pitfall.
 - `references/vendor-compare-architecture-2026-06-02.md` — generic vendor comparison component design, files changed, matched-only comparison principle, SKU normalization rules, JSON schema, and test results.
 - `references/go-cdp-only-repository-consolidation-2026-06-02.md` — project consolidation rules after the user accepted Go CDP output: remove/stop tracking old Python CLI/GUI/spec, keep Go CDP as the only action component/entry point, sync skill into project, and update README.

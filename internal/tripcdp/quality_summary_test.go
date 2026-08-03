@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-func TestQualityRunSummaryWritesFailedArtifacts(t *testing.T) {
+func TestQualityRunSummaryWritesJSONWithoutDiagnosticWorkbook(t *testing.T) {
 	dir := t.TempDir()
 	failures := []qualityFailureSummary{{
 		Vendor:             "TGT",
@@ -38,8 +38,11 @@ func TestQualityRunSummaryWritesFailedArtifacts(t *testing.T) {
 	}
 
 	jsonPath, xlsxPath := emitQualityRunSummary(dir, summary, nil)
-	if jsonPath == "" || xlsxPath == "" {
-		t.Fatalf("expected artifact paths, got json=%q xlsx=%q", jsonPath, xlsxPath)
+	if jsonPath == "" {
+		t.Fatalf("expected JSON artifact path, got %q", jsonPath)
+	}
+	if xlsxPath != "" {
+		t.Fatalf("diagnostic workbook must not be generated, got %q", xlsxPath)
 	}
 	raw, err := os.ReadFile(jsonPath)
 	if err != nil {
@@ -52,8 +55,8 @@ func TestQualityRunSummaryWritesFailedArtifacts(t *testing.T) {
 	if len(decoded) != 1 || decoded[0].ProductID != "45861197" || !strings.Contains(decoded[0].RetryCommand, "trip-score-cdp") {
 		t.Fatalf("unexpected decoded failures: %+v", decoded)
 	}
-	if _, err := os.Stat(xlsxPath); err != nil {
-		t.Fatal(err)
+	if _, err := os.Stat(dir + "/_diagnostics/failed_quality_urls.xlsx"); !os.IsNotExist(err) {
+		t.Fatalf("diagnostic workbook exists or could not be checked: %v", err)
 	}
 }
 

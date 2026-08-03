@@ -285,7 +285,7 @@ readlink /Users/example/.hermes/plugins/trip-manual-delivery-guard
 
 Hermes Agent 发现 Skill 后，应完整读取其中对应章节。项目不再维护用户目录下的 Skill 或插件代码副本。当修改抓取、比价、cron 或报告逻辑时，应同步更新该 Skill。
 
-Hermes 手动抓取单个或数个指定产品时，固定使用项目根目录构建的 `./trip-score-price-scraper`，以重复 `-input` 传入产品，并使用 `-no-headless -delay-profile fast -product-info -no-quality-rerun -output-dir <manual-dir>`。运营提示词如 `【請抓取產品價格71827107】` 会按产品 ID 构造香港站 HKD URL。有效成功时只交付原生 XLSX 附件，不发送平文本价格、产品/SKU 摘要或二次整理表。只有失败、部分 SKU 点击失败、反爬/API 拦截、超时/中断、部分产品失败或原生 Excel 校验异常可以显示单行提示。批量和 cron 任务继续使用各自章节的参数。
+Hermes 手动抓取单个或数个指定产品时，固定使用项目根目录构建的 `./trip-score-price-scraper`，以重复 `-input` 传入产品，并使用 `-no-headless -delay-profile normal -product-info -no-quality-rerun -output-dir <manual-dir>`。运营提示词如 `【請抓取產品價格71827107】` 会按产品 ID 构造香港站 HKD URL。该流程是有头单 worker 顺序抓取；Cloudflare/风险拦截、未知价格状态或缺少产品名、SKU、货币、价格任一必填数据时，即使已保留原生 Excel 也返回非零退出码。有效成功时只交付原生 XLSX 附件，不发送平文本价格、产品/SKU 摘要或二次整理表。只有失败、部分 SKU 点击失败、反爬/API 拦截、超时/中断、部分产品失败或原生 Excel 校验异常可以显示单行提示。批量和 cron 任务继续使用各自章节的参数。
 
 ## 验证
 

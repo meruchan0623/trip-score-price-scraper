@@ -517,6 +517,8 @@ func (s *tripScraper) scrapeOne(ctx context.Context, item ScrapeItem, index int,
 	}
 	base := Event{"vendor": s.vendor, "worker_id": s.workerID, "url_index": index, "url_total": total, "url": item.URL, "global_total": s.globalTotal}
 	target := newNavigationTarget(item.URL)
+	canonicalItem := item
+	canonicalItem.URL = target.NavigateURL
 	s.restartAfterURL = false
 	s.restartReason = ""
 	s.currentScrapeNote = ""
@@ -535,11 +537,12 @@ func (s *tripScraper) scrapeOne(ctx context.Context, item ScrapeItem, index int,
 		s.currentQualityRetryAttempt = priceQualityRetries
 		s.restartAfterURL = false
 		s.restartReason = ""
-		rows, snapshot, retry, err := s.scrapeOneAttempt(ctx, item, target, base, pageAttempt)
+		rows, snapshot, retry, err := s.scrapeOneAttempt(ctx, canonicalItem, target, base, pageAttempt)
 		lastSnapshot = snapshot
 		if err != nil {
-			return s.errorRows(item, err, started, base)
+			return s.errorRows(canonicalItem, err, started, base)
 		}
+		invalidateNonHKDPriceRows(rows)
 		if !retry {
 			restartAfterURL := s.restartAfterURL
 			restartReason := s.restartReason
@@ -560,7 +563,7 @@ func (s *tripScraper) scrapeOne(ctx context.Context, item ScrapeItem, index int,
 				s.clearBatchPromotionResponses()
 				if priceQualityRetries >= 2 {
 					if err := s.restartBrowser(ctx, "price quality retry: "+qualityFailure.failReason); err != nil {
-						return s.errorRows(item, err, started, base)
+						return s.errorRows(canonicalItem, err, started, base)
 					}
 				} else {
 					s.cleanupAfterURL()
@@ -569,10 +572,10 @@ func (s *tripScraper) scrapeOne(ctx context.Context, item ScrapeItem, index int,
 			}
 			if priceQualityRetries > 0 && trustedRows > 0 && firstQualityFailure != nil {
 				firstQualityFailure.recovered = true
-				s.emitPriceQualityRecovered(item, firstQualityFailure, priceQualityRetries, trustedRows, untrustedRows, base)
+				s.emitPriceQualityRecovered(canonicalItem, firstQualityFailure, priceQualityRetries, trustedRows, untrustedRows, base)
 			}
 			if qualityFailure != nil && qualityFailure.failed {
-				s.emitURLQualityFailed(item, qualityFailure)
+				s.emitURLQualityFailed(canonicalItem, qualityFailure)
 			} else if priceQualityRetries > 0 && trustedRows > 0 && firstQualityFailure != nil {
 				qualityFailed = false
 			}
@@ -590,7 +593,7 @@ func (s *tripScraper) scrapeOne(ctx context.Context, item ScrapeItem, index int,
 			s.emit(mergeEvent(Event{"event": "risk_challenge_detected", "stage": "risk", "message": "whaleguard block; cooling down and retrying URL", "risk_kind": snapshot.RiskKind, "http_status": snapshot.HTTPStatus, "body_preview": snapshot.BodyPreview, "cooldown_ms": cooldown.Milliseconds(), "retry_after_risk": true, "risk_retry_count": pageAttempt, "final_url": snapshot.URL}, base))
 			s.cleanupAfterURL()
 			if err := s.restartBrowserNoSessionSave(ctx, "whaleguard block"); err != nil {
-				return s.errorRows(item, err, started, base)
+				return s.errorRows(canonicalItem, err, started, base)
 			}
 			s.enableRiskProtection()
 			if !sleepFixed(ctx, cooldown) {
@@ -601,22 +604,41 @@ func (s *tripScraper) scrapeOne(ctx context.Context, item ScrapeItem, index int,
 		}
 		s.emit(mergeEvent(Event{"event": "page_retry", "stage": "page_open", "message": "page did not load valid product content; restarting browser and retrying URL", "attempt": pageAttempt, "max_attempts": 2, "snapshot": snapshot}, base))
 		if err := s.restartBrowser(ctx, "page unhealthy before extraction"); err != nil {
-			return s.errorRows(item, err, started, base)
+			return s.errorRows(canonicalItem, err, started, base)
 		}
 		pageAttempt++
 	}
 	if isWhaleguardSnapshot(lastSnapshot) {
 		s.emit(mergeEvent(Event{"event": "risk_challenge_detected", "stage": "risk", "message": "whaleguard block after retry", "risk_kind": lastSnapshot.RiskKind, "http_status": lastSnapshot.HTTPStatus, "body_preview": lastSnapshot.BodyPreview, "retry_after_risk": false, "risk_retry_count": 1, "final_url": lastSnapshot.URL}, base))
-		rows := []map[string]string{s.riskBlockedRow(item, "whaleguard block")}
+		rows := []map[string]string{s.riskBlockedRow(canonicalItem, "whaleguard block")}
 		s.emit(mergeEvent(Event{"event": "url_done", "rows": len(rows), "elapsed_ms": elapsedMS(started), "final_url": lastSnapshot.URL, "page_valid": false, "page_retry_count": 1, "restart_after_url": false, "risk_kind": lastSnapshot.RiskKind, "http_status": lastSnapshot.HTTPStatus}, base))
 		s.cleanupAfterURL()
 		_ = s.restartBrowserNoSessionSave(ctx, "whaleguard block after retry")
 		return rows
 	}
 	s.emit(mergeEvent(Event{"event": "page_unhealthy", "stage": "extract", "message": "页面未加载有效商品内容", "snapshot": lastSnapshot}, base))
-	rows := []map[string]string{s.errorRow(item, "页面未加载有效商品内容")}
+	rows := []map[string]string{s.errorRow(canonicalItem, "页面未加载有效商品内容")}
 	s.emit(mergeEvent(Event{"event": "url_done", "rows": len(rows), "elapsed_ms": elapsedMS(started), "final_url": lastSnapshot.URL, "page_valid": false, "page_retry_count": 2, "restart_after_url": false}, base))
 	return rows
+}
+
+func invalidateNonHKDPriceRows(rows []map[string]string) {
+	for _, row := range rows {
+		currency := strings.ToUpper(strings.TrimSpace(row["货币"]))
+		if currency == "" || currency == "N/A" || currency == "HKD" {
+			continue
+		}
+		for _, key := range []string{"货币", "外显价格", "实价", "促销标签"} {
+			row[key] = ""
+		}
+		row["价格状态"] = "currency_mismatch"
+		note := "非HKD价格已拒绝"
+		if existing := strings.TrimSpace(row["抓取备注"]); existing != "" {
+			row["抓取备注"] = existing + "；" + note
+		} else {
+			row["抓取备注"] = note
+		}
+	}
 }
 
 func (s *tripScraper) scrapeOneAttempt(ctx context.Context, item ScrapeItem, target navigationTarget, base Event, attempt int) ([]map[string]string, pageSnapshot, bool, error) {
@@ -660,7 +682,9 @@ func (s *tripScraper) scrapeOneAttempt(ctx context.Context, item ScrapeItem, tar
 	}
 	snapshot, waitMS := s.waitProductPageReady(ctx, 12*time.Second)
 	snapshot.withNavigationStatus(navStatus, navURL)
-	s.recordCloudflareIfPresent("page_open", base)
+	if s.recordCloudflareIfPresent("page_open", base) {
+		return []map[string]string{s.riskBlockedRow(item, "cloudflare overlay detected during navigation")}, snapshot, false, nil
+	}
 	if isWhaleguardSnapshot(snapshot) {
 		s.emit(mergeEvent(Event{"event": "risk_challenge_detected", "stage": "page_open", "message": "whaleguard block detected during navigation", "risk_kind": snapshot.RiskKind, "http_status": snapshot.HTTPStatus, "body_preview": snapshot.BodyPreview, "final_url": snapshot.URL}, base))
 		return nil, snapshot, true, nil
@@ -2612,7 +2636,7 @@ func (s *tripScraper) markCloudflareBlocked(stage string, base Event, reason str
 	s.emit(mergeEvent(Event{
 		"event":        "cloudflare_overlay_detected",
 		"stage":        stage,
-		"message":      firstNonEmpty(reason, "Cloudflare overlay detected; note only, continuing scrape"),
+		"message":      firstNonEmpty(reason, "Cloudflare overlay detected; current URL must not be treated as successful"),
 		"scrape_note":  s.currentScrapeNote,
 		"body_preview": bodyPreview,
 	}, base))
@@ -3041,6 +3065,13 @@ func (s *tripScraper) applyCurrentScrapeNote(row map[string]string) {
 	note := strings.TrimSpace(s.currentScrapeNote)
 	if note == "" || row == nil {
 		return
+	}
+	if !s.request.RatingOnly && strings.Contains(strings.ToLower(note), "cloudflare") {
+		row["价格状态"] = priceStatusRiskBlocked
+		row["价格来源"] = priceSourceBatchPromotion
+		for _, key := range []string{"货币", "外显价格", "实价", "促销标签", "资源ID", "接口ItemID", "促销命中", "原始捕获价格"} {
+			row[key] = ""
+		}
 	}
 	if existing := strings.TrimSpace(row["抓取备注"]); existing != "" {
 		if !strings.Contains(existing, note) {

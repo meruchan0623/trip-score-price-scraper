@@ -27,16 +27,19 @@ func newNavigationTarget(rawURL string) navigationTarget {
 	if err != nil {
 		return target
 	}
-	target.Host = strings.ToLower(parsed.Hostname())
-	if target.Host != "hk.trip.com" {
+	sourceHost := strings.ToLower(parsed.Hostname())
+	if sourceHost != "trip.com" && !strings.HasSuffix(sourceHost, ".trip.com") {
 		return target
 	}
+	parsed.Scheme = "https"
+	parsed.Host = "hk.trip.com"
 	values := parsed.Query()
-	values.Set("locale", "zh-hk")
+	values.Set("locale", "zh-HK")
 	values.Set("curr", "HKD")
 	parsed.RawQuery = values.Encode()
+	target.Host = "hk.trip.com"
 	target.NavigateURL = parsed.String()
-	target.Locale = "zh-hk"
+	target.Locale = "zh-HK"
 	target.Currency = "HKD"
 	target.AcceptLanguage = hkAcceptLanguage
 	target.IsHK = true

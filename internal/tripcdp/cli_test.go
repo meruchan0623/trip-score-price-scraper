@@ -119,7 +119,7 @@ func TestBoolFlagsDoNotRequireValues(t *testing.T) {
 func TestParseManualSelectedProductsContract(t *testing.T) {
 	request, runMode, _, _, _, err := parseArgs([]string{
 		"-no-headless",
-		"-delay-profile", "fast",
+		"-delay-profile", "normal",
 		"-input", "https://hk.trip.com/things-to-do/detail/109223304/?locale=zh-HK&curr=HKD",
 		"-input", "https://hk.trip.com/things-to-do/detail/109223305/?locale=zh-HK&curr=HKD",
 		"-output-dir", "/Users/example/Documents/trip-sku-price-scrape/manual-selected",
@@ -138,8 +138,8 @@ func TestParseManualSelectedProductsContract(t *testing.T) {
 	if request.BrowserOptions.Headless {
 		t.Fatal("manual selected-product scrape should use a visible browser")
 	}
-	if request.DelayOptions.Profile != "fast" {
-		t.Fatalf("delay profile = %q, want fast", request.DelayOptions.Profile)
+	if request.DelayOptions.Profile != "normal" {
+		t.Fatalf("delay profile = %q, want normal", request.DelayOptions.Profile)
 	}
 	if request.OutputDir != "/Users/example/Documents/trip-sku-price-scrape/manual-selected" {
 		t.Fatalf("output dir = %q", request.OutputDir)

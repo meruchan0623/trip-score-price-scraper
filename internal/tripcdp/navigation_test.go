@@ -18,8 +18,8 @@ func TestNavigationTargetNormalizesHKURL(t *testing.T) {
 		t.Fatal(err)
 	}
 	values := parsed.Query()
-	if values.Get("locale") != "zh-hk" {
-		t.Fatalf("locale = %q, want zh-hk", values.Get("locale"))
+	if values.Get("locale") != "zh-HK" {
+		t.Fatalf("locale = %q, want zh-HK", values.Get("locale"))
 	}
 	if values.Get("curr") != "HKD" {
 		t.Fatalf("curr = %q, want HKD", values.Get("curr"))
@@ -32,14 +32,32 @@ func TestNavigationTargetNormalizesHKURL(t *testing.T) {
 	}
 }
 
-func TestNavigationTargetPreservesNonHKURL(t *testing.T) {
-	raw := "https://sg.trip.com/things-to-do/detail/92237157/?locale=en-sg"
-	target := newNavigationTarget(raw)
-	if target.NavigateURL != raw {
-		t.Fatalf("non-HK URL changed: %s", target.NavigateURL)
+func TestNavigationTargetForcesAnyTripURLToHongKongHKD(t *testing.T) {
+	target := newNavigationTarget("https://sg.trip.com/things-to-do/detail/92237157/?locale=en-sg&curr=CNY&foo=bar")
+	if !target.IsHK {
+		t.Fatal("Trip URL should be marked HK")
 	}
-	if target.IsHK {
-		t.Fatal("non-HK target should not be marked HK")
+	parsed, err := url.Parse(target.NavigateURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Scheme != "https" || parsed.Hostname() != "hk.trip.com" {
+		t.Fatalf("navigate URL = %q, want https://hk.trip.com", target.NavigateURL)
+	}
+	values := parsed.Query()
+	if values.Get("locale") != "zh-HK" || values.Get("curr") != "HKD" {
+		t.Fatalf("HK query = locale=%q curr=%q", values.Get("locale"), values.Get("curr"))
+	}
+	if values.Get("foo") != "bar" {
+		t.Fatalf("existing query was not preserved: %s", target.NavigateURL)
+	}
+}
+
+func TestNavigationTargetPreservesNonTripURL(t *testing.T) {
+	raw := "https://example.com/things-to-do/detail/92237157/?curr=CNY"
+	target := newNavigationTarget(raw)
+	if target.NavigateURL != raw || target.IsHK {
+		t.Fatalf("non-Trip URL should remain unchanged: %+v", target)
 	}
 }
 

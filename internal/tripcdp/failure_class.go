@@ -65,15 +65,15 @@ func ClassifyRows(rows []map[string]string) FailureClass {
 	for _, row := range rows {
 		status := strings.TrimSpace(row["价格状态"])
 		note := strings.ToLower(strings.TrimSpace(row["抓取备注"] + " " + row["评分"]))
+		if status == priceStatusRiskBlocked || strings.Contains(note, "whaleguard") || strings.Contains(note, "cloudflare") {
+			return FailureRiskChallenge
+		}
 		if isTrustedPriceStatus(status) {
 			trusted++
 			continue
 		}
 		if status != "" {
 			untrusted++
-		}
-		if status == priceStatusRiskBlocked || strings.Contains(note, "whaleguard") || strings.Contains(note, "cloudflare") {
-			return FailureRiskChallenge
 		}
 		if status == priceStatusUntrustedResourceMiss || strings.Contains(note, "resource_miss") || strings.Contains(note, "价格质量检查失败") {
 			resourceMiss++

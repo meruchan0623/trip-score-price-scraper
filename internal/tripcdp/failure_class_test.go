@@ -49,6 +49,17 @@ func TestClassifyRowsRiskBlocked(t *testing.T) {
 	}
 }
 
+func TestClassifyRowsCloudflareNoteOverridesTrustedPrice(t *testing.T) {
+	rows := []map[string]string{{
+		"价格状态": priceStatusTrustedPromo,
+		"实价":   "19.90",
+		"抓取备注": "被Cloudflare拦截",
+	}}
+	if class := ClassifyRows(rows); class != FailureRiskChallenge {
+		t.Fatalf("class = %q, want %q", class, FailureRiskChallenge)
+	}
+}
+
 func TestClassifyRowsBusinessUnavailableForSingleResourceMissWithoutDiagnostics(t *testing.T) {
 	rows := []map[string]string{{"价格状态": priceStatusUntrustedResourceMiss, "资源ID": "0", "接口ItemID": "0", "抓取备注": "价格质量检查失败: consecutive_resource_miss"}}
 	if class := ClassifyRows(rows); class != FailureBusinessUnavailable {
