@@ -78,6 +78,22 @@ func TestPageSnapshotInvalidNoSKUBlocksFallback(t *testing.T) {
 	}
 }
 
+func TestMarketContextFailureBlocksPriceExtraction(t *testing.T) {
+	for _, class := range []string{"market_context_mismatch", "market_context_unverified"} {
+		snapshot := pageSnapshot{
+			URL:                "https://sg.trip.com/things-to-do/detail/45892282/",
+			ReadyState:         "complete",
+			BodyTextLength:     2000,
+			HasProductTitle:    true,
+			HasPrice:           true,
+			MarketContextClass: class,
+		}
+		if isProductPageExtractable(snapshot, false) {
+			t.Errorf("%s accepted", class)
+		}
+	}
+}
+
 func TestSessionStorageOriginOnlyOnce(t *testing.T) {
 	scraper := newTripScraper(TaskRequest{}, nil, defaultVendor, 1, 1)
 	if !scraper.shouldApplySessionStorage("https://hk.trip.com/things-to-do/detail/1/?locale=zh-hk") {

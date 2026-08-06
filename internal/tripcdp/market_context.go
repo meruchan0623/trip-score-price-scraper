@@ -10,6 +10,50 @@ type MarketContext struct {
 	PricePrefixes                                        []string
 }
 
+// marketObservation contains only the public values needed to verify the
+// market returned by Trip after navigation. It deliberately excludes raw
+// cookies, headers, storage, and account identifiers.
+type marketObservation struct {
+	Host     string `json:"host"`
+	SiteID   string `json:"site_id"`
+	Locale   string `json:"locale"`
+	Currency string `json:"currency"`
+}
+
+type marketContextError struct {
+	Class    string
+	Expected MarketContext
+	Observed marketObservation
+}
+
+func (e *marketContextError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return e.Class
+}
+
+func validateMarketObservation(expected MarketContext, observed marketObservation) error {
+	observed.Host = strings.ToLower(strings.TrimSpace(observed.Host))
+	observed.SiteID = strings.ToUpper(strings.TrimSpace(observed.SiteID))
+	observed.Locale = normalizeLocale(observed.Locale)
+	observed.Currency = strings.ToUpper(strings.TrimSpace(observed.Currency))
+	expectedHost := strings.ToLower(strings.TrimSpace(expected.Host))
+	expectedSiteID := strings.ToUpper(strings.TrimSpace(expected.SiteID))
+	expectedLocale := normalizeLocale(expected.Locale)
+	expectedCurrency := strings.ToUpper(strings.TrimSpace(expected.Currency))
+	if (observed.Host != "" && observed.Host != expectedHost) ||
+		(observed.SiteID != "" && observed.SiteID != expectedSiteID) ||
+		(observed.Locale != "" && observed.Locale != expectedLocale) ||
+		(observed.Currency != "" && observed.Currency != expectedCurrency) {
+		return &marketContextError{Class: "market_context_mismatch", Expected: expected, Observed: observed}
+	}
+	if observed.Host == "" || observed.SiteID == "" || observed.Locale == "" || observed.Currency == "" {
+		return &marketContextError{Class: "market_context_unverified", Expected: expected, Observed: observed}
+	}
+	return nil
+}
+
 var marketSites = []MarketContext{
 	{Code: "global", SiteID: "EN", Host: "www.trip.com", Locale: "en-XX", Currency: "USD"},
 	{Code: "hk", SiteID: "HK", Host: "hk.trip.com", Locale: "zh-HK", Currency: "HKD"},
