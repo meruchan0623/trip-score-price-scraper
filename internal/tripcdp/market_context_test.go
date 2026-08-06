@@ -1,6 +1,9 @@
 package tripcdp
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
 func TestSiteRegistryMatchesVerifiedDefaults(t *testing.T) {
 	if got := len(supportedSiteCodes()); got != 33 {
@@ -57,6 +60,37 @@ func TestAdvertisedTTDLocalesAndOverrides(t *testing.T) {
 	for _, bad := range [][3]string{{"xx", "", ""}, {"hk", "ja-US", "HKD"}, {"hk", "zh-HK", "ZZZ"}} {
 		if _, err := resolveMarketContext(bad[0], bad[1], bad[2]); err == nil {
 			t.Errorf("accepted %v", bad)
+		}
+	}
+}
+
+func TestValidateMarketObservation(t *testing.T) {
+	expected, err := resolveMarketContext("sg", "zh-SG", "MYR")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name     string
+		observed marketObservation
+		class    string
+	}{
+		{"match", marketObservation{"sg.trip.com", "SG", "zh-SG", "MYR"}, ""},
+		{"host", marketObservation{"hk.trip.com", "SG", "zh-SG", "MYR"}, "market_context_mismatch"},
+		{"host despite missing secondary evidence", marketObservation{Host: "hk.trip.com"}, "market_context_mismatch"},
+		{"locale", marketObservation{"sg.trip.com", "SG", "en-SG", "MYR"}, "market_context_mismatch"},
+		{"currency", marketObservation{"sg.trip.com", "SG", "zh-SG", "SGD"}, "market_context_mismatch"},
+		{"missing", marketObservation{Host: "sg.trip.com"}, "market_context_unverified"},
+	}
+	for _, c := range cases {
+		err := validateMarketObservation(expected, c.observed)
+		if c.class == "" && err != nil {
+			t.Errorf("%s: %v", c.name, err)
+		}
+		if c.class != "" {
+			var contextErr *marketContextError
+			if !errors.As(err, &contextErr) || contextErr.Class != c.class {
+				t.Errorf("%s: %#v", c.name, err)
+			}
 		}
 	}
 }

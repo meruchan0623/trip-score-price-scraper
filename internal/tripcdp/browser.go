@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -63,12 +64,13 @@ const (
 )
 
 const (
-	priceStatusTrustedPromo          = "trusted_promo"
-	priceStatusTrustedBase           = "trusted_base"
-	priceStatusUntrustedResourceMiss = "untrusted_resource_miss"
-	priceStatusUntrustedPriceMissing = "untrusted_price_missing"
-	priceStatusRiskBlocked           = "risk_blocked"
-	priceStatusPartialUnhealthy      = "partial_unhealthy"
+	priceStatusTrustedPromo           = "trusted_promo"
+	priceStatusTrustedBase            = "trusted_base"
+	priceStatusUntrustedResourceMiss  = "untrusted_resource_miss"
+	priceStatusUntrustedPriceMissing  = "untrusted_price_missing"
+	priceStatusUntrustedMarketContext = "untrusted_market_context"
+	priceStatusRiskBlocked            = "risk_blocked"
+	priceStatusPartialUnhealthy       = "partial_unhealthy"
 
 	priceSourceBatchPromotion = "batchSearchBookingSalesPromotion"
 )
@@ -155,22 +157,55 @@ type productSalesVolume struct {
 }
 
 type pageSnapshot struct {
-	URL             string `json:"url"`
-	ReadyState      string `json:"ready_state"`
-	BodyTextLength  int    `json:"body_text_length"`
-	Title           string `json:"title"`
-	HasProductTitle bool   `json:"has_product_title"`
-	HasSKU          bool   `json:"has_sku"`
-	HasPrice        bool   `json:"has_price"`
-	HasScore        bool   `json:"has_score"`
-	RiskChallenge   bool   `json:"risk_challenge"`
-	RiskKind        string `json:"risk_kind"`
-	CloudflareBlock bool   `json:"cloudflare_block"`
-	HTTPStatus      int    `json:"http_status"`
-	ResponseURL     string `json:"response_url"`
-	BodyPreview     string `json:"body_preview"`
-	EvalError       string `json:"eval_error"`
+	URL                string            `json:"url"`
+	ReadyState         string            `json:"ready_state"`
+	BodyTextLength     int               `json:"body_text_length"`
+	Title              string            `json:"title"`
+	HasProductTitle    bool              `json:"has_product_title"`
+	HasSKU             bool              `json:"has_sku"`
+	HasPrice           bool              `json:"has_price"`
+	HasScore           bool              `json:"has_score"`
+	RiskChallenge      bool              `json:"risk_challenge"`
+	RiskKind           string            `json:"risk_kind"`
+	CloudflareBlock    bool              `json:"cloudflare_block"`
+	HTTPStatus         int               `json:"http_status"`
+	ResponseURL        string            `json:"response_url"`
+	BodyPreview        string            `json:"body_preview"`
+	EvalError          string            `json:"eval_error"`
+	Market             marketObservation `json:"market"`
+	MarketContextClass string            `json:"market_context_class"`
 }
+
+const readMarketObservationJS = `() => {
+	const out = {host: (location.hostname || '').toLowerCase(), site_id: '', locale: '', currency: ''};
+	const norm = value => String(value || '').replace('_', '-');
+	const preference = name => {
+		for (const part of (document.cookie || '').split(';')) {
+			const index = part.indexOf('=');
+			if (index < 0 || part.slice(0, index).trim() !== name) continue;
+			try { return decodeURIComponent(part.slice(index + 1)); } catch (_) { return part.slice(index + 1); }
+		}
+		return '';
+	};
+	out.site_id = String(preference('ibusite') || '').toUpperCase();
+	out.locale = norm(preference('ibulocale'));
+	out.currency = String(preference('cookiePricesDisplayed') || '').toUpperCase();
+	const visit = value => {
+		if (!value || typeof value !== 'object') return false;
+		const site = value.site || value.siteId || value.siteID;
+		if (site && value.locale && value.currency) {
+			out.site_id = String(site).toUpperCase();
+			out.locale = norm(value.locale);
+			out.currency = String(value.currency).toUpperCase();
+			return true;
+		}
+		return Object.values(value).some(visit);
+	};
+	for (const element of document.querySelectorAll('[data-cargo]')) {
+		try { if (visit(JSON.parse(element.getAttribute('data-cargo') || '{}'))) break; } catch (_) {}
+	}
+	return out;
+}`
 
 type navigationMonitor struct {
 	mu             sync.Mutex
@@ -867,6 +902,29 @@ func (s *tripScraper) scrapeOneAttempt(ctx context.Context, item ScrapeItem, tar
 		s.emit(mergeEvent(Event{"event": "page_unhealthy", "stage": "lazy_load", "message": "product DOM is not extractable after lazy-load scrolling", "wait_ms": waitMS, "snapshot": snapshot}, base))
 		return nil, snapshot, true, nil
 	}
+	observation, observationErr := s.readMarketObservation()
+	snapshot.Market = observation
+	if observationErr != nil {
+		snapshot.MarketContextClass = "market_context_unverified"
+		observationErr = &marketContextError{Class: snapshot.MarketContextClass, Expected: target.Market, Observed: observation}
+	} else if err := validateMarketObservation(target.Market, observation); err != nil {
+		var contextErr *marketContextError
+		if errors.As(err, &contextErr) {
+			snapshot.Market = contextErr.Observed
+			snapshot.MarketContextClass = contextErr.Class
+			observationErr = contextErr
+		} else {
+			snapshot.MarketContextClass = "market_context_unverified"
+			observationErr = &marketContextError{Class: snapshot.MarketContextClass, Expected: target.Market, Observed: observation}
+		}
+	}
+	if observationErr != nil {
+		contextErr, _ := observationErr.(*marketContextError)
+		s.emit(mergeEvent(marketContextFailedEvent(target.Market, snapshot.Market, snapshot.MarketContextClass), base))
+		if !s.request.RatingOnly || snapshot.MarketContextClass != "market_context_unverified" || !strings.EqualFold(snapshot.Market.Host, target.Market.Host) {
+			return []map[string]string{s.marketContextBlockedRow(item, target.Market, contextErr)}, snapshot, false, nil
+		}
+	}
 	s.emit(mergeEvent(Event{"event": "log", "stage": "extract", "message": "extracting page"}, base))
 	rows, valid := s.extractRows(ctx, item, snapshot)
 	if s.recordCloudflareIfPresent("after_extract", base) {
@@ -885,6 +943,47 @@ func (s *tripScraper) scrapeOneAttempt(ctx context.Context, item ScrapeItem, tar
 func (s *tripScraper) errorRows(item ScrapeItem, err error, started time.Time, base Event) []map[string]string {
 	s.emit(mergeEvent(Event{"event": "url_failed", "error": err.Error(), "elapsed_ms": elapsedMS(started)}, base))
 	return []map[string]string{s.errorRow(item, err.Error())}
+}
+
+func (s *tripScraper) marketContextBlockedRow(item ScrapeItem, expected MarketContext, contextErr *marketContextError) map[string]string {
+	observed := marketObservation{}
+	class := "market_context_unverified"
+	if contextErr != nil {
+		observed = contextErr.Observed
+		class = contextErr.Class
+	}
+	row := s.errorRow(item, class)
+	if s.request.RatingOnly {
+		return row
+	}
+	row["价格状态"] = priceStatusUntrustedMarketContext
+	if observed.Currency != "" && !strings.EqualFold(observed.Currency, expected.Currency) {
+		row["价格状态"] = "currency_mismatch"
+	}
+	row["价格来源"] = ""
+	row["原始捕获价格"] = ""
+	for _, key := range []string{"货币", "外显价格", "实价", "促销标签", "资源ID", "接口ItemID", "促销命中"} {
+		row[key] = ""
+	}
+	row["抓取备注"] = class
+	return row
+}
+
+func marketContextFailedEvent(expected MarketContext, observed marketObservation, class string) Event {
+	return Event{
+		"event":                    "market_context_failed",
+		"stage":                    "market_context",
+		"message":                  "returned market context does not match the requested market",
+		"market_context_class":     class,
+		"expected_market_host":     expected.Host,
+		"expected_market_site_id":  expected.SiteID,
+		"expected_market_locale":   expected.Locale,
+		"expected_market_currency": expected.Currency,
+		"observed_market_host":     observed.Host,
+		"observed_market_site_id":  observed.SiteID,
+		"observed_market_locale":   observed.Locale,
+		"observed_market_currency": observed.Currency,
+	}
 }
 
 func countPriceQualityRows(rows []map[string]string) (trusted int, untrusted int, failed bool) {
@@ -2647,6 +2746,9 @@ func isProductPageExtractable(snapshot pageSnapshot, ratingOnly bool) bool {
 	if snapshot.RiskChallenge {
 		return false
 	}
+	if snapshot.MarketContextClass != "" {
+		return ratingOnly && snapshot.MarketContextClass == "market_context_unverified" && strings.TrimSpace(snapshot.Market.Host) != ""
+	}
 	if ratingOnly {
 		return snapshot.HasProductTitle || snapshot.HasScore || snapshot.HasPrice || snapshot.HasSKU
 	}
@@ -3503,6 +3605,18 @@ func (s *tripScraper) evalString(js string, args ...any) string {
 		return ""
 	}
 	return out
+}
+
+func (s *tripScraper) readMarketObservation() (marketObservation, error) {
+	var observed marketObservation
+	if err := s.evalJSON(&observed, readMarketObservationJS); err != nil {
+		return marketObservation{}, err
+	}
+	observed.Host = strings.ToLower(strings.TrimSpace(observed.Host))
+	observed.SiteID = strings.ToUpper(strings.TrimSpace(observed.SiteID))
+	observed.Locale = normalizeLocale(observed.Locale)
+	observed.Currency = strings.ToUpper(strings.TrimSpace(observed.Currency))
+	return observed, nil
 }
 
 func (s *tripScraper) evalJSON(out any, js string, args ...any) error {
