@@ -1020,13 +1020,15 @@ func TestStablePriceBundleKeepsDelayedRealAndPromo(t *testing.T) {
 }
 
 func TestIsValidDisplayPrice(t *testing.T) {
-	if !isValidDisplayPrice("HK$ 1,234.50") {
+	hk, _ := resolveMarketContext("hk", "", "")
+	if !isValidDisplayPriceForMarket("HK$ 1,234.50", hk) {
 		t.Fatal("expected HK$ price with space and comma to be valid")
 	}
-	if !isValidDisplayPrice("S$ 0.11") {
+	sg, _ := resolveMarketContext("sg", "", "")
+	if !isValidDisplayPriceForMarket("S$ 0.11", sg) {
 		t.Fatal("expected S$ price to be valid")
 	}
-	if isValidDisplayPrice("N/A") || isValidDisplayPrice("USD 1") {
+	if isValidDisplayPriceForMarket("N/A", hk) || isValidDisplayPriceForMarket("USD 1", hk) {
 		t.Fatal("unexpected valid display price")
 	}
 }
