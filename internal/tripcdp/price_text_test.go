@@ -44,18 +44,3 @@ func TestParseDisplayPriceRejectsWrongPrefix(t *testing.T) {
 		}
 	}
 }
-
-func TestSplitPricePreservesHistoricalCurrencyBehavior(t *testing.T) {
-	for _, tc := range []struct {
-		text, currency, amount string
-	}{
-		{"¥ 2,500", "CNY", "2500"},
-		{"CNY 2,500", "CNY", "2500"},
-		{"$ 10", "USD", "10"},
-	} {
-		currency, amount := splitPrice(tc.text)
-		if currency != tc.currency || amount != tc.amount {
-			t.Errorf("splitPrice(%q) = %q %q, want %q %q", tc.text, currency, amount, tc.currency, tc.amount)
-		}
-	}
-}

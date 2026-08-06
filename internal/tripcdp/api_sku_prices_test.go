@@ -68,6 +68,36 @@ func TestParseCapturedAPISKUPricesReportsTreeBoundaryWithoutInventingRows(t *tes
 	}
 }
 
+func TestCapturedAPISKUPricesUseExpectedCurrencyWhenResponseOmitsIt(t *testing.T) {
+	responses := []capturedAPIResponse{
+		{URL: "/restapi/soa2/21052/getProductInfo", Status: 200, Text: `{"productInfos":[{"basicInfo":{"packages":[{"packageId":11,"salesProperties":[],"resourceIds":[101]}]}}]}`},
+		{URL: "/restapi/soa2/14580/getProductPriceCalendar", Status: 200, Text: `{"data":{"packageInfos":[{"packageId":11,"resourceInfos":[{"resourceId":101}],"priceInfo":{"originalPrice":2500,"price":2200}}]}}`},
+	}
+
+	rows, coverage := parseCapturedAPISKUPrices(responses, "JPY", true)
+	if coverage.TreeCount != 1 || coverage.PricedCount != 1 || len(rows) != 1 {
+		t.Fatalf("rows=%d coverage=%+v", len(rows), coverage)
+	}
+	if rows[0]["currency"] != "JPY" || rows[0]["real_currency"] != "JPY" {
+		t.Fatalf("currencies = %q/%q, want JPY/JPY", rows[0]["currency"], rows[0]["real_currency"])
+	}
+}
+
+func TestCapturedAPISKUPricesRejectsExplicitUnexpectedCurrency(t *testing.T) {
+	responses := []capturedAPIResponse{
+		{URL: "/restapi/soa2/21052/getProductInfo", Status: 200, Text: `{"productInfos":[{"basicInfo":{"packages":[{"packageId":11,"salesProperties":[],"resourceIds":[101]}]}}]}`},
+		{URL: "/restapi/soa2/14580/getProductPriceCalendar", Status: 200, Text: `{"data":{"packageInfos":[{"packageId":11,"resourceInfos":[{"resourceId":101}],"priceInfo":{"currency":"USD","originalPrice":2500,"price":2200}}]}}`},
+	}
+
+	rows, coverage := parseCapturedAPISKUPrices(responses, "JPY", true)
+	if len(rows) != 0 {
+		t.Fatalf("explicit USD response must not produce a JPY row: %+v", rows)
+	}
+	if coverage.TreeCount != 1 || coverage.PricedCount != 0 || coverage.MissingPriceCount != 1 || coverage.Complete {
+		t.Fatalf("coverage = %+v, want one missing JPY price", coverage)
+	}
+}
+
 func TestParseCapturedAPISKUPricesKeepsResourcesDistinctWithinPackage(t *testing.T) {
 	responses := []capturedAPIResponse{
 		{URL: "/restapi/soa2/21052/getProductInfo", Status: 200, Text: `{"productInfos":[{"basicInfo":{"packages":[{"packageId":11,"salesProperties":[{"saleProperty":{"id":208,"name":"Days"},"salePropertyValues":[{"id":1,"name":"1 day"}]}],"resourceIds":[101,102]}]}}]}`},
