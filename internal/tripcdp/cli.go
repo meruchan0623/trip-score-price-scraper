@@ -38,7 +38,12 @@ func Run(argv []string) int {
 	_ = noColor
 	renderer := newRenderer(request.LogFile, logLevel, jsonLines)
 	result := scrape(request, renderer.emit, runMode)
-	renderer.emit(mergeEvent(Event{
+	renderer.emit(runDoneEvent(request, result))
+	return result.ExitCode
+}
+
+func runDoneEvent(request TaskRequest, result TaskResult) Event {
+	event := Event{
 		"event":                        "run_done",
 		"success":                      result.Success,
 		"exit_code":                    result.ExitCode,
@@ -53,8 +58,18 @@ func Run(argv []string) int {
 		"quality_rerun_attempted_urls": result.QualityRerunAttemptedURLs,
 		"quality_rerun_recovered_urls": result.QualityRerunRecoveredURLs,
 		"final_quality_failed_urls":    result.FinalQualityFailedURLs,
-	}, marketEventFields(request.Market)))
-	return result.ExitCode
+	}
+	if request.Market.Code != "" {
+		event = mergeEvent(event, marketEventFields(request.Market))
+	}
+	if result.MarketCount > 0 {
+		event["market_count"] = result.MarketCount
+		event["successful_market_count"] = result.SuccessfulMarketCount
+		event["failed_market_count"] = result.FailedMarketCount
+		event["partial_success"] = result.PartialSuccess
+		event["market_results"] = multiMarketResultFields(result.MarketResults)
+	}
+	return event
 }
 
 func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bool, bool, error) {

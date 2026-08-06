@@ -15,6 +15,9 @@ import (
 )
 
 func scrape(request TaskRequest, reporter Reporter, runMode string) TaskResult {
+	if len(request.Markets) > 0 {
+		return scrapeMultiMarkets(request, reporter, runMode)
+	}
 	if request.ExcelInput != "" {
 		return scrapeVendorBatches(request, reporter, runMode)
 	}
