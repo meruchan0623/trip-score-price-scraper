@@ -55,6 +55,9 @@ type QualityRerunOptions struct {
 }
 
 type TaskRequest struct {
+	Market MarketContext
+	// Site is retained temporarily for compatibility with the navigation and runner
+	// work that migrates to MarketContext in the following task.
 	Site                string
 	FreshProfile        bool
 	InputPaths          []string
