@@ -90,7 +90,7 @@ func scrapeSingle(request TaskRequest, reporter Reporter, runMode string) TaskRe
 	if err := prepareRuntimeProfile(state.ProfileSeedDir, request.BrowserOptions.UserDataDir, request.FreshProfile); err != nil {
 		return TaskResult{Success: false, OutputPath: outputPath, LogFile: request.LogFile, Error: "profile copy failed: " + err.Error(), ExitCode: 4}
 	}
-	reporter(Event{
+	reporter(mergeEvent(Event{
 		"event":                 "run_started",
 		"mode":                  "single",
 		"run_mode":              runMode,
@@ -107,7 +107,7 @@ func scrapeSingle(request TaskRequest, reporter Reporter, runMode string) TaskRe
 		"log_file":              absPath(request.LogFile),
 		"state_dir":             absPath(state.StateDir),
 		"profile_seed_dir":      absPath(state.ProfileSeedDir),
-	})
+	}, marketEventFields(request.Market)))
 	preflight(request, reporter)
 	powerGuard := startSystemAwakeGuard(reporter)
 	defer powerGuard.close()
@@ -244,7 +244,7 @@ func scrapeVendorBatches(request TaskRequest, reporter Reporter, runMode string)
 		reporter(Event{"event": "state_migrated", "state_dir": state.StateDir})
 	}
 	request.BrowserOptions.SessionFile = state.SessionFile
-	reporter(Event{
+	reporter(mergeEvent(Event{
 		"event":                 "run_started",
 		"mode":                  "excel",
 		"run_mode":              runMode,
@@ -261,7 +261,7 @@ func scrapeVendorBatches(request TaskRequest, reporter Reporter, runMode string)
 		"log_file":              absPath(request.LogFile),
 		"state_dir":             absPath(state.StateDir),
 		"profile_seed_dir":      absPath(state.ProfileSeedDir),
-	})
+	}, marketEventFields(request.Market)))
 	preflight(request, reporter)
 	powerGuard := startSystemAwakeGuard(reporter)
 	defer powerGuard.close()

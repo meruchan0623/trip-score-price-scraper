@@ -55,10 +55,7 @@ type QualityRerunOptions struct {
 }
 
 type TaskRequest struct {
-	Market MarketContext
-	// Site is transitional compatibility for browser extraction; Task3 runtime
-	// navigation and worker propagation use Market exclusively.
-	Site                string
+	Market              MarketContext
 	FreshProfile        bool
 	InputPaths          []string
 	URLsFile            string

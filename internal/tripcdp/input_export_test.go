@@ -144,10 +144,16 @@ func TestExportRowsFieldShape(t *testing.T) {
 	}
 }
 
-func TestSplitPriceRecognizesSingaporeDollars(t *testing.T) {
-	currency, price := splitPrice("S$ 0.11")
-	if currency != "SGD" || price != "0.11" {
-		t.Fatalf("splitPrice = %q %q, want SGD 0.11", currency, price)
+func TestResolvedMarketPricePrefixRejectsDifferentCurrency(t *testing.T) {
+	jp, err := resolveMarketContext("jp", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !isValidDisplayPriceForMarket("¥ 2,500", jp) {
+		t.Fatal("JPY price should be valid for the JPY market")
+	}
+	if isValidDisplayPriceForMarket("HK$ 2,500", jp) {
+		t.Fatal("HKD price must not be valid for the JPY market")
 	}
 }
 
@@ -385,13 +391,6 @@ func TestExportRowsRatingOnlyProductInfoShapeMatchesLegacyGUI(t *testing.T) {
 	}
 }
 
-func TestSplitPriceSupportsHKDollarText(t *testing.T) {
-	currency, price := splitPrice("HK$ 1,234.50")
-	if currency != "HKD" || price != "1234.50" {
-		t.Fatalf("got %s %s", currency, price)
-	}
-}
-
 func TestTraverseSKUCombinationsRefreshesLayerOptions(t *testing.T) {
 	layers := []skuLayerInfo{{Index: 0, Title: "套餐"}, {Index: 1, Title: "天数"}}
 	selected := []string{}
@@ -594,7 +593,7 @@ func TestCurrentCombinationPriceRowFromBatchPromotionDiscounts(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			row := currentCombinationPriceRowFromBatchPromotion([]skuOption{{Text: "1天", Layer: 1}, {Text: "每日-1GB", Layer: 2}}, tt.bundle, true)
+			row := currentCombinationPriceRowFromBatchPromotion([]skuOption{{Text: "1天", Layer: 1}, {Text: "每日-1GB", Layer: 2}}, tt.bundle, true, "HKD")
 			if row["price"] != tt.wantPrice || row["real_price"] != tt.wantRealPrice || row["promo_tag"] != tt.wantPromo {
 				t.Fatalf("row = %+v, want price=%s real=%s promo=%s", row, tt.wantPrice, tt.wantRealPrice, tt.wantPromo)
 			}
@@ -607,6 +606,7 @@ func TestCurrentCombinationPriceRowFromBatchPromotionNoPromoKeepsOriginal(t *tes
 		[]skuOption{{Text: "1天", Layer: 1}},
 		batchPromotionPriceBundle{ResourceID: 123, Currency: "HKD", OriginalPrice: 8.63},
 		true,
+		"HKD",
 	)
 	if row["price_status"] != priceStatusTrustedBase || row["price"] != "8.63" || row["real_currency"] != "HKD" || row["real_price"] != "8.63" || row["promo_tag"] != "" {
 		t.Fatalf("no-promo row should keep original as real price and blank promo: %+v", row)
@@ -618,6 +618,7 @@ func TestCurrentCombinationPriceRowFromBatchPromotionResourceMissIsUntrusted(t *
 		[]skuOption{{Text: "1天", Layer: 1}, {Text: "每日-1GB", Layer: 2}},
 		batchPromotionPriceBundle{Currency: "HKD", OriginalPrice: 22},
 		true,
+		"HKD",
 	)
 	if row["price_status"] != priceStatusUntrustedResourceMiss {
 		t.Fatalf("price_status = %q, want %q; row=%+v", row["price_status"], priceStatusUntrustedResourceMiss, row)
@@ -932,6 +933,7 @@ func TestCurrentCombinationPriceRowUsesBundleAndNoRealPriceFlag(t *testing.T) {
 		priceBundle{DisplayPrice: "HK$ 99", RealPrice: "HK$ 88", PromoTag: "減 10%"},
 		"",
 		false,
+		mustTestMarket("hk"),
 	)
 	if row["currency"] != "HKD" || row["price"] != "99" || row["real_price"] != "N/A" || row["promo_tag"] != "減 10%" {
 		t.Fatalf("unexpected row: %+v", row)
@@ -944,6 +946,7 @@ func TestCurrentCombinationPriceRowFallsBackAndKeepsPythonNAAsSuccess(t *testing
 		priceBundle{PromoTag: "折扣"},
 		"HK$ 123",
 		true,
+		mustTestMarket("hk"),
 	)
 	if withFallback["price"] != "123" {
 		t.Fatalf("fallback price not used: %+v", withFallback)
@@ -954,6 +957,7 @@ func TestCurrentCombinationPriceRowFallsBackAndKeepsPythonNAAsSuccess(t *testing
 		priceBundle{},
 		"",
 		true,
+		mustTestMarket("hk"),
 	)
 	if pythonCompatible["price"] != "N/A" || pythonCompatible["currency"] != "N/A" {
 		t.Fatalf("empty display should keep Python N/A success semantics, got %+v", pythonCompatible)
@@ -966,6 +970,7 @@ func TestCurrentCombinationPriceRowRealPriceMissingBecomesEmpty(t *testing.T) {
 		priceBundle{DisplayPrice: "HK$ 99"},
 		"",
 		true,
+		mustTestMarket("hk"),
 	)
 	if row["real_currency"] != "N/A" || row["real_price"] != "" {
 		t.Fatalf("missing real price should become empty with N/A currency, got %+v", row)
@@ -976,11 +981,11 @@ func TestStablePriceBundleRequiresTwoMatchingFooterSamples(t *testing.T) {
 	samples := []priceBundle{
 		{DisplayPrice: "HK$ 99", RealPrice: "HK$ 88", PromoTag: "即減15%", FooterSignature: "HK$ 99||HK$ 88||即減15%", SampleAtMS: 360},
 	}
-	if _, ok := stablePriceBundle(samples, 350*time.Millisecond); ok {
+	if _, ok := stablePriceBundle(samples, 350*time.Millisecond, mustTestMarket("hk")); ok {
 		t.Fatal("single sample should not be stable")
 	}
 	samples = append(samples, priceBundle{DisplayPrice: "HK$ 99", RealPrice: "HK$ 88", PromoTag: "即減15%", FooterSignature: "HK$ 99||HK$ 88||即減15%", SampleAtMS: 480})
-	stable, ok := stablePriceBundle(samples, 350*time.Millisecond)
+	stable, ok := stablePriceBundle(samples, 350*time.Millisecond, mustTestMarket("hk"))
 	if !ok {
 		t.Fatal("two matching footer samples should be stable")
 	}
@@ -995,7 +1000,7 @@ func TestStablePriceBundleDoesNotCarryPreviousPromoToEmptyStableFooter(t *testin
 		{DisplayPrice: "HK$ 100", FooterSignature: "HK$ 100||||", SampleAtMS: 360},
 		{DisplayPrice: "HK$ 100", FooterSignature: "HK$ 100||||", SampleAtMS: 480},
 	}
-	stable, ok := stablePriceBundle(samples, 350*time.Millisecond)
+	stable, ok := stablePriceBundle(samples, 350*time.Millisecond, mustTestMarket("hk"))
 	if !ok {
 		t.Fatal("empty footer stable samples should settle")
 	}
@@ -1010,7 +1015,7 @@ func TestStablePriceBundleKeepsDelayedRealAndPromo(t *testing.T) {
 		{DisplayPrice: "HK$ 100", RealPrice: "HK$ 72", PromoTag: "即減15%", FooterSignature: "HK$ 100||HK$ 72||即減15%", SampleAtMS: 360},
 		{DisplayPrice: "HK$ 100", RealPrice: "HK$ 72", PromoTag: "即減15%", FooterSignature: "HK$ 100||HK$ 72||即減15%", SampleAtMS: 480},
 	}
-	stable, ok := stablePriceBundle(samples, 350*time.Millisecond)
+	stable, ok := stablePriceBundle(samples, 350*time.Millisecond, mustTestMarket("hk"))
 	if !ok {
 		t.Fatal("delayed real/promo should settle after matching samples")
 	}
@@ -1042,6 +1047,23 @@ func TestBatchPromotionRowUsesRequestedCurrencyWhenResponseOmitsIt(t *testing.T)
 	)
 	if row["currency"] != "SGD" || row["real_currency"] != "SGD" {
 		t.Fatalf("row currencies = %q/%q, want SGD/SGD", row["currency"], row["real_currency"])
+	}
+}
+
+func TestBatchPromotionRowRejectsExplicitUnexpectedCurrency(t *testing.T) {
+	row := currentCombinationPriceRowFromBatchPromotion(
+		[]skuOption{{Text: "1 day", Layer: 1}},
+		batchPromotionPriceBundle{ResourceID: 10, ItemID: 10, Currency: "USD", OriginalPrice: 22},
+		true,
+		"JPY",
+	)
+	if row["price_status"] != "currency_mismatch" {
+		t.Fatalf("price status = %q, want currency_mismatch; row=%+v", row["price_status"], row)
+	}
+	for _, key := range []string{"currency", "price", "real_currency", "real_price", "promo_tag"} {
+		if row[key] != "" {
+			t.Fatalf("%s = %q, want blank; row=%+v", key, row[key], row)
+		}
 	}
 }
 

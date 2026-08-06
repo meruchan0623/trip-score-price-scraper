@@ -38,7 +38,7 @@ func Run(argv []string) int {
 	_ = noColor
 	renderer := newRenderer(request.LogFile, logLevel, jsonLines)
 	result := scrape(request, renderer.emit, runMode)
-	renderer.emit(Event{
+	renderer.emit(mergeEvent(Event{
 		"event":                        "run_done",
 		"success":                      result.Success,
 		"exit_code":                    result.ExitCode,
@@ -53,7 +53,7 @@ func Run(argv []string) int {
 		"quality_rerun_attempted_urls": result.QualityRerunAttemptedURLs,
 		"quality_rerun_recovered_urls": result.QualityRerunRecoveredURLs,
 		"final_quality_failed_urls":    result.FinalQualityFailedURLs,
-	})
+	}, marketEventFields(request.Market)))
 	return result.ExitCode
 }
 
@@ -187,7 +187,7 @@ func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bo
 	}
 	market, err := resolveMarketContext(site, locale, currency)
 	if err != nil {
-		return TaskRequest{}, "", "", false, false, flagValueError(err, site, locale, currency)
+		return TaskRequest{}, "", "", false, false, flagValueError(err)
 	}
 	if runMode != "" && runMode != "mode1" && runMode != "mode2" {
 		return TaskRequest{}, "", "", false, false, fmt.Errorf("--run-mode must be mode1 or mode2")
@@ -266,7 +266,6 @@ func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bo
 	}
 	return TaskRequest{
 		Market:              market,
-		Site:                market.Code,
 		FreshProfile:        freshProfile,
 		InputPaths:          []string(inputs),
 		URLsFile:            urlsFile,
@@ -298,7 +297,7 @@ func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bo
 	}, runMode, logLevel, jsonLines, noColor, nil
 }
 
-func flagValueError(err error, site, locale, currency string) error {
+func flagValueError(err error) error {
 	message := err.Error()
 	switch {
 	case strings.Contains(message, "unsupported site"):

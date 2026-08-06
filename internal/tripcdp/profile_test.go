@@ -11,7 +11,11 @@ import (
 )
 
 func TestChromeArgumentsIncludeUCSubprocessFlags(t *testing.T) {
-	args := chromeArguments("/tmp/profile", true, 45678, hkAcceptLanguage)
+	market, err := resolveMarketContext("hk", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := chromeArguments("/tmp/profile", true, 45678, market.AcceptLanguage)
 	for _, want := range []string{
 		"--user-data-dir=/tmp/profile",
 		"--remote-debugging-host=127.0.0.1",

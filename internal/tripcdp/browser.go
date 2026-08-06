@@ -216,7 +216,7 @@ type navigationMonitor struct {
 	cancel         context.CancelFunc
 }
 
-const currentPriceBundleJS = `(displaySelectors, includeReal, pricePrefix) => {
+const currentPriceBundleJS = `(displaySelectors, includeReal, currency, pricePrefixes) => {
 	const realSelector = 'div[class*="price-comp_m_footer_left_total"] div div div span span';
 	const footerSelector = 'div[class*="price-comp_m_footer_left"]';
 	const promoSelector = footerSelector + ' div span';
@@ -227,13 +227,16 @@ const currentPriceBundleJS = `(displaySelectors, includeReal, pricePrefix) => {
 		return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
 	};
 	const textOf = (el) => (el && (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ')) || '';
-	const validPrice = (text) => text && text.includes(pricePrefix) && /[0-9,]+(?:\.\d+)?/.test(text);
+	const hasExpectedPrefix = (text) => pricePrefixes.some(prefix => text.startsWith(prefix));
+	const validPrice = (el, text) => text && /[0-9,]+(?:\.\d+)?/.test(text) && (
+		String(el.getAttribute('currency') || '').toUpperCase() === currency || hasExpectedPrefix(text)
+	);
 	let displayPrice = '';
 	for (const selector of displaySelectors) {
 		for (const el of document.querySelectorAll(selector)) {
 			if (!isVisible(el)) continue;
 			const text = textOf(el);
-			if (validPrice(text)) {
+			if (validPrice(el, text)) {
 				displayPrice = text;
 				break;
 			}
@@ -244,7 +247,7 @@ const currentPriceBundleJS = `(displaySelectors, includeReal, pricePrefix) => {
 		for (const el of document.querySelectorAll('span,div')) {
 			if (!isVisible(el)) continue;
 			const text = textOf(el);
-			if (validPrice(text)) {
+			if (validPrice(el, text)) {
 				displayPrice = text;
 				break;
 			}
@@ -255,7 +258,7 @@ const currentPriceBundleJS = `(displaySelectors, includeReal, pricePrefix) => {
 		for (const el of document.querySelectorAll(realSelector)) {
 			if (!isVisible(el)) continue;
 			const text = textOf(el);
-			if (text) {
+			if (validPrice(el, text)) {
 				realPrice = text;
 				break;
 			}
@@ -273,7 +276,7 @@ const currentPriceBundleJS = `(displaySelectors, includeReal, pricePrefix) => {
 	for (const el of document.querySelectorAll(promoSelector)) {
 		if (!isVisible(el)) continue;
 		const text = textOf(el);
-		if (text && !text.includes(pricePrefix) && (text.includes('減') || text.includes('%') || text.includes('折') || /off/i.test(text))) {
+		if (text && !hasExpectedPrefix(text) && (text.includes('減') || text.includes('%') || text.includes('折') || /off/i.test(text))) {
 			promoTag = text;
 			break;
 		}
@@ -666,7 +669,7 @@ func (s *tripScraper) scrapeOne(ctx context.Context, item ScrapeItem, index int,
 	s.currentScrapeNote = ""
 	s.currentQualityFailure = nil
 	s.currentQualityRetryAttempt = 0
-	s.emit(mergeEvent(Event{"event": "url_started", "first_trip_navigation_url": target.NavigateURL, "navigation_locale": target.Market.Locale, "navigation_currency": target.Market.Currency, "accept_language": target.Market.AcceptLanguage, "session_nav_skipped": true}, base))
+	s.emit(mergeEvent(mergeEvent(Event{"event": "url_started", "first_trip_navigation_url": target.NavigateURL, "navigation_locale": target.Market.Locale, "navigation_currency": target.Market.Currency, "accept_language": target.Market.AcceptLanguage, "session_nav_skipped": true}, marketEventFields(target.Market)), base))
 	var lastSnapshot pageSnapshot
 	pageAttempt := 1
 	priceQualityRetries := 0
@@ -721,7 +724,7 @@ func (s *tripScraper) scrapeOne(ctx context.Context, item ScrapeItem, index int,
 			} else if priceQualityRetries > 0 && trustedRows > 0 && firstQualityFailure != nil {
 				qualityFailed = false
 			}
-			s.emit(mergeEvent(Event{"event": "url_done", "rows": len(rows), "elapsed_ms": elapsedMS(started), "final_url": snapshot.URL, "page_valid": isProductPageReady(snapshot), "page_retry_count": pageAttempt - 1, "price_quality_retry_count": priceQualityRetries, "restart_after_url": restartAfterURL, "trusted_rows": trustedRows, "untrusted_rows": untrustedRows, "price_quality_failed": qualityFailed}, base))
+			s.emit(mergeEvent(mergeEvent(Event{"event": "url_done", "rows": len(rows), "elapsed_ms": elapsedMS(started), "final_url": snapshot.URL, "page_valid": isProductPageReady(snapshot), "page_retry_count": pageAttempt - 1, "price_quality_retry_count": priceQualityRetries, "restart_after_url": restartAfterURL, "trusted_rows": trustedRows, "untrusted_rows": untrustedRows, "price_quality_failed": qualityFailed}, marketEventFields(target.Market)), base))
 			if restartAfterURL {
 				_ = s.restartBrowser(ctx, restartReason)
 			}
@@ -753,19 +756,15 @@ func (s *tripScraper) scrapeOne(ctx context.Context, item ScrapeItem, index int,
 	if isWhaleguardSnapshot(lastSnapshot) {
 		s.emit(mergeEvent(Event{"event": "risk_challenge_detected", "stage": "risk", "message": "whaleguard block after retry", "risk_kind": lastSnapshot.RiskKind, "http_status": lastSnapshot.HTTPStatus, "body_preview": lastSnapshot.BodyPreview, "retry_after_risk": false, "risk_retry_count": 1, "final_url": lastSnapshot.URL}, base))
 		rows := []map[string]string{s.riskBlockedRow(canonicalItem, "whaleguard block")}
-		s.emit(mergeEvent(Event{"event": "url_done", "rows": len(rows), "elapsed_ms": elapsedMS(started), "final_url": lastSnapshot.URL, "page_valid": false, "page_retry_count": 1, "restart_after_url": false, "risk_kind": lastSnapshot.RiskKind, "http_status": lastSnapshot.HTTPStatus}, base))
+		s.emit(mergeEvent(mergeEvent(Event{"event": "url_done", "rows": len(rows), "elapsed_ms": elapsedMS(started), "final_url": lastSnapshot.URL, "page_valid": false, "page_retry_count": 1, "restart_after_url": false, "risk_kind": lastSnapshot.RiskKind, "http_status": lastSnapshot.HTTPStatus}, marketEventFields(target.Market)), base))
 		s.cleanupAfterURL()
 		_ = s.restartBrowserNoSessionSave(ctx, "whaleguard block after retry")
 		return rows
 	}
 	s.emit(mergeEvent(Event{"event": "page_unhealthy", "stage": "extract", "message": "页面未加载有效商品内容", "snapshot": lastSnapshot}, base))
 	rows := []map[string]string{s.errorRow(canonicalItem, "页面未加载有效商品内容")}
-	s.emit(mergeEvent(Event{"event": "url_done", "rows": len(rows), "elapsed_ms": elapsedMS(started), "final_url": lastSnapshot.URL, "page_valid": false, "page_retry_count": 2, "restart_after_url": false}, base))
+	s.emit(mergeEvent(mergeEvent(Event{"event": "url_done", "rows": len(rows), "elapsed_ms": elapsedMS(started), "final_url": lastSnapshot.URL, "page_valid": false, "page_retry_count": 2, "restart_after_url": false}, marketEventFields(target.Market)), base))
 	return rows
-}
-
-func invalidateNonHKDPriceRows(rows []map[string]string) {
-	invalidateUnexpectedCurrencyRows(rows, "HKD")
 }
 
 func invalidateUnexpectedCurrencyRows(rows []map[string]string, expected string) {
@@ -1888,7 +1887,7 @@ func (s *tripScraper) currentCombinationPrice(ctx context.Context, selected []sk
 	if ctx.Err() != nil {
 		return nil
 	}
-	result := currentCombinationPriceRowFromBatchPromotion(selected, batchBundle, s.request.ExtractRealPrice, siteConfigFor(s.request.Site).Currency)
+	result := currentCombinationPriceRowFromBatchPromotion(selected, batchBundle, s.request.ExtractRealPrice, s.request.Market.Currency)
 	if isTrustedPriceStatus(result["price_status"]) {
 		if waitMS > 1000 {
 			s.emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("batch promotion price settled slowly: %s wait_ms=%d promo_matched=%v", result["combination"], waitMS, batchBundle.PromoMatched)})
@@ -2123,7 +2122,7 @@ func (s *tripScraper) currentBatchPromotionPriceBundle(selectedTexts []string) b
 			}
 		}
 		return out;
-	}`, selectedTexts, siteConfigFor(s.request.Site).Currency)
+	}`, selectedTexts, s.request.Market.Currency)
 	if bundle.ResourceID > 0 && bundle.ResponseText != "" {
 		applyBatchPromotionResponse(&bundle, bundle.ResponseText, bundle.ResponseStatus, bundle.ResponseURL)
 	}
@@ -2199,7 +2198,7 @@ func applyBatchPromotionResponse(bundle *batchPromotionPriceBundle, responseText
 	return false
 }
 
-func currentCombinationPriceRowFromBatchPromotion(selected []skuOption, bundle batchPromotionPriceBundle, extractRealPrice bool, expectedCurrencies ...string) map[string]string {
+func currentCombinationPriceRowFromBatchPromotion(selected []skuOption, bundle batchPromotionPriceBundle, extractRealPrice bool, expectedCurrency string) map[string]string {
 	if len(selected) == 0 {
 		return nil
 	}
@@ -2208,11 +2207,26 @@ func currentCombinationPriceRowFromBatchPromotion(selected []skuOption, bundle b
 		parts = append(parts, option.Text)
 	}
 	combination := strings.Join(parts, " | ")
-	expectedCurrency := "HKD"
-	if len(expectedCurrencies) > 0 && strings.TrimSpace(expectedCurrencies[0]) != "" {
-		expectedCurrency = strings.ToUpper(strings.TrimSpace(expectedCurrencies[0]))
+	expectedCurrency = strings.ToUpper(strings.TrimSpace(expectedCurrency))
+	bundleCurrency := strings.ToUpper(strings.TrimSpace(bundle.Currency))
+	if bundleCurrency != "" && bundleCurrency != expectedCurrency {
+		return map[string]string{
+			"combination":    combination,
+			"selected_texts": combination,
+			"currency":       "",
+			"price":          "",
+			"real_currency":  "",
+			"real_price":     "",
+			"promo_tag":      "",
+			"resource_id":    strconv.FormatInt(bundle.ResourceID, 10),
+			"item_id":        strconv.FormatInt(bundle.ItemID, 10),
+			"promo_matched":  strconv.FormatBool(bundle.PromoMatched),
+			"price_source":   priceSourceBatchPromotion,
+			"price_status":   "currency_mismatch",
+			"scrape_note":    "returned currency does not match requested market",
+		}
 	}
-	currency := firstNonEmpty(bundle.Currency, expectedCurrency)
+	currency := firstNonEmpty(bundleCurrency, expectedCurrency)
 	base := map[string]string{
 		"combination":    combination,
 		"selected_texts": combination,
@@ -2450,7 +2464,7 @@ func (s *tripScraper) waitCurrentPriceBundleStable(ctx context.Context, maxWait 
 	}
 }
 
-func stablePriceBundle(samples []priceBundle, minAge time.Duration, markets ...MarketContext) (priceBundle, bool) {
+func stablePriceBundle(samples []priceBundle, minAge time.Duration, market MarketContext) (priceBundle, bool) {
 	if len(samples) < 2 {
 		return priceBundle{}, false
 	}
@@ -2459,11 +2473,7 @@ func stablePriceBundle(samples []priceBundle, minAge time.Duration, markets ...M
 	if time.Duration(last.SampleAtMS)*time.Millisecond < minAge {
 		return priceBundle{}, false
 	}
-	valid := isValidDisplayPrice(last.DisplayPrice)
-	if len(markets) > 0 {
-		valid = isValidDisplayPriceForMarket(last.DisplayPrice, markets[0])
-	}
-	if !valid {
+	if !isValidDisplayPriceForMarket(last.DisplayPrice, market) {
 		return priceBundle{}, false
 	}
 	if bundleSignature(last) == "" || bundleSignature(last) != bundleSignature(prev) {
@@ -2472,17 +2482,14 @@ func stablePriceBundle(samples []priceBundle, minAge time.Duration, markets ...M
 	return last, true
 }
 
-func selectStablePriceBundle(samples []priceBundle, elapsed time.Duration, markets ...MarketContext) priceBundle {
+func selectStablePriceBundle(samples []priceBundle, elapsed time.Duration, market MarketContext) priceBundle {
 	if len(samples) == 0 {
 		return priceBundle{}
 	}
-	if stable, ok := stablePriceBundle(samples, 0, markets...); ok {
+	if stable, ok := stablePriceBundle(samples, 0, market); ok {
 		return stable
 	}
-	valid := func(value string) bool { return isValidDisplayPrice(value) }
-	if len(markets) > 0 {
-		valid = func(value string) bool { return isValidDisplayPriceForMarket(value, markets[0]) }
-	}
+	valid := func(value string) bool { return isValidDisplayPriceForMarket(value, market) }
 	for i := len(samples) - 1; i >= 0; i-- {
 		if valid(samples[i].DisplayPrice) && time.Duration(samples[i].SampleAtMS)*time.Millisecond >= min(elapsed, 350*time.Millisecond) {
 			return samples[i]
@@ -2509,7 +2516,7 @@ func bundleSignature(bundle priceBundle) string {
 	}, "||")
 }
 
-func currentCombinationPriceRow(selected []skuOption, bundle priceBundle, fallbackDisplayPrice string, extractRealPrice bool, markets ...MarketContext) map[string]string {
+func currentCombinationPriceRow(selected []skuOption, bundle priceBundle, fallbackDisplayPrice string, extractRealPrice bool, market MarketContext) map[string]string {
 	if len(selected) == 0 {
 		return nil
 	}
@@ -2522,16 +2529,10 @@ func currentCombinationPriceRow(selected []skuOption, bundle priceBundle, fallba
 	if displayPriceText == "" {
 		displayPriceText = fallbackDisplayPrice
 	}
-	currency, price := splitPrice(displayPriceText)
-	if len(markets) > 0 {
-		currency, price = parseDisplayPrice(displayPriceText, markets[0])
-	}
+	currency, price := parseDisplayPrice(displayPriceText, market)
 	realCurrency, realPrice := "N/A", "N/A"
 	if extractRealPrice {
-		realCurrency, realPrice = splitPrice(bundle.RealPrice)
-		if len(markets) > 0 {
-			realCurrency, realPrice = parseDisplayPrice(bundle.RealPrice, markets[0])
-		}
+		realCurrency, realPrice = parseDisplayPrice(bundle.RealPrice, market)
 		if realPrice == "N/A" {
 			realCurrency, realPrice = "N/A", ""
 		}
@@ -2647,8 +2648,8 @@ func (s *tripScraper) waitProductPageExtractable(ctx context.Context, maxWait ti
 
 func (s *tripScraper) currentPageSnapshot() pageSnapshot {
 	var snapshot pageSnapshot
-	config := siteConfigFor(s.request.Site)
-	err := s.evalJSON(&snapshot, `(currency, pricePrefix) => {
+	market := s.request.Market
+	err := s.evalJSON(&snapshot, `(currency, pricePrefixes) => {
 		const visible = (el) => {
 			if (!el) return false;
 			const style = window.getComputedStyle(el);
@@ -2660,6 +2661,15 @@ func (s *tripScraper) currentPageSnapshot() pageSnapshot {
 		const lower = bodyText.toLowerCase();
 		const hasAny = (selectors) => selectors.some(selector => Array.from(document.querySelectorAll(selector)).some(visible));
 		const hasText = (patterns) => patterns.some(pattern => bodyText.includes(pattern));
+		const hasExpectedPrice = () => {
+			for (const el of document.querySelectorAll('span,div')) {
+				if (!visible(el)) continue;
+				const text = (el.innerText || el.textContent || '').trim();
+				if (!/[0-9,]+(?:\.\d+)?/.test(text)) continue;
+				if (String(el.getAttribute('currency') || '').toUpperCase() === currency || pricePrefixes.some(prefix => text.startsWith(prefix))) return true;
+			}
+			return false;
+		};
 		const title = document.title || '';
 		const explicitCloudflareOverlay = document.querySelector('#guestLogin-sliderTntLoginBanneribu_nonmemberlogin_online_pic_cf_container');
 		const cloudflareOverlay = !!explicitCloudflareOverlay && visible(explicitCloudflareOverlay);
@@ -2672,14 +2682,14 @@ func (s *tripScraper) currentPageSnapshot() pageSnapshot {
 			title,
 			has_product_title: hasAny(['h1', '[data-testid="product-title"]']) || hasText(['套餐與價格', '套餐与价格', '商品詳情', '商品详情']),
 			has_sku: hasAny(['div[testid="act_sku_wrapper"]', 'div[class*="style_sku_wrapper_container"]', 'div[class*="sku_tab_ceil"]']) || hasText(['套餐與價格', '套餐与价格']),
-			has_price: hasAny(['span[currency="' + currency + '"]', 'span[testid*="price"]', 'div[class*="price"]']) || bodyText.includes(pricePrefix),
+			has_price: hasExpectedPrice(),
 			has_score: hasAny(['span[testid="productdetail-productInfo-commentScore"]', '[class*="commentScore"]']),
 			risk_challenge: riskChallenge,
 			risk_kind: whaleguard ? 'whaleguard' : (cloudflareOverlay ? 'cloudflare' : (riskChallenge ? 'challenge' : '')),
 			cloudflare_block: cloudflareOverlay,
 			body_preview: bodyText.slice(0, 200),
 		};
-	}`, config.Currency, config.PricePrefix)
+	}`, market.Currency, market.PricePrefixes)
 	if err != nil {
 		snapshot.EvalError = err.Error()
 	}
@@ -3425,20 +3435,16 @@ func (s *tripScraper) markRestartAfterURLIfUnhealthy(reason string) {
 }
 
 func (s *tripScraper) currentPrice(ctx context.Context, maxAttempts int) string {
-	config := siteConfigFor(s.request.Site)
-	pricePrefix := config.PricePrefix
-	if len(s.request.Market.PricePrefixes) > 0 {
-		pricePrefix = s.request.Market.PricePrefixes[0]
-	}
+	market := s.request.Market
 	selectors := []string{
 		`#select_quantity div[class*="style_m_select_quantity_container__"] div div[class*="style_m_select_choice_option_wrapper__"] div[class*="style_m_people_price__"] div div span span`,
 		`#select_quantity > div.xtaro-xview > div > div.xtaro-xview > div.xtaro-xview > div > div > span > span`,
 		`div[class*="default_new_title_foot_warp"] div[class*="default_new_title_foot_warp_right"] div div div span`,
-		fmt.Sprintf(`span[currency="%s"][testid*="price"]`, config.Currency),
+		fmt.Sprintf(`span[currency="%s"][testid*="price"]`, market.Currency),
 		`span.price_m_price_price__VrAgh`,
-		fmt.Sprintf(`div.price_m_price__FmWsJ span[currency="%s"]`, config.Currency),
+		fmt.Sprintf(`div.price_m_price__FmWsJ span[currency="%s"]`, market.Currency),
 		`span[testid="undefined-price"]`,
-		fmt.Sprintf(`span[currency="%s"]`, config.Currency),
+		fmt.Sprintf(`span[currency="%s"]`, market.Currency),
 	}
 	if maxAttempts <= 0 {
 		maxAttempts = 3
@@ -3448,27 +3454,29 @@ func (s *tripScraper) currentPrice(ctx context.Context, maxAttempts int) string 
 			return "价格未找到"
 		}
 		for _, selector := range selectors {
-			text := s.evalString(`(selector, pricePrefix) => {
+			text := s.evalString(`(selector, currency, pricePrefixes) => {
 				for (const el of document.querySelectorAll(selector)) {
 					if (el.offsetParent === null) continue;
 					const text = (el.innerText || el.textContent || '').trim();
-					if (text && text.includes(pricePrefix) && /[0-9,]+(?:\.\d+)?/.test(text)) return text;
+					const hasPrefix = pricePrefixes.some(prefix => text.startsWith(prefix));
+					const hasCurrency = String(el.getAttribute('currency') || '').toUpperCase() === currency;
+					if (text && /[0-9,]+(?:\.\d+)?/.test(text) && (hasCurrency || hasPrefix)) return text;
 				}
 				return '';
-			}`, selector, pricePrefix)
+			}`, selector, market.Currency, market.PricePrefixes)
 			if text != "" {
 				return text
 			}
 		}
-		text := s.evalString(`(pricePrefix) => {
+		text := s.evalString(`(pricePrefixes) => {
 			const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
 			let node;
 			while ((node = walker.nextNode())) {
 				const text = (node.nodeValue || '').trim();
-				if (text.includes(pricePrefix) && /[0-9,]+(?:\.\d+)?/.test(text)) return text;
+				if (pricePrefixes.some(prefix => text.startsWith(prefix)) && /[0-9,]+(?:\.\d+)?/.test(text)) return text;
 			}
 			return '';
-		}`, pricePrefix)
+		}`, market.PricePrefixes)
 		if text != "" {
 			return text
 		}
@@ -3478,24 +3486,19 @@ func (s *tripScraper) currentPrice(ctx context.Context, maxAttempts int) string 
 }
 
 func (s *tripScraper) currentPriceBundle() priceBundle {
-	config := siteConfigFor(s.request.Site)
 	market := s.request.Market
-	pricePrefix := config.PricePrefix
-	if len(market.PricePrefixes) > 0 {
-		pricePrefix = market.PricePrefixes[0]
-	}
 	displaySelectors := []string{
 		`#select_quantity div[class*="style_m_select_quantity_container__"] div div[class*="style_m_select_choice_option_wrapper__"] div[class*="style_m_people_price__"] div div span span`,
 		`#select_quantity > div.xtaro-xview > div > div.xtaro-xview > div.xtaro-xview > div > div > span > span`,
 		`div[class*="default_new_title_foot_warp"] div[class*="default_new_title_foot_warp_right"] div div div span`,
-		fmt.Sprintf(`span[currency="%s"][testid*="price"]`, config.Currency),
+		fmt.Sprintf(`span[currency="%s"][testid*="price"]`, market.Currency),
 		`span.price_m_price_price__VrAgh`,
-		fmt.Sprintf(`div.price_m_price__FmWsJ span[currency="%s"]`, config.Currency),
+		fmt.Sprintf(`div.price_m_price__FmWsJ span[currency="%s"]`, market.Currency),
 		`span[testid="undefined-price"]`,
-		fmt.Sprintf(`span[currency="%s"]`, config.Currency),
+		fmt.Sprintf(`span[currency="%s"]`, market.Currency),
 	}
 	var bundle priceBundle
-	_ = s.evalJSON(&bundle, currentPriceBundleJS, displaySelectors, s.request.ExtractRealPrice, pricePrefix)
+	_ = s.evalJSON(&bundle, currentPriceBundleJS, displaySelectors, s.request.ExtractRealPrice, market.Currency, market.PricePrefixes)
 	return bundle
 }
 

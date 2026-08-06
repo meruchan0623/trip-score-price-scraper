@@ -10,6 +10,19 @@ type MarketContext struct {
 	PricePrefixes                                        []string
 }
 
+// marketEventFields carries only requested public market identity through
+// structured events. It deliberately excludes cookies, headers, storage, and
+// user identity.
+func marketEventFields(market MarketContext) Event {
+	return Event{
+		"market_code":     market.Code,
+		"market_site_id":  market.SiteID,
+		"market_host":     market.Host,
+		"market_locale":   market.Locale,
+		"market_currency": market.Currency,
+	}
+}
+
 // marketObservation contains only the public values needed to verify the
 // market returned by Trip after navigation. It deliberately excludes raw
 // cookies, headers, storage, and account identifiers.

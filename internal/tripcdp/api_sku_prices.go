@@ -15,7 +15,7 @@ func (s *tripScraper) waitCapturedAPISKUPrices(ctx context.Context, maxWait time
 	var rows []map[string]string
 	var coverage apiSKUPriceCoverage
 	for {
-		rows, coverage = parseCapturedAPISKUPrices(s.capturedAPIResponses(), siteConfigFor(s.request.Site).Currency, s.request.ExtractRealPrice)
+		rows, coverage = parseCapturedAPISKUPrices(s.capturedAPIResponses(), s.request.Market.Currency, s.request.ExtractRealPrice)
 		if coverage.usable() || time.Now().After(deadline) || ctx.Err() != nil {
 			return rows, coverage, elapsedMS(started)
 		}
@@ -58,6 +58,7 @@ type apiSKUPrice struct {
 	PackageID     int64
 	ResourceID    int64
 	Properties    []apiSKUProperty
+	Currency      string
 	OriginalPrice float64
 	Price         float64
 	PromoTags     []string
@@ -71,6 +72,10 @@ type apiSKUKey struct {
 func parseCapturedAPISKUPrices(responses []capturedAPIResponse, expectedCurrency string, extractRealPrice bool) ([]map[string]string, apiSKUPriceCoverage) {
 	tree := map[apiSKUKey]apiSKUTreeLeaf{}
 	prices := map[apiSKUKey]apiSKUPrice{}
+	currency := strings.ToUpper(strings.TrimSpace(expectedCurrency))
+	if currency == "" {
+		currency = "HKD"
+	}
 	for _, response := range responses {
 		if response.Status < 200 || response.Status >= 300 || strings.TrimSpace(response.Text) == "" {
 			continue
@@ -84,6 +89,9 @@ func parseCapturedAPISKUPrices(responses []capturedAPIResponse, expectedCurrency
 			}
 		case strings.Contains(response.URL, "/restapi/soa2/14580/getProductPriceCalendar"):
 			for _, price := range parseAPIPriceCalendar(response.Text) {
+				if price.Currency != "" && !strings.EqualFold(price.Currency, currency) {
+					continue
+				}
 				if price.PackageID > 0 && price.ResourceID > 0 && price.OriginalPrice > 0 && price.Price > 0 {
 					prices[apiSKUKey{PackageID: price.PackageID, ResourceID: price.ResourceID}] = price
 				}
@@ -102,10 +110,6 @@ func parseCapturedAPISKUPrices(responses []capturedAPIResponse, expectedCurrency
 		return keys[i].PackageID < keys[j].PackageID
 	})
 
-	currency := strings.ToUpper(strings.TrimSpace(expectedCurrency))
-	if currency == "" {
-		currency = "HKD"
-	}
 	rows := make([]map[string]string, 0, len(prices))
 	pricedTreeLeaves := 0
 	for _, key := range keys {
@@ -222,6 +226,8 @@ func parseAPIPriceCalendar(raw string) []apiSKUPrice {
 					ResourceID int64 `json:"resourceId"`
 				} `json:"resourceInfos"`
 				PriceInfo struct {
+					Currency                 string  `json:"currency"`
+					CurrencyCode             string  `json:"currencyCode"`
 					OriginalPrice            float64 `json:"originalPrice"`
 					Price                    float64 `json:"price"`
 					PreferentialPriceDetails []struct {
@@ -237,7 +243,12 @@ func parseAPIPriceCalendar(raw string) []apiSKUPrice {
 	}
 	out := make([]apiSKUPrice, 0, len(payload.Data.PackageInfos))
 	for _, item := range payload.Data.PackageInfos {
-		price := apiSKUPrice{PackageID: item.PackageID, OriginalPrice: item.PriceInfo.OriginalPrice, Price: item.PriceInfo.Price}
+		price := apiSKUPrice{
+			PackageID:     item.PackageID,
+			Currency:      strings.ToUpper(strings.TrimSpace(firstNonEmpty(item.PriceInfo.Currency, item.PriceInfo.CurrencyCode))),
+			OriginalPrice: item.PriceInfo.OriginalPrice,
+			Price:         item.PriceInfo.Price,
+		}
 		for _, property := range item.SalesProperties {
 			for _, value := range property.SalesPropertyValues {
 				price.Properties = append(price.Properties, apiSKUProperty{PropertyID: property.SalesProperty.ID, PropertyName: property.SalesProperty.Name, ValueID: value.ID, ValueName: value.Name})

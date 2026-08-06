@@ -5,25 +5,6 @@ import (
 	"strings"
 )
 
-const hkAcceptLanguage = "zh-HK,zh;q=0.9,en-US;q=0.8,en;q=0.7"
-
-// Transitional compatibility for extraction code migrated in Task 4-6.
-type siteConfig struct {
-	Code, Host, Locale, Currency, AcceptLanguage, PricePrefix string
-}
-
-func siteConfigFor(code string) siteConfig {
-	market, ok := lookupSite(code)
-	if !ok {
-		market, _ = lookupSite("hk")
-	}
-	prefix := ""
-	if len(market.PricePrefixes) > 0 {
-		prefix = market.PricePrefixes[0]
-	}
-	return siteConfig{Code: market.Code, Host: market.Host, Locale: market.Locale, Currency: market.Currency, AcceptLanguage: market.AcceptLanguage, PricePrefix: prefix}
-}
-
 type navigationTarget struct {
 	OriginalURL string
 	NavigateURL string
