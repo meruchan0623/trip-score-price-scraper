@@ -5,85 +5,45 @@ import (
 	"testing"
 )
 
-func TestNavigationTargetNormalizesHKURL(t *testing.T) {
-	target := newNavigationTarget("https://hk.trip.com/things-to-do/detail/92237157/?foo=bar")
-	if target.OriginalURL != "https://hk.trip.com/things-to-do/detail/92237157/?foo=bar" {
-		t.Fatalf("original URL was changed: %s", target.OriginalURL)
-	}
-	if !target.IsHK {
-		t.Fatal("target should be marked HK")
-	}
-	parsed, err := url.Parse(target.NavigateURL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	values := parsed.Query()
-	if values.Get("locale") != "zh-HK" {
-		t.Fatalf("locale = %q, want zh-HK", values.Get("locale"))
-	}
-	if values.Get("curr") != "HKD" {
-		t.Fatalf("curr = %q, want HKD", values.Get("curr"))
-	}
-	if values.Get("foo") != "bar" {
-		t.Fatalf("existing query was not preserved: %s", target.NavigateURL)
-	}
-	if target.AcceptLanguage != hkAcceptLanguage {
-		t.Fatalf("accept language = %q, want HK language", target.AcceptLanguage)
-	}
-}
-
-func TestNavigationTargetForcesAnyTripURLToHongKongHKD(t *testing.T) {
-	target := newNavigationTarget("https://sg.trip.com/things-to-do/detail/92237157/?locale=en-sg&curr=CNY&foo=bar")
-	if !target.IsHK {
-		t.Fatal("Trip URL should be marked HK")
-	}
-	parsed, err := url.Parse(target.NavigateURL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if parsed.Scheme != "https" || parsed.Hostname() != "hk.trip.com" {
-		t.Fatalf("navigate URL = %q, want https://hk.trip.com", target.NavigateURL)
-	}
-	values := parsed.Query()
-	if values.Get("locale") != "zh-HK" || values.Get("curr") != "HKD" {
-		t.Fatalf("HK query = locale=%q curr=%q", values.Get("locale"), values.Get("curr"))
-	}
-	if values.Get("foo") != "bar" {
-		t.Fatalf("existing query was not preserved: %s", target.NavigateURL)
-	}
-}
-
-func TestNavigationTargetUsesRequestedSingaporeSite(t *testing.T) {
-	target := newNavigationTarget("https://hk.trip.com/things-to-do/detail/45892282/?foo=bar", siteConfigFor("sg"))
-	parsed, err := url.Parse(target.NavigateURL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if parsed.Hostname() != "sg.trip.com" {
-		t.Fatalf("host = %q, want sg.trip.com", parsed.Hostname())
-	}
-	if parsed.Query().Get("locale") != "en-SG" || parsed.Query().Get("curr") != "SGD" {
-		t.Fatalf("query = %q, want locale=en-SG curr=SGD", parsed.RawQuery)
-	}
-	if target.Currency != "SGD" || target.AcceptLanguage != "en-SG,en;q=0.9" {
-		t.Fatalf("unexpected SG target: %+v", target)
+func TestNavigationTargetUsesResolvedMarket(t *testing.T) {
+	for _, site := range []string{"hk", "sg", "jp", "tw", "de", "sa"} {
+		market, err := resolveMarketContext(site, "", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		target := newNavigationTarget("https://hk.trip.com/things-to-do/detail/45892282/?foo=bar&curr=CNY", market)
+		u, err := url.Parse(target.NavigateURL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if u.Hostname() != market.Host || u.Query().Get("locale") != market.Locale || u.Query().Get("curr") != market.Currency || u.Query().Get("foo") != "bar" || target.Market.Code != site {
+			t.Errorf("%s: %+v", site, target)
+		}
 	}
 }
 
 func TestNavigationTargetPreservesNonTripURL(t *testing.T) {
+	market, _ := resolveMarketContext("jp", "", "")
 	raw := "https://example.com/things-to-do/detail/92237157/?curr=CNY"
-	target := newNavigationTarget(raw)
-	if target.NavigateURL != raw || target.IsHK {
+	target := newNavigationTarget(raw, market)
+	if target.NavigateURL != raw || target.Market.Code != "" {
 		t.Fatalf("non-Trip URL should remain unchanged: %+v", target)
 	}
 }
 
-func TestPreferredLanguageForItemsUsesHKWhenPresent(t *testing.T) {
-	language := preferredLanguageForItems([]ScrapeItem{
-		{URL: "https://sg.trip.com/things-to-do/detail/1/"},
-		{URL: "https://hk.trip.com/things-to-do/detail/2/"},
-	})
-	if language != hkAcceptLanguage {
-		t.Fatalf("language = %q, want HK accept language", language)
+func TestApplyMarketBrowserDefaults(t *testing.T) {
+	market, err := resolveMarketContext("jp", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := TaskRequest{Market: market}
+	applyMarketBrowserDefaults(&r)
+	if r.BrowserOptions.Language != market.AcceptLanguage {
+		t.Fatalf("language = %q, want %q", r.BrowserOptions.Language, market.AcceptLanguage)
+	}
+	r.BrowserOptions.Language = "custom"
+	applyMarketBrowserDefaults(&r)
+	if r.BrowserOptions.Language != "custom" {
+		t.Fatalf("explicit language overwritten: %q", r.BrowserOptions.Language)
 	}
 }

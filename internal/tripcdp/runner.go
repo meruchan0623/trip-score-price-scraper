@@ -67,9 +67,7 @@ func scrapeSingle(request TaskRequest, reporter Reporter, runMode string) TaskRe
 	if state.Migrated {
 		reporter(Event{"event": "state_migrated", "state_dir": state.StateDir})
 	}
-	if request.BrowserOptions.Language == "" {
-		request.BrowserOptions.Language = siteConfigFor(request.Site).AcceptLanguage
-	}
+	applyMarketBrowserDefaults(&request)
 	runtimeDir := filepath.Join(filepath.Dir(outputPath), "_workers", "01_"+safeFilename(defaultVendor))
 	request.BrowserOptions.SessionFile = filepath.Join(runtimeDir, "session.json")
 	request.BrowserOptions.UserDataDir = filepath.Join(runtimeDir, "profile")
@@ -332,9 +330,7 @@ func scrapeVendorBatches(request TaskRequest, reporter Reporter, runMode string)
 		workerRequest.OutputPath = outputPath
 		workerRequest.BrowserOptions.SessionFile = filepath.Join(workerDir, "session.json")
 		workerRequest.BrowserOptions.UserDataDir = filepath.Join(workerDir, "profile")
-		if workerRequest.BrowserOptions.Language == "" {
-			workerRequest.BrowserOptions.Language = siteConfigFor(workerRequest.Site).AcceptLanguage
-		}
+		applyMarketBrowserDefaults(&workerRequest)
 		var sessionPrepareErr error
 		if err := ensureParent(workerRequest.BrowserOptions.SessionFile); err != nil {
 			sessionPrepareErr = err

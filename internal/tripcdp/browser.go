@@ -622,7 +622,7 @@ func (s *tripScraper) scrapeOne(ctx context.Context, item ScrapeItem, index int,
 		defer cancel()
 	}
 	base := Event{"vendor": s.vendor, "worker_id": s.workerID, "url_index": index, "url_total": total, "url": item.URL, "global_total": s.globalTotal}
-	target := newNavigationTarget(item.URL, siteConfigFor(s.request.Site))
+	target := newNavigationTarget(item.URL, s.request.Market)
 	s.currentTarget = target
 	canonicalItem := item
 	canonicalItem.URL = target.NavigateURL
@@ -631,7 +631,7 @@ func (s *tripScraper) scrapeOne(ctx context.Context, item ScrapeItem, index int,
 	s.currentScrapeNote = ""
 	s.currentQualityFailure = nil
 	s.currentQualityRetryAttempt = 0
-	s.emit(mergeEvent(Event{"event": "url_started", "first_trip_navigation_url": target.NavigateURL, "navigation_locale": target.Locale, "navigation_currency": target.Currency, "accept_language": target.AcceptLanguage, "session_nav_skipped": true}, base))
+	s.emit(mergeEvent(Event{"event": "url_started", "first_trip_navigation_url": target.NavigateURL, "navigation_locale": target.Market.Locale, "navigation_currency": target.Market.Currency, "accept_language": target.Market.AcceptLanguage, "session_nav_skipped": true}, base))
 	var lastSnapshot pageSnapshot
 	pageAttempt := 1
 	priceQualityRetries := 0
@@ -649,7 +649,7 @@ func (s *tripScraper) scrapeOne(ctx context.Context, item ScrapeItem, index int,
 		if err != nil {
 			return s.errorRows(canonicalItem, err, started, base)
 		}
-		invalidateUnexpectedCurrencyRows(rows, target.Currency)
+		invalidateUnexpectedCurrencyRows(rows, target.Market.Currency)
 		if !retry {
 			restartAfterURL := s.restartAfterURL
 			restartReason := s.restartReason
@@ -763,7 +763,7 @@ func (s *tripScraper) scrapeOneAttempt(ctx context.Context, item ScrapeItem, tar
 	} else {
 		s.emit(mergeEvent(Event{"event": "log", "stage": "session_load", "message": "session not loaded or unavailable", "session_nav_skipped": true}, base))
 	}
-	if err := applyUCStealth(ctx, s.page, target.AcceptLanguage); err != nil && ctx.Err() != nil {
+	if err := applyUCStealth(ctx, s.page, target.Market.AcceptLanguage); err != nil && ctx.Err() != nil {
 		return nil, pageSnapshot{}, false, err
 	}
 	if remove, err := s.page.EvalOnNewDocument(promotionContentCaptureJS); err == nil {
