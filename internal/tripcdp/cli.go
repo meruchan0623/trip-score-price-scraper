@@ -70,6 +70,8 @@ func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bo
 	var disableMemoryGuard bool
 	var runMode string
 	var browser string
+	var site string
+	var freshProfile bool
 	var urlsFile string
 	var excelInput string
 	var output string
@@ -122,6 +124,8 @@ func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bo
 	fs.IntVar(&stopGrace, "stop-grace-seconds", 30, "Seconds to wait for partial exports after SIGINT/SIGTERM before terminating workers.")
 	fs.StringVar(&runMode, "run-mode", "", "Preset run mode: mode1=headless full SKU/price/rating scrape; mode2=headless rating-only + product-info scrape (no SKU, no price columns).")
 	fs.StringVar(&browser, "browser", "chrome", "Browser to use. Only chrome is supported.")
+	fs.StringVar(&site, "site", "hk", "Trip subsite to scrape: hk or sg.")
+	fs.BoolVar(&freshProfile, "fresh-profile", false, "Start with an empty temporary Chrome profile instead of copying saved browser state.")
 	fs.BoolFunc("headless", "Run Chrome in headless mode.", func(string) error { headless = triState{set: true, value: true}; return nil })
 	fs.BoolFunc("no-headless", "Run Chrome with a visible browser window.", func(string) error { headless = triState{set: true, value: false}; return nil })
 	fs.StringVar(&sessionFile, "session-file", "", "Optional session file path.")
@@ -175,6 +179,9 @@ func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bo
 	}
 	if browser != "chrome" {
 		return TaskRequest{}, "", "", false, false, fmt.Errorf("--browser must be chrome")
+	}
+	if !validSite(site) {
+		return TaskRequest{}, "", "", false, false, fmt.Errorf("--site must be hk or sg")
 	}
 	if runMode != "" && runMode != "mode1" && runMode != "mode2" {
 		return TaskRequest{}, "", "", false, false, fmt.Errorf("--run-mode must be mode1 or mode2")
@@ -252,6 +259,8 @@ func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bo
 		qualityRerun.Headless = qualityRerunHeadless.value
 	}
 	return TaskRequest{
+		Site:                strings.ToLower(strings.TrimSpace(site)),
+		FreshProfile:        freshProfile,
 		InputPaths:          []string(inputs),
 		URLsFile:            urlsFile,
 		ExcelInput:          excelInput,

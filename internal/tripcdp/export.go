@@ -74,14 +74,17 @@ func exportRows(rows []map[string]string, outputPath string, ratingOnly bool, ex
 	if extractProductInfo {
 		fields = append(fields, "商品资讯")
 	}
-	fields = append(fields, "预定数", "评价数", "评分", "客户服务", "方便程度", "讯号状态", "中差评价数")
+	if !ratingOnly {
+		fields = append(fields, "总促销标签")
+	}
+	fields = append(fields, "月销量", "年销量", "总销量", "评价数", "评分", "好评率", "客户服务", "方便程度", "讯号状态", "中差评价数")
 	if hasScrapeNote {
 		fields = append(fields, "抓取备注")
 	}
 
 	for col, field := range fields {
 		cell, _ := excelize.CoordinatesToCellName(col+1, 1)
-		_ = file.SetCellValue(sheet, cell, field)
+		_ = file.SetCellValue(sheet, cell, exportHeader(field))
 	}
 	headerStyle, _ := file.NewStyle(&excelize.Style{Font: &excelize.Font{Bold: true}, Alignment: &excelize.Alignment{Horizontal: "center", Vertical: "center"}})
 	endHeader, _ := excelize.CoordinatesToCellName(len(fields), 1)
@@ -94,6 +97,9 @@ func exportRows(rows []map[string]string, outputPath string, ratingOnly bool, ex
 	for rowIndex, row := range rows {
 		for col, field := range fields {
 			value := row[field]
+			if value == "" {
+				continue
+			}
 			cell, _ := excelize.CoordinatesToCellName(col+1, rowIndex+2)
 			_ = file.SetCellValue(sheet, cell, value)
 			widths[col] = max(widths[col], min(runeLen(value)+2, 60))
@@ -113,7 +119,14 @@ func exportRows(rows []map[string]string, outputPath string, ratingOnly bool, ex
 }
 
 func priceQualityExportFields() []string {
-	return []string{"价格状态", "资源ID", "接口ItemID", "促销命中", "价格来源", "原始捕获价格"}
+	return []string{"价格状态", "原始捕获价格"}
+}
+
+func exportHeader(field string) string {
+	if field == "价格状态" {
+		return "价格可信标签"
+	}
+	return field
 }
 
 func ensureParent(path string) error {

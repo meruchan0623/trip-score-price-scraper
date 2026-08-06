@@ -53,6 +53,23 @@ func TestNavigationTargetForcesAnyTripURLToHongKongHKD(t *testing.T) {
 	}
 }
 
+func TestNavigationTargetUsesRequestedSingaporeSite(t *testing.T) {
+	target := newNavigationTarget("https://hk.trip.com/things-to-do/detail/45892282/?foo=bar", siteConfigFor("sg"))
+	parsed, err := url.Parse(target.NavigateURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Hostname() != "sg.trip.com" {
+		t.Fatalf("host = %q, want sg.trip.com", parsed.Hostname())
+	}
+	if parsed.Query().Get("locale") != "en-SG" || parsed.Query().Get("curr") != "SGD" {
+		t.Fatalf("query = %q, want locale=en-SG curr=SGD", parsed.RawQuery)
+	}
+	if target.Currency != "SGD" || target.AcceptLanguage != "en-SG,en;q=0.9" {
+		t.Fatalf("unexpected SG target: %+v", target)
+	}
+}
+
 func TestNavigationTargetPreservesNonTripURL(t *testing.T) {
 	raw := "https://example.com/things-to-do/detail/92237157/?curr=CNY"
 	target := newNavigationTarget(raw)

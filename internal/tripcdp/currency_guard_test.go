@@ -32,3 +32,13 @@ func TestInvalidateNonHKDPriceRowsKeepsHKD(t *testing.T) {
 		t.Fatalf("HKD row was changed: %+v", rows[0])
 	}
 }
+
+func TestInvalidateUnexpectedCurrencyRowsKeepsRequestedSGD(t *testing.T) {
+	rows := []map[string]string{{"货币": "SGD", "外显价格": "0.11", "实价": "0.10"}}
+
+	invalidateUnexpectedCurrencyRows(rows, "SGD")
+
+	if rows[0]["货币"] != "SGD" || rows[0]["实价"] != "0.10" {
+		t.Fatalf("SGD row was changed: %+v", rows[0])
+	}
+}
