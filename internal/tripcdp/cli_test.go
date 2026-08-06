@@ -3,6 +3,7 @@ package tripcdp
 import (
 	"bytes"
 	"io"
+	"strings"
 	"testing"
 	"time"
 )
@@ -160,12 +161,61 @@ func TestParseSiteParameter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseArgs failed: %v", err)
 	}
-	if request.Site != "sg" {
-		t.Fatalf("site = %q, want sg", request.Site)
+	if request.Market.Code != "sg" {
+		t.Fatalf("market code = %q, want sg", request.Market.Code)
 	}
 
 	if _, _, _, _, _, err := parseArgs([]string{"--site", "xx", "--input", "https://trip.com/detail/1"}, &bytes.Buffer{}); err == nil {
 		t.Fatal("unsupported site should fail")
+	}
+}
+
+func TestParseMarketDefaultsAndOverrides(t *testing.T) {
+	r, _, _, _, _, err := parseArgs([]string{"--input", "https://trip.com/detail/1"}, &bytes.Buffer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Market.Code != "hk" || r.Market.Locale != "zh-HK" || r.Market.Currency != "HKD" {
+		t.Fatalf("%+v", r.Market)
+	}
+
+	r, _, _, _, _, err = parseArgs([]string{"--site", "sg", "--locale", "zh_sg", "--currency", "myr", "--input", "https://trip.com/detail/1"}, &bytes.Buffer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Market.Host != "sg.trip.com" || r.Market.Locale != "zh-SG" || r.Market.Currency != "MYR" {
+		t.Fatalf("%+v", r.Market)
+	}
+}
+
+func TestParseMarketFlagErrors(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"--site", "xx", "--input", "https://trip.com/detail/1"}, "--site"},
+		{[]string{"--locale", "ja-US", "--input", "https://trip.com/detail/1"}, "--locale"},
+		{[]string{"--currency", "ZZZ", "--input", "https://trip.com/detail/1"}, "--currency"},
+	} {
+		_, _, _, _, _, err := parseArgs(tc.args, &bytes.Buffer{})
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Fatalf("args %v err=%v, want %s", tc.args, err, tc.want)
+		}
+	}
+	_, _, _, _, _, err := parseArgs([]string{"--site", "xx", "--input", "https://trip.com/detail/1"}, &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "supported: ae, au, br") {
+		t.Fatalf("site values are not sorted: %v", err)
+	}
+}
+
+func TestParseInvalidSiteListsSupportedValuesSorted(t *testing.T) {
+	_, _, _, _, _, err := parseArgs([]string{"--site", "xx", "--input", "https://trip.com/detail/1"}, &bytes.Buffer{})
+	if err == nil {
+		t.Fatal("unsupported site should fail")
+	}
+	message := err.Error()
+	if !strings.Contains(message, "supported: ae, au, br") {
+		t.Fatalf("site supported values are not sorted: %s", message)
 	}
 }
 
