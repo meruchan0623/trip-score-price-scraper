@@ -957,7 +957,7 @@ func (s *tripScraper) extractRows(ctx context.Context, item ScrapeItem, snapshot
 		if !allowNoSKUFallback(baseRow, snapshot) {
 			return nil, false
 		}
-		currency, price := splitPrice(s.currentPrice(ctx, 3))
+		currency, price := parseDisplayPrice(s.currentPrice(ctx, 3), s.request.Market)
 		row := cloneRow(baseRow)
 		row["货币"] = currency
 		row["外显价格"] = price
@@ -2332,26 +2332,26 @@ func (s *tripScraper) waitCurrentPriceBundleStable(ctx context.Context, maxWait 
 	deadline := started.Add(maxWait)
 	for {
 		if ctx.Err() != nil {
-			return selectStablePriceBundle(samples, time.Since(started)), elapsedMS(started)
+			return selectStablePriceBundle(samples, time.Since(started), s.request.Market), elapsedMS(started)
 		}
 		bundle := s.currentPriceBundle()
 		bundle.SampleAtMS = elapsedMS(started)
 		samples = append(samples, bundle)
-		if stable, ok := stablePriceBundle(samples, 350*time.Millisecond); ok {
+		if stable, ok := stablePriceBundle(samples, 350*time.Millisecond, s.request.Market); ok {
 			return stable, elapsedMS(started)
 		}
 		if time.Now().After(deadline) {
-			return selectStablePriceBundle(samples, time.Since(started)), elapsedMS(started)
+			return selectStablePriceBundle(samples, time.Since(started), s.request.Market), elapsedMS(started)
 		}
 		select {
 		case <-ctx.Done():
-			return selectStablePriceBundle(samples, time.Since(started)), elapsedMS(started)
+			return selectStablePriceBundle(samples, time.Since(started), s.request.Market), elapsedMS(started)
 		case <-time.After(120 * time.Millisecond):
 		}
 	}
 }
 
-func stablePriceBundle(samples []priceBundle, minAge time.Duration) (priceBundle, bool) {
+func stablePriceBundle(samples []priceBundle, minAge time.Duration, markets ...MarketContext) (priceBundle, bool) {
 	if len(samples) < 2 {
 		return priceBundle{}, false
 	}
@@ -2360,7 +2360,11 @@ func stablePriceBundle(samples []priceBundle, minAge time.Duration) (priceBundle
 	if time.Duration(last.SampleAtMS)*time.Millisecond < minAge {
 		return priceBundle{}, false
 	}
-	if !isValidDisplayPrice(last.DisplayPrice) {
+	valid := isValidDisplayPrice(last.DisplayPrice)
+	if len(markets) > 0 {
+		valid = isValidDisplayPriceForMarket(last.DisplayPrice, markets[0])
+	}
+	if !valid {
 		return priceBundle{}, false
 	}
 	if bundleSignature(last) == "" || bundleSignature(last) != bundleSignature(prev) {
@@ -2369,20 +2373,24 @@ func stablePriceBundle(samples []priceBundle, minAge time.Duration) (priceBundle
 	return last, true
 }
 
-func selectStablePriceBundle(samples []priceBundle, elapsed time.Duration) priceBundle {
+func selectStablePriceBundle(samples []priceBundle, elapsed time.Duration, markets ...MarketContext) priceBundle {
 	if len(samples) == 0 {
 		return priceBundle{}
 	}
-	if stable, ok := stablePriceBundle(samples, 0); ok {
+	if stable, ok := stablePriceBundle(samples, 0, markets...); ok {
 		return stable
 	}
+	valid := func(value string) bool { return isValidDisplayPrice(value) }
+	if len(markets) > 0 {
+		valid = func(value string) bool { return isValidDisplayPriceForMarket(value, markets[0]) }
+	}
 	for i := len(samples) - 1; i >= 0; i-- {
-		if isValidDisplayPrice(samples[i].DisplayPrice) && time.Duration(samples[i].SampleAtMS)*time.Millisecond >= min(elapsed, 350*time.Millisecond) {
+		if valid(samples[i].DisplayPrice) && time.Duration(samples[i].SampleAtMS)*time.Millisecond >= min(elapsed, 350*time.Millisecond) {
 			return samples[i]
 		}
 	}
 	for i := len(samples) - 1; i >= 0; i-- {
-		if isValidDisplayPrice(samples[i].DisplayPrice) {
+		if valid(samples[i].DisplayPrice) {
 			return samples[i]
 		}
 	}
@@ -2402,7 +2410,7 @@ func bundleSignature(bundle priceBundle) string {
 	}, "||")
 }
 
-func currentCombinationPriceRow(selected []skuOption, bundle priceBundle, fallbackDisplayPrice string, extractRealPrice bool) map[string]string {
+func currentCombinationPriceRow(selected []skuOption, bundle priceBundle, fallbackDisplayPrice string, extractRealPrice bool, markets ...MarketContext) map[string]string {
 	if len(selected) == 0 {
 		return nil
 	}
@@ -2416,9 +2424,15 @@ func currentCombinationPriceRow(selected []skuOption, bundle priceBundle, fallba
 		displayPriceText = fallbackDisplayPrice
 	}
 	currency, price := splitPrice(displayPriceText)
+	if len(markets) > 0 {
+		currency, price = parseDisplayPrice(displayPriceText, markets[0])
+	}
 	realCurrency, realPrice := "N/A", "N/A"
 	if extractRealPrice {
 		realCurrency, realPrice = splitPrice(bundle.RealPrice)
+		if len(markets) > 0 {
+			realCurrency, realPrice = parseDisplayPrice(bundle.RealPrice, markets[0])
+		}
 		if realPrice == "N/A" {
 			realCurrency, realPrice = "N/A", ""
 		}
@@ -3310,6 +3324,10 @@ func (s *tripScraper) markRestartAfterURLIfUnhealthy(reason string) {
 
 func (s *tripScraper) currentPrice(ctx context.Context, maxAttempts int) string {
 	config := siteConfigFor(s.request.Site)
+	pricePrefix := config.PricePrefix
+	if len(s.request.Market.PricePrefixes) > 0 {
+		pricePrefix = s.request.Market.PricePrefixes[0]
+	}
 	selectors := []string{
 		`#select_quantity div[class*="style_m_select_quantity_container__"] div div[class*="style_m_select_choice_option_wrapper__"] div[class*="style_m_people_price__"] div div span span`,
 		`#select_quantity > div.xtaro-xview > div > div.xtaro-xview > div.xtaro-xview > div > div > span > span`,
@@ -3335,7 +3353,7 @@ func (s *tripScraper) currentPrice(ctx context.Context, maxAttempts int) string 
 					if (text && text.includes(pricePrefix) && /[0-9,]+(?:\.\d+)?/.test(text)) return text;
 				}
 				return '';
-			}`, selector, config.PricePrefix)
+			}`, selector, pricePrefix)
 			if text != "" {
 				return text
 			}
@@ -3348,7 +3366,7 @@ func (s *tripScraper) currentPrice(ctx context.Context, maxAttempts int) string 
 				if (text.includes(pricePrefix) && /[0-9,]+(?:\.\d+)?/.test(text)) return text;
 			}
 			return '';
-		}`, config.PricePrefix)
+		}`, pricePrefix)
 		if text != "" {
 			return text
 		}
@@ -3359,6 +3377,11 @@ func (s *tripScraper) currentPrice(ctx context.Context, maxAttempts int) string 
 
 func (s *tripScraper) currentPriceBundle() priceBundle {
 	config := siteConfigFor(s.request.Site)
+	market := s.request.Market
+	pricePrefix := config.PricePrefix
+	if len(market.PricePrefixes) > 0 {
+		pricePrefix = market.PricePrefixes[0]
+	}
 	displaySelectors := []string{
 		`#select_quantity div[class*="style_m_select_quantity_container__"] div div[class*="style_m_select_choice_option_wrapper__"] div[class*="style_m_people_price__"] div div span span`,
 		`#select_quantity > div.xtaro-xview > div > div.xtaro-xview > div.xtaro-xview > div > div > span > span`,
@@ -3370,7 +3393,7 @@ func (s *tripScraper) currentPriceBundle() priceBundle {
 		fmt.Sprintf(`span[currency="%s"]`, config.Currency),
 	}
 	var bundle priceBundle
-	_ = s.evalJSON(&bundle, currentPriceBundleJS, displaySelectors, s.request.ExtractRealPrice, config.PricePrefix)
+	_ = s.evalJSON(&bundle, currentPriceBundleJS, displaySelectors, s.request.ExtractRealPrice, pricePrefix)
 	return bundle
 }
 
@@ -3531,39 +3554,6 @@ func previewText(value string, limit int) string {
 		return value
 	}
 	return string(runes[:limit])
-}
-
-var validDisplayPricePattern = regexp.MustCompile(`^(?:HK\$|S\$)\s*[0-9,]+(?:\.\d+)?`)
-
-func isValidDisplayPrice(value string) bool {
-	text := strings.TrimSpace(value)
-	return validDisplayPricePattern.MatchString(text)
-}
-
-func splitPrice(value string) (string, string) {
-	priceText := strings.TrimSpace(value)
-	if priceText == "" || priceText == "价格未找到" || priceText == "未找到" {
-		return "N/A", "N/A"
-	}
-	currency := "N/A"
-	if strings.Contains(priceText, "HK$") {
-		currency = "HKD"
-		priceText = strings.ReplaceAll(priceText, "HK$", "")
-	} else if strings.Contains(priceText, "S$") {
-		currency = "SGD"
-		priceText = strings.ReplaceAll(priceText, "S$", "")
-	} else if strings.Contains(priceText, "$") {
-		currency = "USD"
-		priceText = strings.ReplaceAll(priceText, "$", "")
-	} else if strings.Contains(priceText, "¥") || strings.Contains(priceText, "￥") || strings.Contains(priceText, "CNY") {
-		currency = "CNY"
-		priceText = strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(priceText, "¥", ""), "￥", ""), "CNY", "")
-	}
-	match := regexp.MustCompile(`([0-9,]+\.?[0-9]*)`).FindStringSubmatch(priceText)
-	if len(match) == 0 {
-		return currency, strings.TrimSpace(priceText)
-	}
-	return currency, strings.ReplaceAll(match[1], ",", "")
 }
 
 func formatPriceNumber(value float64) string {
