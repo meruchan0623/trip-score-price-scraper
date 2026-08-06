@@ -200,7 +200,7 @@ func TestExportRowsAddsScrapeNoteColumnOnlyWhenPresent(t *testing.T) {
 	}
 }
 
-func TestExportRowsAddsPriceQualityColumnsOnlyWhenPresent(t *testing.T) {
+func TestExportRowsAddsPriceTrustColumnWithoutRawCapturedPrice(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "quality.xlsx")
 	rows := []map[string]string{{
 		"厂商":       "Vendor",
@@ -241,12 +241,12 @@ func TestExportRowsAddsPriceQualityColumnsOnlyWhenPresent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, field := range []string{"价格可信标签", "原始捕获价格", "抓取备注"} {
+	for _, field := range []string{"价格可信标签", "抓取备注"} {
 		if !containsString(gotRows[0], field) {
 			t.Fatalf("quality header %q missing from %#v", field, gotRows[0])
 		}
 	}
-	for _, field := range []string{"价格状态", "资源ID", "接口ItemID", "促销命中", "价格来源"} {
+	for _, field := range []string{"价格状态", "原始捕获价格", "资源ID", "接口ItemID", "促销命中", "价格来源"} {
 		if containsString(gotRows[0], field) {
 			t.Fatalf("internal quality header %q must not be exported: %#v", field, gotRows[0])
 		}
@@ -256,9 +256,6 @@ func TestExportRowsAddsPriceQualityColumnsOnlyWhenPresent(t *testing.T) {
 	}
 	if gotRows[1][indexOfString(gotRows[0], "外显价格")] != "" || gotRows[1][indexOfString(gotRows[0], "实价")] != "" {
 		t.Fatalf("untrusted prices should be blank in price columns: %#v", gotRows[1])
-	}
-	if gotRows[1][indexOfString(gotRows[0], "原始捕获价格")] != "22" {
-		t.Fatalf("raw captured price missing: %#v", gotRows[1])
 	}
 }
 

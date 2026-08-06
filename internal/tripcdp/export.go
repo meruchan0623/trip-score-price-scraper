@@ -36,7 +36,7 @@ func exportRows(rows []map[string]string, outputPath string, ratingOnly bool, ex
 }
 
 func priceQualityExportFields() []string {
-	return []string{"价格状态", "原始捕获价格"}
+	return []string{"价格状态"}
 }
 
 func exportHeader(field string) string {
