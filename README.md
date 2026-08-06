@@ -24,7 +24,8 @@ go build -o /tmp/trip-score-cdp ./cmd/trip-score-cdp
 - 客户服务、方便程度、讯号状态、中差评价数
 - 商品资讯
 - SKU 层级组合
-- 外显价格、动态实价、促销标签
+- 外显价格、动态实价、SKU 促销标签、商品级总促销标签
+- 通过 `--site hk|sg` 切换香港站或新加坡站（默认 `hk`）
 - 厂商 Excel 批量抓取
 - TSIM / 任意基准厂商 vs 竞对厂商横向比价
 
@@ -74,6 +75,31 @@ go build -o /tmp/trip-score-cdp ./cmd/trip-score-cdp
   --input "https://www.trip.com/things-to-do/detail/..." \
   --output ./trip_product.xlsx
 ```
+
+### 分站切换
+
+`--site` 会统一设置目标 host、`locale`、`curr`、浏览器语言、价格前缀和币种质量门禁。当前支持：
+
+```text
+hk -> hk.trip.com / zh-HK / HKD / HK$
+sg -> sg.trip.com / en-SG / SGD / S$
+```
+
+例如抓取同一商品的新加坡站：
+
+```bash
+/tmp/trip-score-cdp \
+  --site sg \
+  --fresh-profile \
+  --no-headless \
+  --delay-profile normal \
+  --input "https://hk.trip.com/things-to-do/detail/45892282/" \
+  --output ./trip_product_sg.xlsx
+```
+
+输入 URL 的原始分站仅用于识别商品路径；最终导航和输出 URL 由 `--site` 规范化。Hermes 指定产品手工交付流程仍固定使用默认香港站，不传 `--site sg`。
+
+公共页面本地调试时可显式传 `--fresh-profile`，避免复制历史浏览器资料；该参数默认关闭，且不会复用已保存的登录态。
 
 ### URL 文件抓取
 
@@ -208,6 +234,14 @@ mode2 = 有头仅评分/商品资讯抓取：只输出 商品ID、URL、商品�
 ```
 
 `mode2` 是固定兼容模式，对齐旧 GUI 中只勾选「仅抓取评分」+「抓取商品资讯」的行为；即使误传 `--real-price` 或 `--no-rating-only`，也不会进入 SKU/价格抓取路径。
+
+### SKU 接口批量价格
+
+`mode1` 会优先复用真实商品页加载期间捕获的 `getProductInfo` 与 `getProductPriceCalendar` 响应：前者提供合法 SKU 叶子、`packageId`、`resourceId` 与销售属性，后者提供当前日期的原价、折后价、促销和库存。程序按 `packageId + resourceId` 合并，不会用所有属性值的笛卡尔积虚构 SKU。
+
+当当前价格覆盖率达到 80% 时，程序直接使用批量接口价格，并在 JSON 事件中输出 `sku_api_batch_used`、树节点数、已报价数和缺价数；未报价的树节点只计入边界诊断，不伪造价格行。接口缺失、失败、资源 ID 不一致或覆盖率低于 80% 时，输出 `sku_api_batch_fallback` 并继续使用原有 CDP 逐 SKU 交互和价格质量门禁。
+
+接口字段映射：`priceInfo.originalPrice` → 外显价格，`priceInfo.price` → 实价，`preferentialPriceDetails` → SKU 促销标签。这里的实价是当前公开可预订折后价；结账价仍可能受日期、数量、附加产品或用户权益影响。产品级「总促销标签」与 SKU 级「促销标签」继续分开保存。
 
 ## 延迟档位
 

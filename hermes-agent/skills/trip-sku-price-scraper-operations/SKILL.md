@@ -185,12 +185,12 @@ The native columns are:
 
 ```text
 商品ID, URL, 商品名称, SKU层级1...N, 货币, 外显价格, 实价, 促销标签,
-[价格状态, 资源ID, 接口ItemID, 促销命中, 价格来源, 原始捕获价格 when present],
-商品资讯, 预定数, 评价数, 评分, 客户服务, 方便程度, 讯号状态, 中差评价数,
+[价格可信标签, 原始捕获价格 when present], 商品资讯, 总促销标签,
+预定数, 评价数, 评分, 客户服务, 方便程度, 讯号状态, 中差评价数,
 [抓取备注 when present]
 ```
 
-`SKU层级1...N` expands to the actual maximum SKU depth. The six price-quality columns appear together only when the native export has price-quality data; `抓取备注` appears only when at least one row has a note.
+`SKU层级1...N` expands to the actual maximum SKU depth. `价格可信标签` and `原始捕获价格` appear only when the native export has price-quality data; internal diagnostic fields `资源ID`, `接口ItemID`, `促销命中`, and `价格来源` are not exported. `总促销标签` follows `商品资讯`; `抓取备注` appears only when at least one row has a note.
 
 The following are not manual-product deliverables: one workbook per requested URL, `product_<id>_pricelist_HKD.xlsx`, a `價格清單` sheet, a two/four-column rebuilt price list, a cleaned workbook, or a workbook with Agent-created `摘要` / `SKU价格明细` sheets.
 
