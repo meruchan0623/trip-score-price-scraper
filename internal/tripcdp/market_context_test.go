@@ -94,3 +94,39 @@ func TestValidateMarketObservation(t *testing.T) {
 		}
 	}
 }
+
+func TestParseMarketSpecAndDedup(t *testing.T) {
+	cases := []struct {
+		spec                   string
+		code, locale, currency string
+	}{
+		{"jp", "jp", "ja-JP", "JPY"},
+		{"sg:zh-SG", "sg", "zh-SG", "SGD"},
+		{"sg:zh-SG:myr", "sg", "zh-SG", "MYR"},
+	}
+	for _, tc := range cases {
+		got, err := parseMarketSpec(tc.spec)
+		if err != nil || got.Code != tc.code || got.Locale != tc.locale || got.Currency != tc.currency {
+			t.Fatalf("parseMarketSpec(%q) = %+v, err=%v", tc.spec, got, err)
+		}
+	}
+	markets, err := resolveMarketSpecs([]string{"hk", "jp", "hk:zh-HK:HKD", "jp"})
+	if err != nil || len(markets) != 2 || markets[0].Code != "hk" || markets[1].Code != "jp" {
+		t.Fatalf("resolved markets = %+v, err=%v", markets, err)
+	}
+	if !sameMarketContext(markets[0], markets[0]) || sameMarketContext(markets[0], markets[1]) {
+		t.Fatal("sameMarketContext identity comparison failed")
+	}
+	variants, err := resolveMarketSpecs([]string{"sg:zh-SG:SGD", "sg:en-SG:SGD", "sg:zh-SG:MYR"})
+	if err != nil || len(variants) != 3 {
+		t.Fatalf("same-site variants were deduplicated: %+v, err=%v", variants, err)
+	}
+}
+
+func TestParseMarketSpecRejectsMalformedValues(t *testing.T) {
+	for _, spec := range []string{"", "sg:", "sg:zh-SG:MYR:extra", "xx", "hk:ja-US", "hk:zh-HK:ZZZ"} {
+		if _, err := parseMarketSpec(spec); err == nil {
+			t.Fatalf("parseMarketSpec(%q) unexpectedly succeeded", spec)
+		}
+	}
+}

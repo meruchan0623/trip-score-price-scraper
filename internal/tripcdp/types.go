@@ -56,6 +56,8 @@ type QualityRerunOptions struct {
 
 type TaskRequest struct {
 	Market              MarketContext
+	Markets             []MarketContext
+	MarketWorkers       int
 	FreshProfile        bool
 	InputPaths          []string
 	URLsFile            string
@@ -93,6 +95,26 @@ type TaskResult struct {
 	QualityRerunAttemptedURLs int
 	QualityRerunRecoveredURLs int
 	FinalQualityFailedURLs    int
+	MarketCount               int
+	SuccessfulMarketCount     int
+	FailedMarketCount         int
+	PartialSuccess            bool
+	MarketResults             []MarketJobResult
+}
+
+type MarketJob struct {
+	Index     int
+	Market    MarketContext
+	Inputs    []ScrapeItem
+	SheetName string
+}
+
+type MarketJobResult struct {
+	Job          MarketJob
+	Rows         []map[string]string
+	Success      bool
+	FailureClass string
+	Error        string
 }
 
 type Event map[string]any

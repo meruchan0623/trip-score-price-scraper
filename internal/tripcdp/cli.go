@@ -59,6 +59,7 @@ func Run(argv []string) int {
 
 func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bool, bool, error) {
 	var inputs stringList
+	var marketSpecs stringList
 	var headless triState
 	var ratingOnly triState
 	var realPrice triState
@@ -80,6 +81,7 @@ func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bo
 	var output string
 	var outputDir string
 	var workers int
+	var marketWorkers int
 	var sessionFile string
 	var logFile string
 	var logLevel string
@@ -118,6 +120,8 @@ func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bo
 		fs.PrintDefaults()
 	}
 	fs.Var(&inputs, "input", "Product URL. Repeat for multiple URLs.")
+	fs.Var(&marketSpecs, "market", "Market context site[:locale[:currency]]. Repeat for multi-market scraping.")
+	fs.IntVar(&marketWorkers, "market-workers", 2, "Concurrent market jobs, 1-3. Defaults to 2.")
 	fs.StringVar(&urlsFile, "urls-file", "", "Text file containing one product URL per line.")
 	fs.StringVar(&excelInput, "excel-input", "", "Excel workbook. First row contains vendors; links start from row 2.")
 	fs.StringVar(&output, "output", "", "Excel output path.")
@@ -185,9 +189,39 @@ func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bo
 	if browser != "chrome" {
 		return TaskRequest{}, "", "", false, false, fmt.Errorf("--browser must be chrome")
 	}
+	if marketWorkers < 1 || marketWorkers > 3 {
+		return TaskRequest{}, "", "", false, false, fmt.Errorf("--market-workers must be between 1 and 3")
+	}
+	if len(marketSpecs) > 0 {
+		for _, name := range []string{"site", "locale", "currency"} {
+			if stringFlagPassed(argv, name) {
+				return TaskRequest{}, "", "", false, false, fmt.Errorf("--market cannot be combined with --%s", name)
+			}
+		}
+		if excelInput != "" {
+			return TaskRequest{}, "", "", false, false, fmt.Errorf("--market cannot be combined with --excel-input")
+		}
+		if compareVendor != "" {
+			return TaskRequest{}, "", "", false, false, fmt.Errorf("--market cannot be combined with --compare-vendor")
+		}
+		if runMode == "mode2" || (ratingOnly.set && ratingOnly.value) {
+			return TaskRequest{}, "", "", false, false, fmt.Errorf("--market cannot be combined with rating-only or mode2")
+		}
+	}
 	market, err := resolveMarketContext(site, locale, currency)
 	if err != nil {
 		return TaskRequest{}, "", "", false, false, flagValueError(err)
+	}
+	var markets []MarketContext
+	if len(marketSpecs) > 0 {
+		markets, err = resolveMarketSpecs([]string(marketSpecs))
+		if err != nil {
+			return TaskRequest{}, "", "", false, false, err
+		}
+		if len(markets) == 0 {
+			return TaskRequest{}, "", "", false, false, fmt.Errorf("at least one --market is required")
+		}
+		market = MarketContext{}
 	}
 	if runMode != "" && runMode != "mode1" && runMode != "mode2" {
 		return TaskRequest{}, "", "", false, false, fmt.Errorf("--run-mode must be mode1 or mode2")
@@ -266,6 +300,8 @@ func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bo
 	}
 	return TaskRequest{
 		Market:              market,
+		Markets:             markets,
+		MarketWorkers:       marketWorkers,
 		FreshProfile:        freshProfile,
 		InputPaths:          []string(inputs),
 		URLsFile:            urlsFile,

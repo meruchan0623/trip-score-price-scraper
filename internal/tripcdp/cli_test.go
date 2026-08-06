@@ -3,6 +3,7 @@ package tripcdp
 import (
 	"bytes"
 	"io"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -205,6 +206,77 @@ func TestParseMarketFlagErrors(t *testing.T) {
 	_, _, _, _, _, err := parseArgs([]string{"--site", "xx", "--input", "https://trip.com/detail/1"}, &bytes.Buffer{})
 	if err == nil || !strings.Contains(err.Error(), "supported: ae, au, br") {
 		t.Fatalf("site values are not sorted: %v", err)
+	}
+}
+
+func TestParseMultiMarketCLIContract(t *testing.T) {
+	r, _, _, _, _, err := parseArgs([]string{
+		"--market", "hk", "--market", "jp", "--market-workers", "3",
+		"--input", "https://trip.com/detail/1", "--output", "multi.xlsx",
+	}, &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("multi-market parse failed: %v", err)
+	}
+	if len(r.Markets) != 2 || r.Markets[0].Code != "hk" || r.Markets[1].Code != "jp" || r.MarketWorkers != 3 {
+		t.Fatalf("request markets/workers = %+v/%d", r.Markets, r.MarketWorkers)
+	}
+	if !reflect.DeepEqual(r.Market, MarketContext{}) {
+		t.Fatalf("multi-market request must not populate legacy Market: %+v", r.Market)
+	}
+	r, _, _, _, _, err = parseArgs([]string{"--market", "jp", "--input", "https://trip.com/detail/1"}, &bytes.Buffer{})
+	if err != nil || len(r.Markets) != 1 || r.MarketWorkers != 2 {
+		t.Fatalf("single explicit market defaults = %+v, workers=%d, err=%v", r.Markets, r.MarketWorkers, err)
+	}
+}
+
+func TestParseMultiMarketRejectsConflictingModes(t *testing.T) {
+	cases := []struct {
+		args []string
+		want string
+	}{
+		{[]string{"--market", "jp", "--site", "sg", "--input", "https://trip.com/detail/1"}, "--site"},
+		{[]string{"--market", "jp", "--locale", "ja-JP", "--input", "https://trip.com/detail/1"}, "--locale"},
+		{[]string{"--market", "jp", "--currency", "JPY", "--input", "https://trip.com/detail/1"}, "--currency"},
+		{[]string{"--market", "jp", "--excel-input", "vendors.xlsx"}, "--excel-input"},
+		{[]string{"--market", "jp", "--compare-vendor", "base", "--input", "https://trip.com/detail/1"}, "--compare-vendor"},
+		{[]string{"--market", "jp", "--rating-only", "--input", "https://trip.com/detail/1"}, "rating-only"},
+		{[]string{"--market", "jp", "--run-mode", "mode2", "--input", "https://trip.com/detail/1"}, "mode2"},
+	}
+	for _, tc := range cases {
+		if _, _, _, _, _, err := parseArgs(tc.args, &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Fatalf("conflict args=%v err=%v, want %q", tc.args, err, tc.want)
+		}
+	}
+}
+
+func TestRunRejectsMultiMarketConflictsBeforeBrowser(t *testing.T) {
+	if got := Run([]string{"--market", "jp", "--rating-only", "--input", "https://trip.com/detail/1"}); got != 2 {
+		t.Fatalf("Run conflict exit=%d, want 2", got)
+	}
+}
+
+func TestParseMarketWorkersBounds(t *testing.T) {
+	for _, value := range []string{"0", "4"} {
+		if _, _, _, _, _, err := parseArgs([]string{"--market", "jp", "--market-workers", value, "--input", "https://trip.com/detail/1"}, &bytes.Buffer{}); err == nil {
+			t.Fatalf("market-workers=%s unexpectedly succeeded", value)
+		}
+	}
+	for _, value := range []string{"1", "3"} {
+		r, _, _, _, _, err := parseArgs([]string{"--market", "jp", "--market-workers", value, "--input", "https://trip.com/detail/1"}, &bytes.Buffer{})
+		if err != nil || r.MarketWorkers != map[string]int{"1": 1, "3": 3}[value] {
+			t.Fatalf("market-workers=%s parse=%d err=%v", value, r.MarketWorkers, err)
+		}
+	}
+	defaultRequest, _, _, _, _, err := parseArgs([]string{"--market", "jp", "--input", "https://trip.com/detail/1"}, &bytes.Buffer{})
+	if err != nil || defaultRequest.MarketWorkers != 2 {
+		t.Fatalf("default market-workers=%d err=%v, want 2", defaultRequest.MarketWorkers, err)
+	}
+}
+
+func TestTaskResultCarriesMultiMarketContract(t *testing.T) {
+	result := TaskResult{PartialSuccess: true, MarketResults: []MarketJobResult{{Success: true}}}
+	if !result.PartialSuccess || len(result.MarketResults) != 1 || !result.MarketResults[0].Success {
+		t.Fatalf("multi-market result contract = %+v", result)
 	}
 }
 

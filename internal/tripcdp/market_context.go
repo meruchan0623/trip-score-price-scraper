@@ -204,3 +204,56 @@ func resolveMarketContext(site, locale, currency string) (MarketContext, error) 
 	market.PricePrefixes = append([]string(nil), currencyPricePrefixes[market.Currency]...)
 	return market, nil
 }
+
+func parseMarketSpec(spec string) (MarketContext, error) {
+	parts := strings.Split(spec, ":")
+	if len(parts) < 1 || len(parts) > 3 || strings.TrimSpace(parts[0]) == "" {
+		return MarketContext{}, fmt.Errorf("invalid market specification %q", spec)
+	}
+	for _, part := range parts {
+		if strings.TrimSpace(part) == "" {
+			return MarketContext{}, fmt.Errorf("invalid market specification %q", spec)
+		}
+	}
+	var locale, currency string
+	if len(parts) >= 2 {
+		locale = parts[1]
+	}
+	if len(parts) == 3 {
+		currency = parts[2]
+	}
+	market, err := resolveMarketContext(parts[0], locale, currency)
+	if err != nil {
+		return MarketContext{}, flagValueError(err)
+	}
+	return market, nil
+}
+
+func sameMarketContext(a, b MarketContext) bool {
+	return strings.EqualFold(strings.TrimSpace(a.Code), strings.TrimSpace(b.Code)) &&
+		strings.EqualFold(strings.TrimSpace(a.SiteID), strings.TrimSpace(b.SiteID)) &&
+		strings.EqualFold(strings.TrimSpace(a.Host), strings.TrimSpace(b.Host)) &&
+		normalizeLocale(a.Locale) == normalizeLocale(b.Locale) &&
+		strings.EqualFold(strings.TrimSpace(a.Currency), strings.TrimSpace(b.Currency))
+}
+
+func resolveMarketSpecs(specs []string) ([]MarketContext, error) {
+	markets := make([]MarketContext, 0, len(specs))
+	for _, spec := range specs {
+		market, err := parseMarketSpec(spec)
+		if err != nil {
+			return nil, err
+		}
+		duplicate := false
+		for _, existing := range markets {
+			if sameMarketContext(existing, market) {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			markets = append(markets, market)
+		}
+	}
+	return markets, nil
+}
