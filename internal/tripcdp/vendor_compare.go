@@ -289,10 +289,11 @@ func loadVendorProducts(xlsxPath string) (map[string][]productSKU, error) {
 	}
 	products := map[string][]productSKU{}
 	currentPID, currentName, currentURL := "", "", ""
-	hasPriceStatus := false
-	if _, ok := colIdx["价格状态"]; ok {
-		hasPriceStatus = true
+	priceStatusHeader := "价格状态"
+	if _, ok := colIdx["价格可信标签"]; ok {
+		priceStatusHeader = "价格可信标签"
 	}
+	_, hasPriceStatus := colIdx[priceStatusHeader]
 	for _, row := range rows[1:] {
 		pid := getVal(row, "商品ID")
 		if pid != "" {
@@ -303,7 +304,7 @@ func loadVendorProducts(xlsxPath string) (map[string][]productSKU, error) {
 		if currentPID == "" {
 			continue
 		}
-		if hasPriceStatus && !isTrustedPriceStatus(getVal(row, "价格状态")) {
+		if hasPriceStatus && !isTrustedPriceStatus(getVal(row, priceStatusHeader)) {
 			continue
 		}
 		realPriceStr := getVal(row, "实价")

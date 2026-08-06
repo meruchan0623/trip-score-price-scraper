@@ -41,6 +41,7 @@ type tripScraper struct {
 	currentScrapeNote          string
 	currentQualityFailure      *priceQualityTracker
 	currentQualityRetryAttempt int
+	currentTarget              navigationTarget
 }
 
 type skuLayerInfo struct {
@@ -129,6 +130,30 @@ type baseRatingBundle struct {
 	SampleAtMS     int    `json:"sample_at_ms"`
 }
 
+type capturedAPIResponse struct {
+	URL    string `json:"url"`
+	Status int    `json:"status"`
+	Text   string `json:"text"`
+}
+
+type capturedAPIFields struct {
+	ProductName    string
+	ProductInfo    string
+	ReviewCount    string
+	Score          string
+	GoodRate       string
+	Customer       string
+	Convenience    string
+	Signal         string
+	BadReviewCount string
+}
+
+type productSalesVolume struct {
+	Monthly int64 `json:"monthly_sales"`
+	Yearly  int64 `json:"yearly_sales"`
+	Total   int64 `json:"total_sales"`
+}
+
 type pageSnapshot struct {
 	URL             string `json:"url"`
 	ReadyState      string `json:"ready_state"`
@@ -156,7 +181,7 @@ type navigationMonitor struct {
 	cancel         context.CancelFunc
 }
 
-const currentPriceBundleJS = `(displaySelectors, includeReal) => {
+const currentPriceBundleJS = `(displaySelectors, includeReal, pricePrefix) => {
 	const realSelector = 'div[class*="price-comp_m_footer_left_total"] div div div span span';
 	const footerSelector = 'div[class*="price-comp_m_footer_left"]';
 	const promoSelector = footerSelector + ' div span';
@@ -167,7 +192,7 @@ const currentPriceBundleJS = `(displaySelectors, includeReal) => {
 		return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
 	};
 	const textOf = (el) => (el && (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ')) || '';
-	const validPrice = (text) => text && text.includes('HK$') && /^HK\$\s*[0-9,]+(?:\.\d+)?/.test(text);
+	const validPrice = (text) => text && text.includes(pricePrefix) && /[0-9,]+(?:\.\d+)?/.test(text);
 	let displayPrice = '';
 	for (const selector of displaySelectors) {
 		for (const el of document.querySelectorAll(selector)) {
@@ -213,13 +238,94 @@ const currentPriceBundleJS = `(displaySelectors, includeReal) => {
 	for (const el of document.querySelectorAll(promoSelector)) {
 		if (!isVisible(el)) continue;
 		const text = textOf(el);
-		if (text && !text.includes('HK$') && (text.includes('減') || text.includes('%') || text.includes('折'))) {
+		if (text && !text.includes(pricePrefix) && (text.includes('減') || text.includes('%') || text.includes('折') || /off/i.test(text))) {
 			promoTag = text;
 			break;
 		}
 	}
 	return {display_price: displayPrice, real_price: realPrice, promo_tag: promoTag, footer_text: footerText, footer_signature: [displayPrice, realPrice, promoTag, footerText].join('||')};
 }`
+
+const totalPromoTextJS = `() => {
+	const selectors = ['span[testid="act-promotionText"]', 'span[testid="act-discountTextOtherDesc"]'];
+	const values = [];
+	for (const selector of selectors) {
+		for (const el of document.querySelectorAll(selector)) {
+			if (el.offsetParent === null) continue;
+			const text = (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ');
+			if (text && !values.includes(text)) values.push(text);
+		}
+	}
+	return values;
+}`
+
+const totalPromoContentJS = `() => {
+	const nextScript = document.querySelector('script#__NEXT_DATA__');
+	try {
+		const data = JSON.parse((nextScript && nextScript.textContent) || '{}');
+		const product = data.props.pageProps.initialState.__STATE_MAP__.PageModel.ds.getProductInfo[0];
+		const preferences = (((product || {}).saleDiscountInfo || {}).preferences) || [];
+		return preferences.map((item) => String((item || {}).tagDesc || '').trim().replace(/\s+/g, ' ')).filter(Boolean);
+	} catch (e) {
+		return [];
+	}
+}`
+
+const productSalesVolumeJS = `(expectedProductID) => {
+	const nextScript = document.querySelector('script#__NEXT_DATA__');
+	try {
+		const data = JSON.parse((nextScript && nextScript.textContent) || '{}');
+		const product = data?.props?.pageProps?.initialState?.__STATE_MAP__?.PageModel?.ds?.getProductInfo?.[0] || {};
+		const productID = String(product.productId || product.basicInfo?.productId || '');
+		if (!expectedProductID || productID !== String(expectedProductID)) return {};
+		const volume = product.salesVolume || {};
+		return {monthly_sales: Number(volume.monthlySales || 0), yearly_sales: Number(volume.yearlySales || 0), total_sales: Number(volume.twoYearSales || 0)};
+	} catch (e) {
+		return {};
+	}
+}`
+
+const promotionContentCaptureJS = `(() => {
+	window.__tripCdpProductPromotionResponses = [];
+	const keep = (url) => {
+		const value = String(url || '');
+		return value.includes('/restapi/soa2/21052/getProductInfo') ||
+			value.includes('/restapi/soa2/14580/getProductPriceCalendar') ||
+			value.includes('/restapi/soa2/18084/commonQueryCommentSummary') ||
+			value.includes('/restapi/soa2/20047/listComments');
+	};
+	const push = (url, status, text) => {
+		try {
+			window.__tripCdpProductPromotionResponses.push({url: String(url || ''), status: Number(status || 0), text: String(text || '')});
+			window.__tripCdpProductPromotionResponses = window.__tripCdpProductPromotionResponses.slice(-10);
+		} catch (e) {}
+	};
+	const originalFetch = window.fetch;
+	if (typeof originalFetch === 'function') {
+		window.fetch = async function(input, init) {
+			const response = await originalFetch.apply(this, arguments);
+			const url = typeof input === 'string' ? input : (input && input.url) || response.url;
+			if (keep(url)) response.clone().text().then((text) => push(url, response.status, text)).catch(() => {});
+			return response;
+		};
+	}
+	const OriginalXHR = window.XMLHttpRequest;
+	if (OriginalXHR && OriginalXHR.prototype) {
+		const originalOpen = OriginalXHR.prototype.open;
+		const originalSend = OriginalXHR.prototype.send;
+		OriginalXHR.prototype.open = function(method, url) {
+			this.__tripCdpProductPromotionURL = url;
+			return originalOpen.apply(this, arguments);
+		};
+		OriginalXHR.prototype.send = function() {
+			this.addEventListener('load', function() {
+				const url = this.__tripCdpProductPromotionURL || '';
+				if (keep(url)) push(url, this.status, this.responseText || '');
+			});
+			return originalSend.apply(this, arguments);
+		};
+	}
+})();`
 
 const baseRatingBundleJS = `(includeProductInfo) => {
 	const isVisible = (el) => {
@@ -516,7 +622,8 @@ func (s *tripScraper) scrapeOne(ctx context.Context, item ScrapeItem, index int,
 		defer cancel()
 	}
 	base := Event{"vendor": s.vendor, "worker_id": s.workerID, "url_index": index, "url_total": total, "url": item.URL, "global_total": s.globalTotal}
-	target := newNavigationTarget(item.URL)
+	target := newNavigationTarget(item.URL, siteConfigFor(s.request.Site))
+	s.currentTarget = target
 	canonicalItem := item
 	canonicalItem.URL = target.NavigateURL
 	s.restartAfterURL = false
@@ -542,7 +649,7 @@ func (s *tripScraper) scrapeOne(ctx context.Context, item ScrapeItem, index int,
 		if err != nil {
 			return s.errorRows(canonicalItem, err, started, base)
 		}
-		invalidateNonHKDPriceRows(rows)
+		invalidateUnexpectedCurrencyRows(rows, target.Currency)
 		if !retry {
 			restartAfterURL := s.restartAfterURL
 			restartReason := s.restartReason
@@ -623,16 +730,21 @@ func (s *tripScraper) scrapeOne(ctx context.Context, item ScrapeItem, index int,
 }
 
 func invalidateNonHKDPriceRows(rows []map[string]string) {
+	invalidateUnexpectedCurrencyRows(rows, "HKD")
+}
+
+func invalidateUnexpectedCurrencyRows(rows []map[string]string, expected string) {
+	expected = strings.ToUpper(strings.TrimSpace(expected))
 	for _, row := range rows {
 		currency := strings.ToUpper(strings.TrimSpace(row["货币"]))
-		if currency == "" || currency == "N/A" || currency == "HKD" {
+		if currency == "" || currency == "N/A" || currency == expected {
 			continue
 		}
 		for _, key := range []string{"货币", "外显价格", "实价", "促销标签"} {
 			row[key] = ""
 		}
 		row["价格状态"] = "currency_mismatch"
-		note := "非HKD价格已拒绝"
+		note := "非" + expected + "价格已拒绝"
 		if existing := strings.TrimSpace(row["抓取备注"]); existing != "" {
 			row["抓取备注"] = existing + "；" + note
 		} else {
@@ -653,6 +765,9 @@ func (s *tripScraper) scrapeOneAttempt(ctx context.Context, item ScrapeItem, tar
 	}
 	if err := applyUCStealth(ctx, s.page, target.AcceptLanguage); err != nil && ctx.Err() != nil {
 		return nil, pageSnapshot{}, false, err
+	}
+	if remove, err := s.page.EvalOnNewDocument(promotionContentCaptureJS); err == nil {
+		defer remove()
 	}
 	monitor := s.startNavigationMonitor(ctx)
 	if monitor != nil {
@@ -819,6 +934,7 @@ func priceQualityReasonRetryable(reason string) bool {
 
 func (s *tripScraper) extractRows(ctx context.Context, item ScrapeItem, snapshot pageSnapshot) ([]map[string]string, bool) {
 	baseRow := s.extractBaseRow(ctx, item)
+	baseRow["总促销标签"] = joinTotalPromoTags(s.totalPromoContents())
 	s.applyCurrentScrapeNote(baseRow)
 	if s.request.RatingOnly {
 		s.emit(Event{"event": "log", "stage": "sku", "message": "rating-only mode; skipping SKU price extraction"})
@@ -865,12 +981,7 @@ func (s *tripScraper) extractRows(ctx context.Context, item ScrapeItem, snapshot
 	for index, combo := range combinations {
 		row := cloneRow(baseRow)
 		if index > 0 {
-			for _, key := range []string{"厂商", "商品ID", "URL", "商品名称", "评分", "评价数", "预定数", "客户服务", "方便程度", "讯号状态", "中差评价数", "货币"} {
-				row[key] = ""
-			}
-			if s.request.ExtractProductInfo {
-				row["商品资讯"] = ""
-			}
+			clearRepeatedProductFields(row, s.request.ExtractProductInfo)
 		}
 		row["货币"] = combo["currency"]
 		row["外显价格"] = combo["price"]
@@ -1071,7 +1182,176 @@ func (s *tripScraper) extractBaseRow(ctx context.Context, item ScrapeItem) map[s
 		bundle.Score = s.firstText([]string{`span[testid="productdetail-productInfo-commentScore"]`})
 	}
 	title := firstNonEmpty(s.firstText([]string{"h1", `[data-testid="product-title"]`, `[class*="title"]`}), s.titleFromDocument())
-	return baseRowFromBundle(item, title, text, bundle, s.request.ExtractProductInfo)
+	row := baseRowFromBundle(item, title, text, bundle, s.request.ExtractProductInfo)
+	applyProductSalesVolumeFields(row, s.productSalesVolume(productID(item.URL)))
+	applyCapturedAPIFields(row, s.capturedAPIFields(), s.request.ExtractProductInfo)
+	return row
+}
+
+func (s *tripScraper) productSalesVolume(expectedProductID string) productSalesVolume {
+	var volume productSalesVolume
+	if expectedProductID == "" {
+		return volume
+	}
+	_ = s.evalJSON(&volume, productSalesVolumeJS, expectedProductID)
+	return volume
+}
+
+func applyProductSalesVolumeFields(row map[string]string, volume productSalesVolume) {
+	if row == nil {
+		return
+	}
+	if volume.Monthly > 0 {
+		row["月销量"] = strconv.FormatInt(volume.Monthly, 10)
+	}
+	if volume.Yearly > 0 {
+		row["年销量"] = strconv.FormatInt(volume.Yearly, 10)
+	}
+	if volume.Total > 0 {
+		row["总销量"] = strconv.FormatInt(volume.Total, 10)
+	}
+}
+
+func (s *tripScraper) capturedAPIFields() capturedAPIFields {
+	return parseCapturedAPIFields(s.capturedAPIResponses())
+}
+
+func (s *tripScraper) capturedAPIResponses() []capturedAPIResponse {
+	if s == nil || s.page == nil {
+		return nil
+	}
+	var responses []capturedAPIResponse
+	_ = s.evalJSON(&responses, `() => (window.__tripCdpProductPromotionResponses || []).slice()`)
+	return responses
+}
+
+func parseCapturedAPIFields(responses []capturedAPIResponse) capturedAPIFields {
+	var fields capturedAPIFields
+	for _, response := range responses {
+		if response.Status < 200 || response.Status >= 300 || strings.TrimSpace(response.Text) == "" {
+			continue
+		}
+		if strings.Contains(response.URL, "/restapi/soa2/21052/getProductInfo") {
+			var payload struct {
+				ProductInfos []struct {
+					BasicInfo struct {
+						ProductName string `json:"productName"`
+					} `json:"basicInfo"`
+					AddInfos []struct {
+						Code     string `json:"code"`
+						Contents []struct {
+							Value string `json:"value"`
+						} `json:"contents"`
+					} `json:"addInfos"`
+				} `json:"productInfos"`
+			}
+			if json.Unmarshal([]byte(response.Text), &payload) != nil || len(payload.ProductInfos) == 0 {
+				continue
+			}
+			product := payload.ProductInfos[0]
+			fields.ProductName = firstNonEmpty(fields.ProductName, strings.TrimSpace(product.BasicInfo.ProductName))
+			for _, info := range product.AddInfos {
+				if info.Code != "ProductIntroduction" {
+					continue
+				}
+				parts := make([]string, 0, len(info.Contents))
+				for _, content := range info.Contents {
+					if text := compactHTMLText(content.Value); text != "" {
+						parts = append(parts, text)
+					}
+				}
+				fields.ProductInfo = firstNonEmpty(fields.ProductInfo, strings.Join(parts, "\n"))
+			}
+		}
+		if strings.Contains(response.URL, "/restapi/soa2/18084/commonQueryCommentSummary") {
+			var payload struct {
+				CommentAggregation struct {
+					TotalCount int     `json:"totalCount"`
+					ScoreAvg   float64 `json:"scoreAvg"`
+					CommonTags []struct {
+						TagName    string `json:"tagName"`
+						TotalCount int    `json:"totalCount"`
+					} `json:"commonTags"`
+				} `json:"commentAggregation"`
+			}
+			if json.Unmarshal([]byte(response.Text), &payload) != nil {
+				continue
+			}
+			aggregation := payload.CommentAggregation
+			if aggregation.TotalCount > 0 {
+				fields.ReviewCount = strconv.Itoa(aggregation.TotalCount)
+			}
+			if aggregation.ScoreAvg > 0 {
+				fields.Score = formatPriceNumber(aggregation.ScoreAvg)
+			}
+			for _, tag := range aggregation.CommonTags {
+				if tag.TagName == "MIDBAD" && tag.TotalCount >= 0 {
+					fields.BadReviewCount = strconv.Itoa(tag.TotalCount)
+				}
+			}
+		}
+		if strings.Contains(response.URL, "/restapi/soa2/20047/listComments") {
+			var payload struct {
+				CommentAggregation struct {
+					GoodRate    float64 `json:"goodRate"`
+					SubItemTags []struct {
+						TagName  string  `json:"tagName"`
+						ScoreAvg float64 `json:"scoreAvg"`
+					} `json:"subItemTags"`
+				} `json:"commentAggregation"`
+			}
+			if json.Unmarshal([]byte(response.Text), &payload) != nil {
+				continue
+			}
+			if payload.CommentAggregation.GoodRate > 0 {
+				fields.GoodRate = fmt.Sprintf("%.1f%%", payload.CommentAggregation.GoodRate*100)
+			}
+			for _, tag := range payload.CommentAggregation.SubItemTags {
+				if tag.ScoreAvg <= 0 {
+					continue
+				}
+				score := formatPriceNumber(tag.ScoreAvg)
+				switch tag.TagName {
+				case "42":
+					fields.Customer = score
+				case "43":
+					fields.Convenience = score
+				case "44":
+					fields.Signal = score
+				}
+			}
+		}
+	}
+	return fields
+}
+
+func compactHTMLText(value string) string {
+	value = regexp.MustCompile(`(?i)<br\s*/?>|</p\s*>`).ReplaceAllString(value, "\n")
+	value = regexp.MustCompile(`<[^>]+>`).ReplaceAllString(value, "")
+	return strings.TrimSpace(strings.Join(strings.Fields(value), " "))
+}
+
+func applyCapturedAPIFields(row map[string]string, fields capturedAPIFields, includeProductInfo bool) {
+	if row == nil {
+		return
+	}
+	for key, value := range map[string]string{
+		"商品名称":  fields.ProductName,
+		"评价数":   fields.ReviewCount,
+		"评分":    fields.Score,
+		"好评率":   fields.GoodRate,
+		"客户服务":  fields.Customer,
+		"方便程度":  fields.Convenience,
+		"讯号状态":  fields.Signal,
+		"中差评价数": fields.BadReviewCount,
+	} {
+		if value = strings.TrimSpace(value); value != "" {
+			row[key] = value
+		}
+	}
+	if includeProductInfo && strings.TrimSpace(fields.ProductInfo) != "" {
+		row["商品资讯"] = fields.ProductInfo
+	}
 }
 
 func baseRowFromBundle(item ScrapeItem, title string, pageText string, bundle baseRatingBundle, extractProductInfo bool) map[string]string {
@@ -1091,6 +1371,9 @@ func baseRowFromBundle(item ScrapeItem, title string, pageText string, bundle ba
 		"URL":   item.URL,
 		"商品名称":  title,
 		"预定数":   bundle.BookingCount,
+		"月销量":   "",
+		"年销量":   "",
+		"总销量":   "",
 		"评价数":   bundle.ReviewCount,
 		"评分":    score,
 		"客户服务":  customer,
@@ -1106,6 +1389,35 @@ func baseRowFromBundle(item ScrapeItem, title string, pageText string, bundle ba
 
 func (s *tripScraper) extractAllSKUPrices(ctx context.Context) ([]map[string]string, *priceQualityTracker) {
 	s.emit(Event{"event": "log", "stage": "sku", "message": "starting SKU option and price extraction"})
+	if rows, coverage, waitMS := s.waitCapturedAPISKUPrices(ctx, 3*time.Second); coverage.usable() {
+		for _, row := range rows {
+			if combination := strings.TrimSpace(row["combination"]); combination != "" {
+				s.maxSKULayers = max(s.maxSKULayers, len(strings.Split(combination, " | ")))
+			}
+		}
+		s.emit(Event{
+			"event":               "sku_api_batch_used",
+			"stage":               "sku",
+			"message":             "using captured product price calendar batch",
+			"price_source":        priceSourceProductPriceCalendar,
+			"tree_count":          coverage.TreeCount,
+			"priced_count":        coverage.PricedCount,
+			"missing_price_count": coverage.MissingPriceCount,
+			"coverage_rate":       float64(coverage.PricedCount) / float64(coverage.TreeCount),
+			"wait_ms":             waitMS,
+		})
+		return rows, nil
+	} else if coverage.TreeCount > 0 || coverage.PricedCount > 0 {
+		s.emit(Event{
+			"event":               "sku_api_batch_fallback",
+			"stage":               "sku",
+			"message":             "captured API batch coverage is below the trusted threshold; using browser traversal",
+			"tree_count":          coverage.TreeCount,
+			"priced_count":        coverage.PricedCount,
+			"missing_price_count": coverage.MissingPriceCount,
+			"wait_ms":             waitMS,
+		})
+	}
 	count, waitMS := s.waitSKULayerCount(ctx, skuLayerWaitMax)
 	if count == 0 {
 		s.emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("SKU container not found after wait; product may have no SKU options wait_ms=%d", waitMS)})
@@ -1477,7 +1789,7 @@ func (s *tripScraper) currentCombinationPrice(ctx context.Context, selected []sk
 	if ctx.Err() != nil {
 		return nil
 	}
-	result := currentCombinationPriceRowFromBatchPromotion(selected, batchBundle, s.request.ExtractRealPrice)
+	result := currentCombinationPriceRowFromBatchPromotion(selected, batchBundle, s.request.ExtractRealPrice, siteConfigFor(s.request.Site).Currency)
 	if isTrustedPriceStatus(result["price_status"]) {
 		if waitMS > 1000 {
 			s.emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("batch promotion price settled slowly: %s wait_ms=%d promo_matched=%v", result["combination"], waitMS, batchBundle.PromoMatched)})
@@ -1622,10 +1934,17 @@ func waitForBatchPromotionPriceBundle(ctx context.Context, selected []skuOption,
 
 func (s *tripScraper) currentBatchPromotionPriceBundle(selectedTexts []string) batchPromotionPriceBundle {
 	var bundle batchPromotionPriceBundle
-	_ = s.evalJSON(&bundle, `(selectedTexts) => {
+	_ = s.evalJSON(&bundle, `(selectedTexts, expectedCurrency) => {
+		const normalizeText = (value) => String(value || '').trim().replace(/\s+/g, ' ').toLowerCase();
 		const textIncludesAll = (value, parts) => {
-			const text = String(value || '');
-			return (parts || []).every((part) => text.includes(String(part || '')));
+			const text = normalizeText(value);
+			return (parts || []).every((part) => text.includes(normalizeText(part)));
+		};
+		const packageText = (item) => {
+			const values = ((item && item.salesProperties) || []).flatMap((property) =>
+				(property.salePropertyValues || []).map((value) => value && value.name)
+			);
+			return [item && item.packageName, ...values].filter(Boolean).join(' | ');
 		};
 		const nextScript = document.querySelector('script#__NEXT_DATA__');
 		let product = null;
@@ -1636,7 +1955,7 @@ func (s *tripScraper) currentBatchPromotionPriceBundle(selectedTexts []string) b
 		const packages = (product && (product.packageInfos || (product.basicInfo && product.basicInfo.packages))) || [];
 		const resources = (product && product.resourceInfos) || [];
 		const resourceByID = new Map(resources.map((resource) => [Number(resource.resourceId), resource]));
-		const packageInfo = packages.find((item) => textIncludesAll(item.packageName, selectedTexts)) || null;
+		const packageInfo = packages.find((item) => textIncludesAll(packageText(item), selectedTexts)) || null;
 		const resourceID = Number((packageInfo && packageInfo.resourceIds && packageInfo.resourceIds[0]) || 0);
 		const resource = resourceByID.get(resourceID) || null;
 		const basic = (resource && resource.basicInfo) || {};
@@ -1662,7 +1981,7 @@ func (s *tripScraper) currentBatchPromotionPriceBundle(selectedTexts []string) b
 			package_id: Number((packageInfo && packageInfo.packageId) || 0),
 			resource_id: resourceID,
 			item_id: 0,
-			currency: basic.originMarketCurrency || 'HKD',
+			currency: basic.originMarketCurrency || expectedCurrency,
 			original_price: Number(basic.minPrice || 0) || firstRenderedBasePrice(),
 			deduction_amount: 0,
 			deduction_price: 0,
@@ -1705,7 +2024,7 @@ func (s *tripScraper) currentBatchPromotionPriceBundle(selectedTexts []string) b
 			}
 		}
 		return out;
-	}`, selectedTexts)
+	}`, selectedTexts, siteConfigFor(s.request.Site).Currency)
 	if bundle.ResourceID > 0 && bundle.ResponseText != "" {
 		applyBatchPromotionResponse(&bundle, bundle.ResponseText, bundle.ResponseStatus, bundle.ResponseURL)
 	}
@@ -1781,7 +2100,7 @@ func applyBatchPromotionResponse(bundle *batchPromotionPriceBundle, responseText
 	return false
 }
 
-func currentCombinationPriceRowFromBatchPromotion(selected []skuOption, bundle batchPromotionPriceBundle, extractRealPrice bool) map[string]string {
+func currentCombinationPriceRowFromBatchPromotion(selected []skuOption, bundle batchPromotionPriceBundle, extractRealPrice bool, expectedCurrencies ...string) map[string]string {
 	if len(selected) == 0 {
 		return nil
 	}
@@ -1790,7 +2109,11 @@ func currentCombinationPriceRowFromBatchPromotion(selected []skuOption, bundle b
 		parts = append(parts, option.Text)
 	}
 	combination := strings.Join(parts, " | ")
-	currency := firstNonEmpty(bundle.Currency, "HKD")
+	expectedCurrency := "HKD"
+	if len(expectedCurrencies) > 0 && strings.TrimSpace(expectedCurrencies[0]) != "" {
+		expectedCurrency = strings.ToUpper(strings.TrimSpace(expectedCurrencies[0]))
+	}
+	currency := firstNonEmpty(bundle.Currency, expectedCurrency)
 	base := map[string]string{
 		"combination":    combination,
 		"selected_texts": combination,
@@ -2211,7 +2534,8 @@ func (s *tripScraper) waitProductPageExtractable(ctx context.Context, maxWait ti
 
 func (s *tripScraper) currentPageSnapshot() pageSnapshot {
 	var snapshot pageSnapshot
-	err := s.evalJSON(&snapshot, `() => {
+	config := siteConfigFor(s.request.Site)
+	err := s.evalJSON(&snapshot, `(currency, pricePrefix) => {
 		const visible = (el) => {
 			if (!el) return false;
 			const style = window.getComputedStyle(el);
@@ -2235,14 +2559,14 @@ func (s *tripScraper) currentPageSnapshot() pageSnapshot {
 			title,
 			has_product_title: hasAny(['h1', '[data-testid="product-title"]']) || hasText(['套餐與價格', '套餐与价格', '商品詳情', '商品详情']),
 			has_sku: hasAny(['div[testid="act_sku_wrapper"]', 'div[class*="style_sku_wrapper_container"]', 'div[class*="sku_tab_ceil"]']) || hasText(['套餐與價格', '套餐与价格']),
-			has_price: hasAny(['span[currency="HKD"]', 'span[testid*="price"]', 'div[class*="price"]']) || /HK\$\s*[0-9,]+(?:\.\d+)?/.test(bodyText),
+			has_price: hasAny(['span[currency="' + currency + '"]', 'span[testid*="price"]', 'div[class*="price"]']) || bodyText.includes(pricePrefix),
 			has_score: hasAny(['span[testid="productdetail-productInfo-commentScore"]', '[class*="commentScore"]']),
 			risk_challenge: riskChallenge,
 			risk_kind: whaleguard ? 'whaleguard' : (cloudflareOverlay ? 'cloudflare' : (riskChallenge ? 'challenge' : '')),
 			cloudflare_block: cloudflareOverlay,
 			body_preview: bodyText.slice(0, 200),
 		};
-	}`)
+	}`, config.Currency, config.PricePrefix)
 	if err != nil {
 		snapshot.EvalError = err.Error()
 	}
@@ -2322,7 +2646,7 @@ func allowNoSKUFallback(row map[string]string, snapshot pageSnapshot) bool {
 	if !snapshot.HasPrice {
 		return false
 	}
-	for _, key := range []string{"商品名称", "评分", "评价数", "预定数"} {
+	for _, key := range []string{"商品名称", "评分", "评价数", "预定数", "月销量", "年销量", "总销量"} {
 		if strings.TrimSpace(row[key]) != "" {
 			return true
 		}
@@ -2703,6 +3027,60 @@ func (s *tripScraper) promoText() string {
 	return ""
 }
 
+func (s *tripScraper) totalPromoTexts() []string {
+	values := []string{}
+	_ = s.evalJSON(&values, totalPromoTextJS)
+	return values
+}
+
+func (s *tripScraper) totalPromoContents() []string {
+	values := []string{}
+	_ = s.evalJSON(&values, `() => {
+		const responses = (window.__tripCdpProductPromotionResponses || []).slice().reverse();
+		for (const response of responses) {
+			if (Number((response || {}).status || 0) < 200 || Number((response || {}).status || 0) >= 300) continue;
+			try {
+				const data = JSON.parse((response || {}).text || '{}');
+				const preferences = (((data || {}).productInfos || [])[0] || {}).saleDiscountInfo?.preferences || [];
+				const contents = preferences.map((item) => String((item || {}).tagDesc || '').trim().replace(/\s+/g, ' ')).filter(Boolean);
+				if (contents.length) return contents;
+			} catch (e) {}
+		}
+		return [];
+	}`)
+	if len(values) > 0 {
+		return values
+	}
+	_ = s.evalJSON(&values, totalPromoContentJS)
+	if len(values) == 0 {
+		return s.totalPromoTexts()
+	}
+	return values
+}
+
+func clearRepeatedProductFields(row map[string]string, includeProductInfo bool) {
+	for _, key := range []string{"厂商", "商品ID", "URL", "商品名称", "评分", "好评率", "评价数", "预定数", "月销量", "年销量", "总销量", "客户服务", "方便程度", "讯号状态", "中差评价数", "货币", "总促销标签"} {
+		row[key] = ""
+	}
+	if includeProductInfo {
+		row["商品资讯"] = ""
+	}
+}
+
+func joinTotalPromoTags(values []string) string {
+	seen := map[string]bool{}
+	joined := []string{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		joined = append(joined, value)
+	}
+	return strings.Join(joined, " | ")
+}
+
 func (s *tripScraper) skuLayerCount() int {
 	var count int
 	_ = s.evalJSON(&count, `() => {
@@ -2931,15 +3309,16 @@ func (s *tripScraper) markRestartAfterURLIfUnhealthy(reason string) {
 }
 
 func (s *tripScraper) currentPrice(ctx context.Context, maxAttempts int) string {
+	config := siteConfigFor(s.request.Site)
 	selectors := []string{
 		`#select_quantity div[class*="style_m_select_quantity_container__"] div div[class*="style_m_select_choice_option_wrapper__"] div[class*="style_m_people_price__"] div div span span`,
 		`#select_quantity > div.xtaro-xview > div > div.xtaro-xview > div.xtaro-xview > div > div > span > span`,
 		`div[class*="default_new_title_foot_warp"] div[class*="default_new_title_foot_warp_right"] div div div span`,
-		`span[currency="HKD"][testid*="price"]`,
+		fmt.Sprintf(`span[currency="%s"][testid*="price"]`, config.Currency),
 		`span.price_m_price_price__VrAgh`,
-		`div.price_m_price__FmWsJ span[currency="HKD"]`,
+		fmt.Sprintf(`div.price_m_price__FmWsJ span[currency="%s"]`, config.Currency),
 		`span[testid="undefined-price"]`,
-		`span[currency="HKD"]`,
+		fmt.Sprintf(`span[currency="%s"]`, config.Currency),
 	}
 	if maxAttempts <= 0 {
 		maxAttempts = 3
@@ -2949,27 +3328,27 @@ func (s *tripScraper) currentPrice(ctx context.Context, maxAttempts int) string 
 			return "价格未找到"
 		}
 		for _, selector := range selectors {
-			text := s.evalString(`(selector) => {
+			text := s.evalString(`(selector, pricePrefix) => {
 				for (const el of document.querySelectorAll(selector)) {
 					if (el.offsetParent === null) continue;
 					const text = (el.innerText || el.textContent || '').trim();
-					if (text && text.includes('HK$') && /^HK\$\s*[0-9,]+(?:\.\d+)?/.test(text)) return text;
+					if (text && text.includes(pricePrefix) && /[0-9,]+(?:\.\d+)?/.test(text)) return text;
 				}
 				return '';
-			}`, selector)
+			}`, selector, config.PricePrefix)
 			if text != "" {
 				return text
 			}
 		}
-		text := s.evalString(`() => {
+		text := s.evalString(`(pricePrefix) => {
 			const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
 			let node;
 			while ((node = walker.nextNode())) {
 				const text = (node.nodeValue || '').trim();
-				if (text.startsWith('HK$') && /^HK\$\s*[0-9,]+(?:\.\d+)?/.test(text)) return text;
+				if (text.includes(pricePrefix) && /[0-9,]+(?:\.\d+)?/.test(text)) return text;
 			}
 			return '';
-		}`)
+		}`, config.PricePrefix)
 		if text != "" {
 			return text
 		}
@@ -2979,18 +3358,19 @@ func (s *tripScraper) currentPrice(ctx context.Context, maxAttempts int) string 
 }
 
 func (s *tripScraper) currentPriceBundle() priceBundle {
+	config := siteConfigFor(s.request.Site)
 	displaySelectors := []string{
 		`#select_quantity div[class*="style_m_select_quantity_container__"] div div[class*="style_m_select_choice_option_wrapper__"] div[class*="style_m_people_price__"] div div span span`,
 		`#select_quantity > div.xtaro-xview > div > div.xtaro-xview > div.xtaro-xview > div > div > span > span`,
 		`div[class*="default_new_title_foot_warp"] div[class*="default_new_title_foot_warp_right"] div div div span`,
-		`span[currency="HKD"][testid*="price"]`,
+		fmt.Sprintf(`span[currency="%s"][testid*="price"]`, config.Currency),
 		`span.price_m_price_price__VrAgh`,
-		`div.price_m_price__FmWsJ span[currency="HKD"]`,
+		fmt.Sprintf(`div.price_m_price__FmWsJ span[currency="%s"]`, config.Currency),
 		`span[testid="undefined-price"]`,
-		`span[currency="HKD"]`,
+		fmt.Sprintf(`span[currency="%s"]`, config.Currency),
 	}
 	var bundle priceBundle
-	_ = s.evalJSON(&bundle, currentPriceBundleJS, displaySelectors, s.request.ExtractRealPrice)
+	_ = s.evalJSON(&bundle, currentPriceBundleJS, displaySelectors, s.request.ExtractRealPrice, config.PricePrefix)
 	return bundle
 }
 
@@ -3022,6 +3402,9 @@ func (s *tripScraper) errorRow(item ScrapeItem, message string) map[string]strin
 		"评分":    "处理错误: " + message,
 		"评价数":   "",
 		"预定数":   "",
+		"月销量":   "",
+		"年销量":   "",
+		"总销量":   "",
 		"客户服务":  "",
 		"方便程度":  "",
 		"讯号状态":  "",
@@ -3150,11 +3533,11 @@ func previewText(value string, limit int) string {
 	return string(runes[:limit])
 }
 
-var validDisplayPricePattern = regexp.MustCompile(`^HK\$\s*[0-9,]+(?:\.\d+)?`)
+var validDisplayPricePattern = regexp.MustCompile(`^(?:HK\$|S\$)\s*[0-9,]+(?:\.\d+)?`)
 
 func isValidDisplayPrice(value string) bool {
 	text := strings.TrimSpace(value)
-	return strings.Contains(text, "HK$") && validDisplayPricePattern.MatchString(text)
+	return validDisplayPricePattern.MatchString(text)
 }
 
 func splitPrice(value string) (string, string) {
@@ -3166,6 +3549,9 @@ func splitPrice(value string) (string, string) {
 	if strings.Contains(priceText, "HK$") {
 		currency = "HKD"
 		priceText = strings.ReplaceAll(priceText, "HK$", "")
+	} else if strings.Contains(priceText, "S$") {
+		currency = "SGD"
+		priceText = strings.ReplaceAll(priceText, "S$", "")
 	} else if strings.Contains(priceText, "$") {
 		currency = "USD"
 		priceText = strings.ReplaceAll(priceText, "$", "")

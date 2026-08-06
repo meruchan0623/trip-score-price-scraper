@@ -17,7 +17,9 @@ func TestBaseRowFromGUIBundle(t *testing.T) {
 		BadReviewCount: "中性評價及負面評價 (601)",
 		ProductInfo:    "• 適用地區：中國內地 • 電訊商：China Unicom",
 	}, true)
-	assertRowValue(t, row, "预定数", "123150")
+	assertRowValue(t, row, "月销量", "")
+	assertRowValue(t, row, "年销量", "")
+	assertRowValue(t, row, "总销量", "")
 	assertRowValue(t, row, "评价数", "5674")
 	assertRowValue(t, row, "评分", "4.6")
 	assertRowValue(t, row, "客户服务", "4.6")
@@ -26,6 +28,16 @@ func TestBaseRowFromGUIBundle(t *testing.T) {
 	assertRowValue(t, row, "中差评价数", "601")
 	if !strings.Contains(row["商品资讯"], "China Unicom") {
 		t.Fatalf("商品资讯 = %q, want DOM product info", row["商品资讯"])
+	}
+}
+
+func TestApplyProductSalesVolumeFields(t *testing.T) {
+	row := map[string]string{"月销量": "", "年销量": "", "总销量": ""}
+	applyProductSalesVolumeFields(row, productSalesVolume{Monthly: 10675, Yearly: 50968, Total: 54938})
+	for key, want := range map[string]string{"月销量": "10675", "年销量": "50968", "总销量": "54938"} {
+		if got := row[key]; got != want {
+			t.Fatalf("%s = %q, want %q", key, got, want)
+		}
 	}
 }
 

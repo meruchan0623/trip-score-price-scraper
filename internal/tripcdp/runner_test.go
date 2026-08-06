@@ -3,9 +3,32 @@ package tripcdp
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestPrepareRuntimeSessionFreshProfileDoesNotCopySavedSession(t *testing.T) {
+	dir := t.TempDir()
+	seed := filepath.Join(dir, "saved.json")
+	runtimePath := filepath.Join(dir, "runtime", "session.json")
+	if err := os.WriteFile(seed, []byte(`{"cookies":[{"name":"saved"}]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := prepareRuntimeSession(seed, runtimePath, true); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(runtimePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) == `{"cookies":[{"name":"saved"}]}` {
+		t.Fatal("fresh profile copied the saved session")
+	}
+}
 
 func TestCanStartWorkerStopsWhenContextCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -83,5 +106,22 @@ func TestValidateSinglePriceScrapeRowsRejectsMissingRequiredFields(t *testing.T)
 
 	if failed != 1 || err == nil {
 		t.Fatalf("failed products = %d, error = %v", failed, err)
+	}
+}
+
+func TestScrapeSingleReportsFreshSessionPreparationFailure(t *testing.T) {
+	blockedParent := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blockedParent, []byte("block"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	result := scrapeSingle(TaskRequest{
+		Site:         "hk",
+		FreshProfile: true,
+		InputPaths:   []string{"https://hk.trip.com/things-to-do/detail/45892282/"},
+		OutputPath:   filepath.Join(blockedParent, "result.xlsx"),
+	}, func(Event) {}, "")
+
+	if result.Success || result.ExitCode != 4 || !strings.Contains(result.Error, "session prepare failed") {
+		t.Fatalf("result = %+v, want explicit session preparation failure", result)
 	}
 }

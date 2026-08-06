@@ -152,6 +152,36 @@ func TestParseManualSelectedProductsContract(t *testing.T) {
 	}
 }
 
+func TestParseSiteParameter(t *testing.T) {
+	request, _, _, _, _, err := parseArgs([]string{
+		"--site", "sg",
+		"--input", "https://trip.com/things-to-do/detail/45892282/",
+	}, &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("parseArgs failed: %v", err)
+	}
+	if request.Site != "sg" {
+		t.Fatalf("site = %q, want sg", request.Site)
+	}
+
+	if _, _, _, _, _, err := parseArgs([]string{"--site", "xx", "--input", "https://trip.com/detail/1"}, &bytes.Buffer{}); err == nil {
+		t.Fatal("unsupported site should fail")
+	}
+}
+
+func TestParseFreshProfileParameter(t *testing.T) {
+	request, _, _, _, _, err := parseArgs([]string{
+		"--fresh-profile",
+		"--input", "https://trip.com/things-to-do/detail/45892282/",
+	}, &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("parseArgs failed: %v", err)
+	}
+	if !request.FreshProfile {
+		t.Fatal("fresh profile flag was not preserved")
+	}
+}
+
 func TestParseDefaultsDoNotEnableLogFileOrExplicitSession(t *testing.T) {
 	request, _, _, _, _, err := parseArgs([]string{"--input", "https://www.trip.com/detail/12345"}, &bytes.Buffer{})
 	if err != nil {

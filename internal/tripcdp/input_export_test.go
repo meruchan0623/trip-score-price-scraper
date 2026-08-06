@@ -106,9 +106,13 @@ func TestExportRowsFieldShape(t *testing.T) {
 		"外显价格":   "10",
 		"实价":     "8",
 		"促销标签":   "Save",
-		"预定数":    "1",
+		"总促销标签":  "限時優惠 | 即減50%",
+		"月销量":    "10",
+		"年销量":    "100",
+		"总销量":    "1000",
 		"评价数":    "2",
 		"评分":     "4.8",
+		"好评率":    "91.1%",
 		"客户服务":   "4.7",
 		"方便程度":   "4.6",
 		"讯号状态":   "4.5",
@@ -129,7 +133,7 @@ func TestExportRowsFieldShape(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"厂商", "商品ID", "URL", "商品名称", "SKU层级1", "SKU层级2", "货币", "外显价格", "实价", "促销标签", "商品资讯", "预定数", "评价数", "评分", "客户服务", "方便程度", "讯号状态", "中差评价数"}
+	want := []string{"厂商", "商品ID", "URL", "商品名称", "SKU层级1", "SKU层级2", "货币", "外显价格", "实价", "促销标签", "商品资讯", "总促销标签", "月销量", "年销量", "总销量", "评价数", "评分", "好评率", "客户服务", "方便程度", "讯号状态", "中差评价数"}
 	if len(header) == 0 || len(header[0]) != len(want) {
 		t.Fatalf("unexpected header length: %v", header)
 	}
@@ -137,6 +141,13 @@ func TestExportRowsFieldShape(t *testing.T) {
 		if header[0][i] != value {
 			t.Fatalf("header[%d] = %q, want %q", i, header[0][i], value)
 		}
+	}
+}
+
+func TestSplitPriceRecognizesSingaporeDollars(t *testing.T) {
+	currency, price := splitPrice("S$ 0.11")
+	if currency != "SGD" || price != "0.11" {
+		t.Fatalf("splitPrice = %q %q, want SGD 0.11", currency, price)
 	}
 }
 
@@ -224,10 +235,18 @@ func TestExportRowsAddsPriceQualityColumnsOnlyWhenPresent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, field := range []string{"价格状态", "资源ID", "接口ItemID", "促销命中", "价格来源", "原始捕获价格", "抓取备注"} {
+	for _, field := range []string{"价格可信标签", "原始捕获价格", "抓取备注"} {
 		if !containsString(gotRows[0], field) {
 			t.Fatalf("quality header %q missing from %#v", field, gotRows[0])
 		}
+	}
+	for _, field := range []string{"价格状态", "资源ID", "接口ItemID", "促销命中", "价格来源"} {
+		if containsString(gotRows[0], field) {
+			t.Fatalf("internal quality header %q must not be exported: %#v", field, gotRows[0])
+		}
+	}
+	if gotRows[1][indexOfString(gotRows[0], "价格可信标签")] != "untrusted_resource_miss" {
+		t.Fatalf("price trust label value missing: %#v", gotRows[1])
 	}
 	if gotRows[1][indexOfString(gotRows[0], "外显价格")] != "" || gotRows[1][indexOfString(gotRows[0], "实价")] != "" {
 		t.Fatalf("untrusted prices should be blank in price columns: %#v", gotRows[1])
@@ -255,7 +274,7 @@ func TestLoadVendorProductsSkipsUntrustedPriceStatusRows(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "vendor.xlsx")
 	file := excelize.NewFile()
 	sheet := file.GetSheetName(file.GetActiveSheetIndex())
-	headers := []string{"商品ID", "URL", "商品名称", "SKU层级1", "SKU层级2", "货币", "外显价格", "实价", "促销标签", "预定数", "评价数", "评分", "价格状态"}
+	headers := []string{"商品ID", "URL", "商品名称", "SKU层级1", "SKU层级2", "货币", "外显价格", "实价", "促销标签", "预定数", "评价数", "评分", "价格可信标签"}
 	for i, header := range headers {
 		cell, _ := excelize.CoordinatesToCellName(i+1, 1)
 		_ = file.SetCellValue(sheet, cell, header)
@@ -321,9 +340,12 @@ func TestExportRowsRatingOnlyProductInfoShapeMatchesLegacyGUI(t *testing.T) {
 		"URL":   "https://www.trip.com/detail/12345",
 		"商品名称":  "Product",
 		"商品资讯":  "Device info",
-		"预定数":   "10",
+		"月销量":   "10",
+		"年销量":   "100",
+		"总销量":   "1000",
 		"评价数":   "2",
 		"评分":    "4.8",
+		"好评率":   "91.1%",
 		"客户服务":  "4.7",
 		"方便程度":  "4.6",
 		"讯号状态":  "4.5",
@@ -343,7 +365,7 @@ func TestExportRowsRatingOnlyProductInfoShapeMatchesLegacyGUI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"商品ID", "URL", "商品名称", "商品资讯", "预定数", "评价数", "评分", "客户服务", "方便程度", "讯号状态", "中差评价数"}
+	want := []string{"商品ID", "URL", "商品名称", "商品资讯", "月销量", "年销量", "总销量", "评价数", "评分", "好评率", "客户服务", "方便程度", "讯号状态", "中差评价数"}
 	if !reflect.DeepEqual(gotRows[0], want) {
 		t.Fatalf("rating-only header = %#v, want %#v", gotRows[0], want)
 	}
@@ -351,10 +373,10 @@ func TestExportRowsRatingOnlyProductInfoShapeMatchesLegacyGUI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if dimension != "A1:K2" {
-		t.Fatalf("rating-only sheet dimension = %q, want A1:K2", dimension)
+	if dimension != "A1:N2" {
+		t.Fatalf("rating-only sheet dimension = %q, want A1:N2", dimension)
 	}
-	for _, forbidden := range []string{"SKU层级1", "货币", "外显价格", "实价", "促销标签"} {
+	for _, forbidden := range []string{"SKU层级1", "货币", "外显价格", "实价", "促销标签", "总促销标签"} {
 		for _, field := range gotRows[0] {
 			if field == forbidden {
 				t.Fatalf("rating-only header unexpectedly contains %q: %#v", forbidden, gotRows[0])
@@ -1001,8 +1023,23 @@ func TestIsValidDisplayPrice(t *testing.T) {
 	if !isValidDisplayPrice("HK$ 1,234.50") {
 		t.Fatal("expected HK$ price with space and comma to be valid")
 	}
+	if !isValidDisplayPrice("S$ 0.11") {
+		t.Fatal("expected S$ price to be valid")
+	}
 	if isValidDisplayPrice("N/A") || isValidDisplayPrice("USD 1") {
 		t.Fatal("unexpected valid display price")
+	}
+}
+
+func TestBatchPromotionRowUsesRequestedCurrencyWhenResponseOmitsIt(t *testing.T) {
+	row := currentCombinationPriceRowFromBatchPromotion(
+		[]skuOption{{Text: "1 day", Layer: 1}},
+		batchPromotionPriceBundle{ResourceID: 10, ItemID: 10, OriginalPrice: 0.23},
+		true,
+		"SGD",
+	)
+	if row["currency"] != "SGD" || row["real_currency"] != "SGD" {
+		t.Fatalf("row currencies = %q/%q, want SGD/SGD", row["currency"], row["real_currency"])
 	}
 }
 

@@ -68,18 +68,28 @@ func scrapeSingle(request TaskRequest, reporter Reporter, runMode string) TaskRe
 		reporter(Event{"event": "state_migrated", "state_dir": state.StateDir})
 	}
 	if request.BrowserOptions.Language == "" {
-		request.BrowserOptions.Language = preferredLanguageForItems(items)
+		request.BrowserOptions.Language = siteConfigFor(request.Site).AcceptLanguage
 	}
 	runtimeDir := filepath.Join(filepath.Dir(outputPath), "_workers", "01_"+safeFilename(defaultVendor))
 	request.BrowserOptions.SessionFile = filepath.Join(runtimeDir, "session.json")
 	request.BrowserOptions.UserDataDir = filepath.Join(runtimeDir, "profile")
-	_ = ensureParent(request.BrowserOptions.SessionFile)
-	if raw, err := os.ReadFile(state.SessionFile); err == nil {
-		_ = os.WriteFile(request.BrowserOptions.SessionFile, raw, 0o644)
-	} else if !state.SessionExplicit {
-		_ = writeEmptySession(request.BrowserOptions.SessionFile)
+	if err := ensureParent(request.BrowserOptions.SessionFile); err != nil {
+		return TaskResult{Success: false, OutputPath: outputPath, LogFile: request.LogFile, Error: "session prepare failed: " + err.Error(), ExitCode: 4}
 	}
-	if err := replaceProfileDir(state.ProfileSeedDir, request.BrowserOptions.UserDataDir); err != nil {
+	if request.FreshProfile {
+		if err := prepareRuntimeSession(state.SessionFile, request.BrowserOptions.SessionFile, true); err != nil {
+			return TaskResult{Success: false, OutputPath: outputPath, LogFile: request.LogFile, Error: "session prepare failed: " + err.Error(), ExitCode: 4}
+		}
+	} else if raw, err := os.ReadFile(state.SessionFile); err == nil {
+		if err := os.WriteFile(request.BrowserOptions.SessionFile, raw, 0o644); err != nil {
+			return TaskResult{Success: false, OutputPath: outputPath, LogFile: request.LogFile, Error: "session prepare failed: " + err.Error(), ExitCode: 4}
+		}
+	} else if !state.SessionExplicit {
+		if err := writeEmptySession(request.BrowserOptions.SessionFile); err != nil {
+			return TaskResult{Success: false, OutputPath: outputPath, LogFile: request.LogFile, Error: "session prepare failed: " + err.Error(), ExitCode: 4}
+		}
+	}
+	if err := prepareRuntimeProfile(state.ProfileSeedDir, request.BrowserOptions.UserDataDir, request.FreshProfile); err != nil {
 		return TaskResult{Success: false, OutputPath: outputPath, LogFile: request.LogFile, Error: "profile copy failed: " + err.Error(), ExitCode: 4}
 	}
 	reporter(Event{
@@ -323,17 +333,32 @@ func scrapeVendorBatches(request TaskRequest, reporter Reporter, runMode string)
 		workerRequest.BrowserOptions.SessionFile = filepath.Join(workerDir, "session.json")
 		workerRequest.BrowserOptions.UserDataDir = filepath.Join(workerDir, "profile")
 		if workerRequest.BrowserOptions.Language == "" {
-			workerRequest.BrowserOptions.Language = preferredLanguageForItems(group.Items)
+			workerRequest.BrowserOptions.Language = siteConfigFor(workerRequest.Site).AcceptLanguage
 		}
-		_ = ensureParent(workerRequest.BrowserOptions.SessionFile)
-		if base := expandPath(request.BrowserOptions.SessionFile); base != "" {
-			if raw, err := os.ReadFile(base); err == nil {
-				_ = os.WriteFile(workerRequest.BrowserOptions.SessionFile, raw, 0o644)
+		var sessionPrepareErr error
+		if err := ensureParent(workerRequest.BrowserOptions.SessionFile); err != nil {
+			sessionPrepareErr = err
+		}
+		if workerRequest.FreshProfile {
+			if sessionPrepareErr == nil {
+				sessionPrepareErr = prepareRuntimeSession("", workerRequest.BrowserOptions.SessionFile, true)
 			}
+		} else if base := expandPath(request.BrowserOptions.SessionFile); base != "" {
+			if raw, err := os.ReadFile(base); err == nil {
+				if sessionPrepareErr == nil {
+					sessionPrepareErr = os.WriteFile(workerRequest.BrowserOptions.SessionFile, raw, 0o644)
+				}
+			}
+		}
+		if sessionPrepareErr != nil {
+			go func() {
+				resultCh <- workerResult{Vendor: group.Vendor, WorkerID: workerID, Success: false, OutputPath: outputPath, SessionFile: workerRequest.BrowserOptions.SessionFile, ProfileDir: workerRequest.BrowserOptions.UserDataDir, Error: "session prepare failed: " + sessionPrepareErr.Error(), ErrorType: fmt.Sprintf("%T", sessionPrepareErr), Stage: "session_prepare", URLCount: len(group.Items), LogFile: request.LogFile}
+			}()
+			return ctx.Err() == nil
 		}
 		baseProfile := state.ProfileSeedDir
 		reporter(Event{"event": "browser_prepare", "stage": "profile_copy", "vendor": group.Vendor, "worker_id": workerID, "message": "copying Chrome profile for worker", "source_profile_dir": baseProfile, "profile_dir": workerRequest.BrowserOptions.UserDataDir})
-		if err := replaceProfileDir(baseProfile, workerRequest.BrowserOptions.UserDataDir); err != nil {
+		if err := prepareRuntimeProfile(baseProfile, workerRequest.BrowserOptions.UserDataDir, workerRequest.FreshProfile); err != nil {
 			go func() {
 				resultCh <- workerResult{Vendor: group.Vendor, WorkerID: workerID, Success: false, OutputPath: outputPath, SessionFile: workerRequest.BrowserOptions.SessionFile, ProfileDir: workerRequest.BrowserOptions.UserDataDir, Error: "profile copy failed: " + err.Error(), ErrorType: fmt.Sprintf("%T", err), Stage: "profile_copy", URLCount: len(group.Items), LogFile: request.LogFile}
 			}()
@@ -498,6 +523,27 @@ func scrapeVendorBatches(request TaskRequest, reporter Reporter, runMode string)
 	}
 
 	return TaskResult{Success: true, OutputPath: outputDir, OutputPaths: outputPaths, ProcessedCount: rows, Warnings: warnings, LogFile: request.LogFile, ExitCode: 0, QualityFailedURLs: finalQualityFailedURLs, QualityRecoveredURLs: qualityRecoveredURLs, QualityRerunAttemptedURLs: qualityRerunAttemptedURLs, QualityRerunRecoveredURLs: qualityRerunRecoveredURLs, FinalQualityFailedURLs: finalQualityFailedURLs}
+}
+
+func prepareRuntimeProfile(seedDir, runtimeDir string, fresh bool) error {
+	if fresh {
+		return os.MkdirAll(runtimeDir, 0o755)
+	}
+	return replaceProfileDir(seedDir, runtimeDir)
+}
+
+func prepareRuntimeSession(seedPath, runtimePath string, fresh bool) error {
+	if err := ensureParent(runtimePath); err != nil {
+		return err
+	}
+	if fresh {
+		return writeEmptySession(runtimePath)
+	}
+	raw, err := os.ReadFile(seedPath)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(runtimePath, raw, 0o644)
 }
 
 type stopControl struct {

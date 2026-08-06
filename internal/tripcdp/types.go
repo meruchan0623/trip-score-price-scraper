@@ -55,6 +55,8 @@ type QualityRerunOptions struct {
 }
 
 type TaskRequest struct {
+	Site                string
+	FreshProfile        bool
 	InputPaths          []string
 	URLsFile            string
 	ExcelInput          string
