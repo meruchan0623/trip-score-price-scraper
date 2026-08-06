@@ -10,6 +10,8 @@
 - URL 列表评分与商品信息抓取：使用 `Ad-hoc rating-only score/sales scrape via --urls-file`。
 - 多厂商、批量、趋势、比价、恢复或定时任务：使用 Skill 中对应的批量与 cron 章节。
 
+凡任务由对话窗口发起，任务完成后必须将本次生成的 Excel 文件作为附件发送到发起该任务的同一个对话窗口；不得只回复文件路径，也不得发送到其他对话、群组或频道。
+
 指定产品抓取的用户可见回复由项目插件 `hermes-agent/plugins/trip-manual-delivery-guard/` 在 Hermes 发送前执行硬过滤。插件只允许原生附件，以及失败或影响完整性的单行警告；Agent 不得读取工作簿后生成价格、SKU、评分或产品摘要。
 
 项目内 Skill 和插件是唯一权威来源。不得使用 `~/.hermes/skills/` 中的旧 Skill 副本，也不得在 `~/.hermes/plugins/` 维护插件代码副本；主机只建立指向项目插件目录的符号链接。所有相对路径都以项目根目录为基准。

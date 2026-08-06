@@ -185,12 +185,12 @@ The native columns are:
 
 ```text
 商品ID, URL, 商品名称, SKU层级1...N, 货币, 外显价格, 实价, 促销标签,
-[价格可信标签, 原始捕获价格 when present], 商品资讯, 总促销标签,
+[价格可信标签 when present], 商品资讯, 总促销标签,
 月销量, 年销量, 总销量, 评价数, 评分, 好评率, 客户服务, 方便程度, 讯号状态, 中差评价数,
 [抓取备注 when present]
 ```
 
-`SKU层级1...N` expands to the actual maximum SKU depth. `月销量/年销量/总销量` and `好评率` follow the committed native field contract. `价格可信标签` and optional `原始捕获价格` may appear when price-quality data is present; `资源ID`, `接口ItemID`, `促销命中`, and `价格来源` remain internal. `总促销标签` follows `商品资讯`; `抓取备注` appears only when at least one row has a note.
+`SKU层级1...N` expands to the actual maximum SKU depth. `月销量/年销量/总销量` and `好评率` follow the committed native field contract. `价格可信标签` may appear when price-quality data is present; `原始捕获价格`, `资源ID`, `接口ItemID`, `促销命中`, and `价格来源` remain internal. `总促销标签` follows `商品资讯`; `抓取备注` appears only when at least one row has a note.
 
 The following are not manual-product deliverables: one workbook per requested URL, `product_<id>_pricelist_HKD.xlsx`, a `價格清單` sheet, a two/four-column rebuilt price list, a cleaned workbook, or a workbook with Agent-created `摘要` / `SKU价格明细` sheets.
 
