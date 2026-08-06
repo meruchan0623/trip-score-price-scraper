@@ -7,53 +7,31 @@ import (
 
 const hkAcceptLanguage = "zh-HK,zh;q=0.9,en-US;q=0.8,en;q=0.7"
 
+// Transitional compatibility for extraction code migrated in Task 4-6.
 type siteConfig struct {
-	Code           string
-	Host           string
-	Locale         string
-	Currency       string
-	AcceptLanguage string
-	PricePrefix    string
+	Code, Host, Locale, Currency, AcceptLanguage, PricePrefix string
 }
 
 func siteConfigFor(code string) siteConfig {
-	switch strings.ToLower(strings.TrimSpace(code)) {
-	case "sg":
-		return siteConfig{Code: "sg", Host: "sg.trip.com", Locale: "en-SG", Currency: "SGD", AcceptLanguage: "en-SG,en;q=0.9", PricePrefix: "S$"}
-	default:
-		return siteConfig{Code: "hk", Host: "hk.trip.com", Locale: "zh-HK", Currency: "HKD", AcceptLanguage: hkAcceptLanguage, PricePrefix: "HK$"}
+	market, ok := lookupSite(code)
+	if !ok {
+		market, _ = lookupSite("hk")
 	}
-}
-
-func validSite(code string) bool {
-	switch strings.ToLower(strings.TrimSpace(code)) {
-	case "hk", "sg":
-		return true
-	default:
-		return false
+	prefix := ""
+	if len(market.PricePrefixes) > 0 {
+		prefix = market.PricePrefixes[0]
 	}
+	return siteConfig{Code: market.Code, Host: market.Host, Locale: market.Locale, Currency: market.Currency, AcceptLanguage: market.AcceptLanguage, PricePrefix: prefix}
 }
 
 type navigationTarget struct {
-	OriginalURL    string
-	NavigateURL    string
-	Host           string
-	Locale         string
-	Currency       string
-	AcceptLanguage string
-	IsHK           bool
+	OriginalURL string
+	NavigateURL string
+	Market      MarketContext
 }
 
-func newNavigationTarget(rawURL string, configs ...siteConfig) navigationTarget {
-	config := siteConfigFor("hk")
-	if len(configs) > 0 {
-		config = configs[0]
-	}
-	target := navigationTarget{
-		OriginalURL:    rawURL,
-		NavigateURL:    rawURL,
-		AcceptLanguage: chromeLanguage(),
-	}
+func newNavigationTarget(rawURL string, market MarketContext) navigationTarget {
+	target := navigationTarget{OriginalURL: rawURL, NavigateURL: rawURL}
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
 		return target
@@ -63,28 +41,27 @@ func newNavigationTarget(rawURL string, configs ...siteConfig) navigationTarget 
 		return target
 	}
 	parsed.Scheme = "https"
-	parsed.Host = config.Host
+	parsed.Host = market.Host
 	values := parsed.Query()
-	values.Set("locale", config.Locale)
-	values.Set("curr", config.Currency)
+	values.Set("locale", market.Locale)
+	values.Set("curr", market.Currency)
 	parsed.RawQuery = values.Encode()
-	target.Host = config.Host
+	target.Market = market
 	target.NavigateURL = parsed.String()
-	target.Locale = config.Locale
-	target.Currency = config.Currency
-	target.AcceptLanguage = config.AcceptLanguage
-	target.IsHK = config.Code == "hk"
 	return target
 }
 
-func preferredLanguageForItems(items []ScrapeItem) string {
-	for _, item := range items {
-		target := newNavigationTarget(item.URL)
-		if target.IsHK {
-			return hkAcceptLanguage
-		}
+// preferredLanguageForItems keeps language selection independent from each
+// input URL; all navigations in a task use the resolved market language.
+func preferredLanguageForItems(_ []ScrapeItem, market MarketContext) string {
+	return market.AcceptLanguage
+}
+
+func applyMarketBrowserDefaults(request *TaskRequest) {
+	if request == nil || request.BrowserOptions.Language != "" {
+		return
 	}
-	return ""
+	request.BrowserOptions.Language = request.Market.AcceptLanguage
 }
 
 func targetOrigin(rawURL string) string {

@@ -10,6 +10,14 @@ import (
 	"time"
 )
 
+func mustTestMarket(code string) MarketContext {
+	m, err := resolveMarketContext(code, "", "")
+	if err != nil {
+		panic(err)
+	}
+	return m
+}
+
 func TestPrepareRuntimeSessionFreshProfileDoesNotCopySavedSession(t *testing.T) {
 	dir := t.TempDir()
 	seed := filepath.Join(dir, "saved.json")
@@ -115,7 +123,7 @@ func TestScrapeSingleReportsFreshSessionPreparationFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	result := scrapeSingle(TaskRequest{
-		Site:         "hk",
+		Market:       mustTestMarket("hk"),
 		FreshProfile: true,
 		InputPaths:   []string{"https://hk.trip.com/things-to-do/detail/45892282/"},
 		OutputPath:   filepath.Join(blockedParent, "result.xlsx"),
