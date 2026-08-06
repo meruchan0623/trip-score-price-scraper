@@ -25,7 +25,7 @@ go build -o /tmp/trip-score-cdp ./cmd/trip-score-cdp
 - 商品资讯
 - SKU 层级组合
 - 外显价格、动态实价、SKU 促销标签、商品级总促销标签
-- 通过 `--site hk|sg` 切换香港站或新加坡站（默认 `hk`）
+- 通过 `--site` 选择 33 个已登记站点（默认 `hk`），并用 `--locale` / `--currency` 覆盖展示语言与价格币种
 - 厂商 Excel 批量抓取
 - TSIM / 任意基准厂商 vs 竞对厂商横向比价
 
@@ -78,12 +78,7 @@ go build -o /tmp/trip-score-cdp ./cmd/trip-score-cdp
 
 ### 分站切换
 
-`--site` 会统一设置目标 host、`locale`、`curr`、浏览器语言、价格前缀和币种质量门禁。当前支持：
-
-```text
-hk -> hk.trip.com / zh-HK / HKD / HK$
-sg -> sg.trip.com / en-SG / SGD / S$
-```
+`--site` 先选择目标 host 及其默认 locale/currency；随后 `--locale` 和 `--currency` 分别覆盖展示语言和价格币种。每次导航都会显式带上 `locale`、`curr`，并由 returned-context gate 校验最终 host、站点、locale、currency；非默认组合只有在该校验通过后才会产生可信价格行。未知站点、未广告 locale 或不支持的 ISO 币种会在参数解析阶段失败，不会静默回退到香港站。完整登记和观测证据见 [Trip Things-to-Do 市场兼容性记录](docs/trip-things-to-do-market-compatibility.md)。
 
 例如抓取同一商品的新加坡站：
 
@@ -95,6 +90,20 @@ sg -> sg.trip.com / en-SG / SGD / S$
   --delay-profile normal \
   --input "https://hk.trip.com/things-to-do/detail/45892282/" \
   --output ./trip_product_sg.xlsx
+```
+
+更多市场/覆盖组合示例：
+
+```bash
+/tmp/trip-score-cdp-all-sites --site jp --fresh-profile --no-headless \
+  --delay-profile normal \
+  --input "https://hk.trip.com/things-to-do/detail/45892282/" \
+  --output /tmp/trip-jp-45892282.xlsx
+
+/tmp/trip-score-cdp-all-sites --site sg --locale zh-SG --currency MYR \
+  --fresh-profile --no-headless --delay-profile normal \
+  --input "https://hk.trip.com/things-to-do/detail/45892282/" \
+  --output /tmp/trip-sg-zh-myr-45892282.xlsx
 ```
 
 输入 URL 的原始分站仅用于识别商品路径；最终导航和输出 URL 由 `--site` 规范化。Hermes 指定产品手工交付流程仍固定使用默认香港站，不传 `--site sg`。
