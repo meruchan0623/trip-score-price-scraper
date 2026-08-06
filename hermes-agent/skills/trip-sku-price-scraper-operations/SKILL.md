@@ -123,19 +123,19 @@ Extract the decimal product ID following `產品價格` / `产品价格`. If the
 https://hk.trip.com/things-to-do/detail/<product-id>/?locale=zh-HK&curr=HKD
 ```
 
-The valid success response contains only the native workbook's bare absolute path:
+The valid success response contains only the native workbook attachment in the same conversation that started the task. Hermes converts the native artifact to an attachment; do not expose a path:
 
 ```text
-/Users/example/Documents/trip-sku-price-scrape/manual-<ids>/trip_scoreandprice_results_<YYMMDD-HHMM>.xlsx
+<native XLSX attachment; path remains internal>
 ```
 
-Hermes Gateway converts the bare path into a native attachment and removes the path from visible chat text. Before the path, send no acknowledgement, progress message, product title, price, SKU count, minimum/maximum price, Markdown table, plain-text list, run summary, or output-path explanation. After it, send nothing else. Tool/runtime logs remain internal and are not copied into the user-facing response.
+Before the attachment, send no acknowledgement, progress message, product title, price, SKU count, minimum/maximum price, Markdown table, plain-text list, run summary, or output-path explanation. After it, send nothing else. Tool/runtime logs remain internal and are not copied into the user-facing response.
 
 The project plugin `hermes-agent/plugins/trip-manual-delivery-guard/` enforces this contract with `pre_llm_call` and `transform_llm_output`. It removes any Agent-generated summary immediately before delivery. Do not bypass, disable, or work around the guard. Workbook reads are permitted only for the structural validation required below; never inspect the workbook to compose product, price, rating, booking, promotion, SKU-count, minimum-price, or comparison prose.
 
 The delivered file is always the Go CLI native workbook. Never create or attach a secondary workbook named like `product_<id>_pricelist_HKD.xlsx`. A workbook with a `價格清單` sheet, top summary fields such as `產品名稱 / 產品ID / 幣種 / 最低價 / SKU總數`, or a rebuilt `套餐名稱 / 實價 / 原價 / resourceId` table is an invalid Agent-generated deliverable.
 
-For this manual workflow, every supplied Trip.com URL is a product identifier only. Before navigation, the Go CLI forcibly rewrites any Trip.com host and query to `https://hk.trip.com/...?...&locale=zh-HK&curr=HKD`. The native workbook must therefore record the canonical Hong Kong URL and HKD prices only; do not follow, preserve, compare, or export `CNY` / RMB prices even if the user supplied a mainland, Singapore, or another Trip.com URL. If a page/API still returns a non-HKD price, the CLI clears that row's price fields, marks it `currency_mismatch`, and the manual run must not be delivered as a success.
+For this manual workflow, every supplied Trip.com URL is a product identifier only: its host never infers a market. With no explicit market intent, use the default `hk / zh-HK / HKD`; explicit site/locale/currency outside the URL overrides it. The guard maintains 33 canonical site defaults and 25 currency recommendations (recommendations are not hard bindings). A single market uses the legacy `--site`/`--locale`/`--currency` flags; multiple markets use repeated full `--market site:locale:currency` in user order with `--market-workers` defaulting to 2 (1–3 allowed), producing one XLSX with ordered market sheets. Conflicting or ambiguous market intent must be clarified or exit 2 before launch. If a page/API returns a currency different from the requested market, the CLI clears that row's price fields and marks it `currency_mismatch`; the run is not a successful delivery.
 
 1. Treat the request as a direct-input Go CDP SKU-price scrape, not an Excel-vendor batch and not the Trip outerlist scraper.
 2. Resolve every requested product to its exact Trip.com detail URL. Pass one `-input` argument per product, preserving the user's order. Do not generate an input workbook or URL-list file for this workflow.
@@ -174,27 +174,27 @@ For several selected products, the command shape is:
 Do not replace these manual-task defaults with `-headless`, another delay profile, `-excel-input`, `-urls-file`, `-output`, or quality-rerun flags. Run selected products sequentially with the CLI's single worker. Batch and scheduled workflows keep their separate parameters elsewhere in this skill.
 
 6. Verify the final `run_done` event and the generated workbook at `<output-dir>/trip_scoreandprice_results_<YYMMDD-HHMM>.xlsx`. Success requires `success=true`, exit code `0`, and at least one captured row for every requested product.
-7. Verify that the workbook has exactly one sheet named `Trip商品数据` and that its header follows the native field contract below. Every product must have a product name, at least one SKU level, currency, a non-empty display/real price, and only `trusted_base` or `trusted_promo` price statuses. Any `risk_blocked`, Cloudflare/Whaleguard note, unknown/untrusted status, missing required field, or visibly incomplete product makes the run unsuccessful even if the workbook exists.
-8. On valid success, emit only the bare absolute native workbook path specified above. The delivery guard performs the final allowlist check.
+7. For a single-market manual run, verify exactly one sheet named `Trip商品数据`; for a multi-market run, verify the ordered `<SITE>-<CURRENCY>` sheets described below. Every product must have a product name, at least one SKU level, currency, a non-empty display/real price, and only `trusted_base` or `trusted_promo` price statuses. Any `risk_blocked`, Cloudflare/Whaleguard note, unknown/untrusted status, missing required field, or visibly incomplete product makes the run unsuccessful even if the workbook exists.
+8. On valid success, the agent/runtime emits the bare absolute native workbook path internally. Hermes Gateway converts that path into a native attachment in the same conversation and removes the path from visible text. Never ask the agent to manufacture an attachment object or expose the path. The delivery guard performs ZIP/XML, sheet-order, requested-market, and trusted-row checks. A partial market result retains the native workbook with a single warning and CLI exit 4; all-market failure writes no workbook and also exits 4.
 
 ### Native manual-product workbook contract
 
-The delivered workbook is the unmodified Go CLI output for all requested products. It has exactly one worksheet named `Trip商品数据`. Keep the native row values and native column order; do not fill down, delete, rename, reorder, or summarize fields.
+The delivered workbook is the unmodified Go CLI output for all requested products. A single-market workbook has exactly one worksheet named `Trip商品数据`; a multi-market workbook has the ordered market worksheets described below. Keep native row values and native column order; do not fill down, delete, rename, reorder, or summarize fields.
 
 The native columns are:
 
 ```text
 商品ID, URL, 商品名称, SKU层级1...N, 货币, 外显价格, 实价, 促销标签,
 [价格可信标签, 原始捕获价格 when present], 商品资讯, 总促销标签,
-预定数, 评价数, 评分, 客户服务, 方便程度, 讯号状态, 中差评价数,
+月销量, 年销量, 总销量, 评价数, 评分, 好评率, 客户服务, 方便程度, 讯号状态, 中差评价数,
 [抓取备注 when present]
 ```
 
-`SKU层级1...N` expands to the actual maximum SKU depth. `价格可信标签` and `原始捕获价格` appear only when the native export has price-quality data; internal diagnostic fields `资源ID`, `接口ItemID`, `促销命中`, and `价格来源` are not exported. `总促销标签` follows `商品资讯`; `抓取备注` appears only when at least one row has a note.
+`SKU层级1...N` expands to the actual maximum SKU depth. `月销量/年销量/总销量` and `好评率` follow the committed native field contract. `价格可信标签` and optional `原始捕获价格` may appear when price-quality data is present; `资源ID`, `接口ItemID`, `促销命中`, and `价格来源` remain internal. `总促销标签` follows `商品资讯`; `抓取备注` appears only when at least one row has a note.
 
 The following are not manual-product deliverables: one workbook per requested URL, `product_<id>_pricelist_HKD.xlsx`, a `價格清單` sheet, a two/four-column rebuilt price list, a cleaned workbook, or a workbook with Agent-created `摘要` / `SKU价格明细` sheets.
 
-Validate the workbook with normal `openpyxl.load_workbook(path)` mode before delivery. If the native workbook exists but has no data rows, missing required columns, an unexpected sheet, or other anomalies, the response may contain exactly two lines: `抓取结果异常：<short reason>` followed by the bare absolute native workbook path. If the scrape encountered partial SKU-level click failures, anti-bot/API blocking, timeout/interruption, or partial product failures, use one `抓取重要警告：<short reason>` line followed by the bare path. Never include captured prices, product names, ratings, bookings, promotions, SKU counts, minimum prices, or comparisons. If the native workbook does not exist, report exactly `抓取失败：未生成原生Excel（<run-dir>）`; do not create a replacement workbook from terminal or JSONL logs.
+Validate the workbook using the project guard's Python standard-library ZIP/XML checks (the XLSX is a ZIP package; do not require `openpyxl` for the delivery gate). The guard validates expected ordered market sheets, worksheet names (`<SITE>-<CURRENCY>`; locale suffix is added for collisions), Excel's 31-character limit and deterministic de-duplication, requested host/locale/currency, and trusted rows. Single-market output is one sheet named `Trip商品数据`; multi-market output uses the ordered market names and omits failed/empty market sheets. If the native workbook exists but has no data rows, missing required columns, an unexpected sheet, or other anomalies, send only the allowlisted single-line anomaly/warning plus the native attachment. If the scrape encountered partial SKU-level click failures, anti-bot/API blocking, timeout/interruption, or partial product/market failures, send one allowlisted warning plus the native attachment. Never include captured prices, product names, ratings, bookings, promotions, SKU counts, minimum prices, or comparisons. If the native workbook does not exist, report exactly `抓取失败：未生成原生Excel（<run-dir>）`; do not create a replacement workbook from terminal or JSONL logs.
 
 ## Ad-hoc multi-destination price scrape
 

@@ -8,7 +8,7 @@
 
 这是 Go CDP 实现、自动化测试和公开页面探针的证据记录，不是已登录的业务验收。没有执行登录、凭据/Token 读取、原始 Cookie 导出、写入、部署、cron 或远程操作；returned-context gate 仅在页面内读取 `ibusite`、`ibulocale`、`cookiePricesDisplayed` 三个公开市场偏好值并返回规范化后的 site/locale/currency。authenticated business acceptance remains open。`--fresh-profile` 每次使用临时空 profile，不能据此推断登录态业务流程。
 
-市场解析顺序是 `--site` 选择 host 和默认值，`--locale` 覆盖展示语言，`--currency` 覆盖价格币种。最终导航显式设置两项 query；returned-context gate 必须确认最终 host、site ID、locale 和 ISO currency，非默认组合才可信任价格。SA 的默认 locale 是 `ar-SA`，但它不是 60 个 Things-to-Do advertised locale 列表中的独立新增值；它是站点默认值与广告能力清单的边界案例。
+没有市场意图时默认 `hk / zh-HK / HKD`。URL host 不推断市场；只有 URL 外显式站点/地区/币种才会覆盖默认。单市场使用 `--site`、`--locale`、`--currency`；多市场按请求顺序重复完整 `--market site:locale:currency`，市场 worker 默认 2、范围 1–3。33 个 canonical 默认值和 25 个币种推荐映射均为导航/提示默认，不是硬绑定；显式 `site:locale:currency` 优先。冲突或无法一一对应的意图必须澄清/exit 2，不得猜测。最终导航显式设置 query；returned-context gate 必须确认最终 host、site ID、locale 和 ISO currency，非默认组合才可信任价格。SA 的默认 locale 是 `ar-SA`，但它不是 60 个 Things-to-Do advertised locale 列表中的独立新增值；它是站点默认值与广告能力清单的边界案例。
 
 广告 locale 是能力 allow-list，并不保证每个 locale/host/product 都有库存。通过上下文门禁但商品不存在时，结果分类为 `unavailable`；这仍是上下文证据，不是可售价格验收。
 
@@ -81,6 +81,10 @@ th-TH tr-TR uk-UA vi-VN zh-HK zh-MY zh-SG zh-TW
 | sa | ar-SA / SAR | sa.trip.com | ar-SA / SAR | available / 197 | trusted (197) | true | `/tmp/trip-market-acceptance-sa-45892282.log` |
 
 Workbook outputs are under `/tmp/trip-market-acceptance-*-45892282.xlsx`; an XLSX alone is not acceptance evidence. The remaining 24 registry entries have registry/unit-test coverage only, not a public probe in this record.
+
+多市场导出使用一个 XLSX，并按请求顺序写入市场工作表；单市场仍使用旧 flags。任一市场失败时结果只能标记 partial，全部失败不得伪装为成功；无市场意图则维持 HK/HKD 默认。Hermes guard 还会对原生 XLSX 做 ZIP/XML 结构校验、工作表顺序和每行 host/locale/currency/可信状态校验。实现、测试、公开 probe、部署以及 authenticated business acceptance 分开记录；本记录的公开 probe 不代表部署或登录后业务验收。
+
+多市场 worksheet 名称为 `<SITE>-<CURRENCY>`；同一基础名称发生 locale/currency 碰撞时追加 locale，之后按 Excel 31 字符上限截断并以 `-2`, `-3` 等确定性去重。单市场 worksheet 固定为 `Trip商品数据`。部分成功为 CLI exit 4 并保留非空成功市场 sheet；全部失败为 exit 4 且不写 XLSX。当前记录只包含历史单市场公开 probe，不构成当前多市场 probe、部署或 authenticated business acceptance。
 
 ## Failure classes and safe boundaries
 

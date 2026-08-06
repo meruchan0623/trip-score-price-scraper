@@ -78,7 +78,7 @@ go build -o /tmp/trip-score-cdp ./cmd/trip-score-cdp
 
 ### 分站切换
 
-`--site` 先选择目标 host 及其默认 locale/currency；随后 `--locale` 和 `--currency` 分别覆盖展示语言和价格币种。每次导航都会显式带上 `locale`、`curr`，并由 returned-context gate 校验最终 host、站点、locale、currency；非默认组合只有在该校验通过后才会产生可信价格行。未知站点、未广告 locale 或不支持的 ISO 币种会在参数解析阶段失败，不会静默回退到香港站。完整登记和观测证据见 [Trip Things-to-Do 市场兼容性记录](docs/trip-things-to-do-market-compatibility.md)。
+`--site` 先选择目标 host 及其默认 locale/currency；随后 `--locale` 和 `--currency` 分别覆盖展示语言和价格币种。URL host 不推断市场；只有显式参数或 Hermes 在 URL 外解析出的市场意图才会改变默认 `hk / zh-HK / HKD`。每次导航都会显式带上 `locale`、`curr`，并由 returned-context gate 校验最终 host、站点、locale、currency；非默认组合只有在该校验通过后才会产生可信价格行。未知站点、未广告 locale 或不支持的 ISO 币种会在参数解析阶段失败，不会静默回退。完整登记和观测证据见 [Trip Things-to-Do 市场兼容性记录](docs/trip-things-to-do-market-compatibility.md)。
 
 例如抓取同一商品的新加坡站：
 
@@ -106,7 +106,46 @@ go build -o /tmp/trip-score-cdp ./cmd/trip-score-cdp
   --output /tmp/trip-sg-zh-myr-45892282.xlsx
 ```
 
-输入 URL 的原始分站仅用于识别商品路径；最终导航和输出 URL 由 `--site` 规范化。Hermes 指定产品手工交付流程仍固定使用默认香港站，不传 `--site sg`。
+输入 URL 的原始分站仅用于识别商品路径；最终导航和输出 URL 由显式市场规范化。Hermes 指定产品手工交付在无市场意图时使用默认香港站；若用户明确指定其他单市场或多个市场，则由 guard 生成对应单市场 flags 或重复完整 `--market site:locale:currency`。
+
+### 手工市场解析与多市场导出
+
+Hermes guard 注册 33 个 canonical site/host/locale/currency 默认值，并提供 25 个币种到推荐站点的映射；推荐不是硬绑定，显式站点、locale、币种组合优先。市场必须在 URL 之外明确：URL host 永远不构成市场意图。无法一一对应或互相冲突的市场说法先澄清，解析冲突以 exit 2 终止，不启动抓取。
+
+单市场使用旧 `--site`/`--locale`/`--currency` flags；多市场按出现顺序重复 `--market site:locale:currency`，`--market-workers` 默认 2，范围 1–3。多市场只生成一个原生 XLSX，工作表按请求顺序排列；缺一市场是 partial，全部失败仍是失败。手工成功交付只接受 guard 通过 ZIP/XML 结构、sheet 顺序、市场 URL/货币和可信状态校验的原生附件。
+
+可重复的多市场命令（同一商品，HK + JP + SG/MYR；SG 的 locale/currency 显式覆盖默认）：
+
+```bash
+/tmp/trip-score-cdp \
+  --market hk:zh-HK:HKD \
+  --market jp:ja-JP:JPY \
+  --market sg:en-SG:MYR \
+  --market-workers 2 \
+  --fresh-profile --no-headless --delay-profile normal \
+  --input "https://hk.trip.com/things-to-do/detail/45892282/" \
+  --output /tmp/trip-45892282-hk-jp-sg-myr.xlsx
+```
+
+`--market hk:zh-HK:USD --market hk:zh-HK:HKD` 是显式同站不同币种，合法且不应被推荐映射覆盖；`--market jp:ja-JP:JPY --market sg:en-SG:JPY` 也合法。`--market hk:zh-HK` 同样合法，货币继承香港站默认 HKD；完全重复的解析后上下文按首次出现位置去重。`--market` 与顶层 `--site`/`--locale`/`--currency`、`--excel-input`、`--compare-vendor`、rating-only 或 mode2 混用，或者 `--market-workers` 超出 1–3 时，以 exit 2 拒绝启动；用户只说“美元区/几个主要市场”而没有一一对应时必须先澄清。
+
+币种到推荐站点（推荐而非硬绑定）：
+
+| currency | recommended site | currency | recommended site |
+|---|---|---|---|
+| USD | us | HKD | hk |
+| SGD | sg | TWD | tw |
+| JPY | jp | KRW | kr |
+| THB | th | VND | vn |
+| IDR | id | MYR | my |
+| AUD | au | GBP | uk |
+| EUR | de | BRL | br |
+| CAD | ca | AED | ae |
+| SAR | sa | INR | in |
+| PHP | ph | UAH | ua |
+| DKK | dk | PLN | pl |
+| SEK | se | TRY | tr |
+| RUB | ru |  |  |
 
 公共页面本地调试时可显式传 `--fresh-profile`，避免复制历史浏览器资料；该参数默认关闭，且不会复用已保存的登录态。
 
