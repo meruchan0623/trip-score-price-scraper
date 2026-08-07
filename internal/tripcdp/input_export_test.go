@@ -241,12 +241,12 @@ func TestExportRowsAddsPriceQualityColumnsOnlyWhenPresent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, field := range []string{"价格可信标签", "原始捕获价格", "抓取备注"} {
+	for _, field := range []string{"价格可信标签", "抓取备注"} {
 		if !containsString(gotRows[0], field) {
 			t.Fatalf("quality header %q missing from %#v", field, gotRows[0])
 		}
 	}
-	for _, field := range []string{"价格状态", "资源ID", "接口ItemID", "促销命中", "价格来源"} {
+	for _, field := range []string{"价格状态", "原始捕获价格", "资源ID", "接口ItemID", "促销命中", "价格来源"} {
 		if containsString(gotRows[0], field) {
 			t.Fatalf("internal quality header %q must not be exported: %#v", field, gotRows[0])
 		}
@@ -256,9 +256,6 @@ func TestExportRowsAddsPriceQualityColumnsOnlyWhenPresent(t *testing.T) {
 	}
 	if gotRows[1][indexOfString(gotRows[0], "外显价格")] != "" || gotRows[1][indexOfString(gotRows[0], "实价")] != "" {
 		t.Fatalf("untrusted prices should be blank in price columns: %#v", gotRows[1])
-	}
-	if gotRows[1][indexOfString(gotRows[0], "原始捕获价格")] != "22" {
-		t.Fatalf("raw captured price missing: %#v", gotRows[1])
 	}
 }
 
@@ -371,7 +368,7 @@ func TestExportRowsRatingOnlyProductInfoShapeMatchesLegacyGUI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"商品ID", "URL", "商品名称", "商品资讯", "月销量", "年销量", "总销量", "评价数", "评分", "好评率", "客户服务", "方便程度", "讯号状态", "中差评价数"}
+	want := []string{"商品ID", "URL", "商品名称", "商品资讯", "总促销标签", "月销量", "年销量", "总销量", "评价数", "评分", "好评率", "客户服务", "方便程度", "讯号状态", "中差评价数"}
 	if !reflect.DeepEqual(gotRows[0], want) {
 		t.Fatalf("rating-only header = %#v, want %#v", gotRows[0], want)
 	}
@@ -379,10 +376,10 @@ func TestExportRowsRatingOnlyProductInfoShapeMatchesLegacyGUI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if dimension != "A1:N2" {
-		t.Fatalf("rating-only sheet dimension = %q, want A1:N2", dimension)
+	if dimension != "A1:O2" {
+		t.Fatalf("rating-only sheet dimension = %q, want A1:O2", dimension)
 	}
-	for _, forbidden := range []string{"SKU层级1", "货币", "外显价格", "实价", "促销标签", "总促销标签"} {
+	for _, forbidden := range []string{"SKU层级1", "货币", "外显价格", "实价", "促销标签"} {
 		for _, field := range gotRows[0] {
 			if field == forbidden {
 				t.Fatalf("rating-only header unexpectedly contains %q: %#v", forbidden, gotRows[0])

@@ -72,6 +72,7 @@ func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bo
 	var runMode string
 	var browser string
 	var site string
+	var sitesList stringList
 	var locale string
 	var currency string
 	var freshProfile bool
@@ -80,6 +81,7 @@ func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bo
 	var output string
 	var outputDir string
 	var workers int
+	var multiSiteOutput bool
 	var sessionFile string
 	var logFile string
 	var logLevel string
@@ -124,10 +126,12 @@ func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bo
 	fs.StringVar(&outputDir, "output-dir", "", "Directory for automatically named Excel outputs.")
 	fs.IntVar(&workers, "workers", 0, "Concurrent browser workers, 1-5. Defaults to min(vendor count, 5).")
 	fs.Float64Var(&startupStagger, "startup-stagger", 0.5, "Seconds to wait between starting vendor browser workers. Use 0 to disable staggering.")
+	fs.BoolVar(&multiSiteOutput, "multi-site-output", false, "Export rows into one workbook with a sheet per site code. Only meaningful for single-input mode with rating-only; ignored otherwise.")
 	fs.IntVar(&stopGrace, "stop-grace-seconds", 30, "Seconds to wait for partial exports after SIGINT/SIGTERM before terminating workers.")
-	fs.StringVar(&runMode, "run-mode", "", "Preset run mode: mode1=headless full SKU/price/rating scrape; mode2=headless rating-only + product-info scrape (no SKU, no price columns).")
+	fs.StringVar(&runMode, "run-mode", "", "Preset run mode: mode1=visible full SKU/price/rating scrape; mode2=visible rating-only + product-info scrape (no SKU, no price columns).")
 	fs.StringVar(&browser, "browser", "chrome", "Browser to use. Only chrome is supported.")
 	fs.StringVar(&site, "site", "hk", "Trip subsite to scrape.")
+	fs.Var(&sitesList, "sites", "Comma-separated Trip subsites to scrape one workbook across. If set, --site is ignored.")
 	fs.StringVar(&locale, "locale", "", "Trip Things-to-Do locale override (advertised locale).")
 	fs.StringVar(&currency, "currency", "", "Trip ISO currency override.")
 	fs.BoolVar(&freshProfile, "fresh-profile", false, "Start with an empty temporary Chrome profile instead of copying saved browser state.")
@@ -142,7 +146,7 @@ func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bo
 	fs.IntVar(&memoryLimit, "browser-memory-limit-mb", 8192, "Restart Chrome after managed browser RSS exceeds this many MB.")
 	fs.IntVar(&restartEvery, "browser-restart-every", 20, "Restart Chrome after this many processed URLs.")
 	fs.BoolVar(&disableMemoryGuard, "disable-browser-memory-guard", false, "Disable Chrome memory guard and automatic browser restarts.")
-	fs.StringVar(&delayProfile, "delay-profile", "normal", "Delay preset: fast, normal, safe, or slow.")
+	fs.StringVar(&delayProfile, "delay-profile", "fast", "Delay preset: fast, normal, safe, or slow.")
 	fs.Float64Var(&pageDelayMin, "page-delay-min", -1, "Minimum seconds to wait after page load before scrolling. Default -1 uses delay profile default.")
 	fs.Float64Var(&pageDelayMax, "page-delay-max", -1, "Maximum seconds to wait after page load before scrolling. Default -1 uses delay profile default.")
 	fs.Float64Var(&scrollDelayMin, "scroll-delay-min", -1, "Minimum seconds to wait between lazy-load scrolls. Default -1 uses delay profile default.")
@@ -188,6 +192,23 @@ func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bo
 	market, err := resolveMarketContext(site, locale, currency)
 	if err != nil {
 		return TaskRequest{}, "", "", false, false, flagValueError(err)
+	}
+
+	var sites []string
+	if len(sitesList) > 0 {
+		for _, code := range strings.Split(strings.Join([]string(sitesList), ","), ",") {
+			code = strings.TrimSpace(code)
+			if code == "" {
+				continue
+			}
+			if _, ok := lookupSite(code); !ok {
+				return TaskRequest{}, "", "", false, false, fmt.Errorf("unsupported site %q in --sites", code)
+			}
+			sites = append(sites, code)
+		}
+		if len(sites) == 0 {
+			return TaskRequest{}, "", "", false, false, fmt.Errorf("--sites must contain at least one valid site code")
+		}
 	}
 	if runMode != "" && runMode != "mode1" && runMode != "mode2" {
 		return TaskRequest{}, "", "", false, false, fmt.Errorf("--run-mode must be mode1 or mode2")
@@ -247,8 +268,9 @@ func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bo
 	if err != nil {
 		return TaskRequest{}, "", "", false, false, err
 	}
-	if delayProfile == "normal" && !stringFlagPassed(argv, "delay-profile") && runMode == "mode2" {
-		delayProfile = "fast"
+	// mode1 defaults to normal delay unless the user explicitly sets a different profile.
+	if runMode == "mode1" && delayProfile == "fast" && !flagPassed(argv, "delay-profile") {
+		delayProfile = "normal"
 	}
 	delayOptions, err := resolveDelayOptions(delayProfile, overrides)
 	if err != nil {
@@ -293,7 +315,9 @@ func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bo
 			MemoryLimitMB:      memoryLimit,
 			RestartEvery:       restartEvery,
 		},
-		CompareVendor: compareVendor,
+		CompareVendor:  compareVendor,
+		Sites:          sites,
+		MultiSiteOutput: multiSiteOutput || len(sites) > 0,
 	}, runMode, logLevel, jsonLines, noColor, nil
 }
 
@@ -331,12 +355,12 @@ type runOptions struct {
 }
 
 func resolveRunOptions(runMode string, headless triState, ratingOnly triState, realPrice triState, productInfo triState) runOptions {
-	options := runOptions{headless: true, ratingOnly: false, realPrice: true, productInfo: true}
+	options := runOptions{headless: false, ratingOnly: false, realPrice: true, productInfo: true}
 	switch runMode {
 	case "mode1":
-		options = runOptions{headless: true, ratingOnly: false, realPrice: true, productInfo: true}
+		options = runOptions{headless: false, ratingOnly: false, realPrice: true, productInfo: true}
 	case "mode2":
-		options = runOptions{headless: true, ratingOnly: true, realPrice: false, productInfo: true}
+		options = runOptions{headless: false, ratingOnly: true, realPrice: false, productInfo: true}
 	}
 	if headless.set {
 		options.headless = headless.value
@@ -360,25 +384,22 @@ func resolveRunOptions(runMode string, headless triState, ratingOnly triState, r
 	return options
 }
 
+func flagPassed(argv []string, name string) bool {
+	long := "--" + name
+	short := "-" + name
+	for _, arg := range argv {
+		if arg == long || arg == short || strings.HasPrefix(arg, long+"=") || strings.HasPrefix(arg, short+"=") {
+			return true
+		}
+	}
+	return false
+}
+
 func defaultPriceQualityRetries(runMode string, options runOptions) int {
 	if runMode == "mode2" || options.ratingOnly {
 		return 0
 	}
 	return 2
-}
-
-func stringFlagPassed(argv []string, name string) bool {
-	long := "--" + name
-	short := "-" + name
-	for i, arg := range argv {
-		if arg == long || arg == short || strings.HasPrefix(arg, long+"=") || strings.HasPrefix(arg, short+"=") {
-			return true
-		}
-		if (arg == long || arg == short) && i+1 < len(argv) {
-			return true
-		}
-	}
-	return false
 }
 
 func buildDelayOverrides(pageMin float64, pageMax float64, scrollMin float64, scrollMax float64, skuClickMin float64, skuClickMax float64, skuPriceMin float64, skuPriceMax float64, skuBetweenMin float64, skuBetweenMax float64) (delayOverrides, error) {

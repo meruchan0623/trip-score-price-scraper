@@ -210,7 +210,7 @@ state.update({{'status':'running','start_time':time.time(),'pid':int((run/'runne
 Path('/Users/example/Documents/trip-sku-price-scrape/current_state.json').write_text(json.dumps(state,ensure_ascii=False,indent=2),encoding='utf-8')
 PY
 set +e
-{str(BINARY)!r} --run-mode mode1 --no-headless --workers {workers} --delay-profile {DEFAULT_DELAY_PROFILE} --deadline 0530 --url-total-timeout 300 --navigation-timeout 120 --worker-stall-timeout 600 --max-quality-retries 2 --max-browser-restarts-per-vendor 2 --vendor-api-block-ratio 0.70 --vendor-api-block-min-attempts 10 --global-api-block-ratio 0.60 --global-api-block-min-processed 50 --fast-url-threshold 30 --risk-to-safe-threshold 10 --checkpoint-every-urls 10 --timeout {DEFAULT_TIMEOUT_SECONDS} --excel-input "$INPUT" --log-level verbose --log-file {str(jsonl_log_path)!r} --compare-vendor {DEFAULT_COMPARE_VENDOR!r} --output-dir "$RUN_DIR" > "$LOG" 2>&1
+{str(BINARY)!r} --run-mode mode1 --workers {workers} --delay-profile {DEFAULT_DELAY_PROFILE} --deadline 0530 --url-total-timeout 300 --navigation-timeout 120 --worker-stall-timeout 600 --max-quality-retries 2 --max-browser-restarts-per-vendor 2 --vendor-api-block-ratio 0.70 --vendor-api-block-min-attempts 10 --global-api-block-ratio 0.60 --global-api-block-min-processed 50 --fast-url-threshold 30 --risk-to-safe-threshold 10 --checkpoint-every-urls 10 --timeout {DEFAULT_TIMEOUT_SECONDS} --excel-input "$INPUT" --log-level verbose --log-file {str(jsonl_log_path)!r} --compare-vendor {DEFAULT_COMPARE_VENDOR!r} --output-dir "$RUN_DIR" > "$LOG" 2>&1
 code=$?
 set -e
 echo "$code" > "$RUN_DIR/exit_code.txt"

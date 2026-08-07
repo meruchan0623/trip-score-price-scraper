@@ -10,8 +10,8 @@ import (
 
 func TestResolveRunOptionsAppliesModeThenExplicitFlags(t *testing.T) {
 	mode1 := resolveRunOptions("mode1", triState{}, triState{}, triState{}, triState{})
-	if !mode1.headless {
-		t.Fatal("mode1 should be headless by default")
+	if mode1.headless {
+		t.Fatal("mode1 should be visible (headed) by default")
 	}
 	if mode1.ratingOnly || !mode1.realPrice || !mode1.productInfo {
 		t.Fatalf("mode1 should be full scrape with real price and product info: %+v", mode1)
@@ -25,8 +25,8 @@ func TestResolveRunOptionsAppliesModeThenExplicitFlags(t *testing.T) {
 		triState{},
 	)
 
-	if !options.headless {
-		t.Fatal("mode2 should remain headless unless explicitly overridden")
+	if options.headless {
+		t.Fatal("mode2 should remain visible (headed) unless explicitly overridden")
 	}
 	if !options.ratingOnly {
 		t.Fatal("mode2 must remain rating-only even if --no-rating-only is passed")
@@ -47,7 +47,7 @@ func TestParseRunModeDelayDefaults(t *testing.T) {
 	if runMode != "mode1" {
 		t.Fatalf("run mode = %q, want mode1", runMode)
 	}
-	if !mode1.BrowserOptions.Headless || mode1.RatingOnly || !mode1.ExtractRealPrice || !mode1.ExtractProductInfo {
+	if mode1.BrowserOptions.Headless || mode1.RatingOnly || !mode1.ExtractRealPrice || !mode1.ExtractProductInfo {
 		t.Fatalf("unexpected mode1 request: %+v", mode1)
 	}
 	if !mode1.QualityRerun.Enabled || mode1.QualityRerun.Headless || mode1.QualityRerun.DelayProfile != "safe" {
@@ -67,7 +67,7 @@ func TestParseRunModeDelayDefaults(t *testing.T) {
 	if runMode != "mode2" {
 		t.Fatalf("run mode = %q, want mode2", runMode)
 	}
-	if !mode2.BrowserOptions.Headless || !mode2.RatingOnly || mode2.ExtractRealPrice || !mode2.ExtractProductInfo {
+	if mode2.BrowserOptions.Headless || !mode2.RatingOnly || mode2.ExtractRealPrice || !mode2.ExtractProductInfo {
 		t.Fatalf("unexpected mode2 request: %+v", mode2)
 	}
 	if mode2.QualityRerun.Enabled {
@@ -119,8 +119,6 @@ func TestBoolFlagsDoNotRequireValues(t *testing.T) {
 
 func TestParseManualSelectedProductsContract(t *testing.T) {
 	request, runMode, _, _, _, err := parseArgs([]string{
-		"-no-headless",
-		"-delay-profile", "normal",
 		"-input", "https://hk.trip.com/things-to-do/detail/109223304/?locale=zh-HK&curr=HKD",
 		"-input", "https://hk.trip.com/things-to-do/detail/109223305/?locale=zh-HK&curr=HKD",
 		"-output-dir", "/Users/example/Documents/trip-sku-price-scrape/manual-selected",
@@ -139,8 +137,8 @@ func TestParseManualSelectedProductsContract(t *testing.T) {
 	if request.BrowserOptions.Headless {
 		t.Fatal("manual selected-product scrape should use a visible browser")
 	}
-	if request.DelayOptions.Profile != "normal" {
-		t.Fatalf("delay profile = %q, want normal", request.DelayOptions.Profile)
+	if request.DelayOptions.Profile != "fast" {
+		t.Fatalf("delay profile = %q, want fast", request.DelayOptions.Profile)
 	}
 	if request.OutputDir != "/Users/example/Documents/trip-sku-price-scrape/manual-selected" {
 		t.Fatalf("output dir = %q", request.OutputDir)

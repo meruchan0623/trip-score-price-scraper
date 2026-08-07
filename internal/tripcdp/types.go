@@ -76,6 +76,8 @@ type TaskRequest struct {
 	Runtime             RuntimeOptions
 	BrowserOptions      BrowserOptions
 	CompareVendor       string // If set, run vendor comparison against this base vendor after scrape
+	Sites           []string
+	MultiSiteOutput bool
 }
 
 type TaskResult struct {

@@ -29,6 +29,15 @@ go build -o /tmp/trip-score-cdp ./cmd/trip-score-cdp
 - 厂商 Excel 批量抓取
 - TSIM / 任意基准厂商 vs 竞对厂商横向比价
 
+## URL 拼接约定（重要）
+
+用产品 ID / 目标表拼接抓取 URL 时，**默认只拼 `https://{site}.trip.com/things-to-do/detail/<产品ID>/`，不追加任何查询参数**（如 `?locale=zh-HK&curr=HKD`）。
+
+- 只有当用户**显式传入需要抓取的货币/站点/语言**时，才追加对应参数（例如用户说「抓 HKD」「新加坡站」「MYR」时，才按需补 `?locale=...&curr=...` 或 `--site/--locale/--currency`）。
+- 原因：CLI 默认站为 `hk`，并由 returned-context gate 校验最终 host/site/locale/currency；URL 上多余的默认参数可能与实际请求不一致，也不必要。让 CLI 自行按默认站与校验规则规范化真实导航。
+- 从「日常抓取目标.xlsx」这类 ID 目标表构造清单时，同样遵循：只拼 `/detail/<ID>/`，除非用户另行指定货币/站点。
+
+
 ## 项目结构
 
 ```text
@@ -69,8 +78,7 @@ go build -o /tmp/trip-score-cdp ./cmd/trip-score-cdp
 ```bash
 /tmp/trip-score-cdp \
   --run-mode mode1 \
-  --headless \
-  --delay-profile normal \
+  --delay-profile fast \
   --timeout 1800 \
   --input "https://www.trip.com/things-to-do/detail/..." \
   --output ./trip_product.xlsx
@@ -87,7 +95,7 @@ go build -o /tmp/trip-score-cdp ./cmd/trip-score-cdp
   --site sg \
   --fresh-profile \
   --no-headless \
-  --delay-profile normal \
+  --delay-profile fast \
   --input "https://hk.trip.com/things-to-do/detail/45892282/" \
   --output ./trip_product_sg.xlsx
 ```
@@ -96,7 +104,7 @@ go build -o /tmp/trip-score-cdp ./cmd/trip-score-cdp
 
 ```bash
 /tmp/trip-score-cdp-all-sites --site jp --fresh-profile --no-headless \
-  --delay-profile normal \
+  --delay-profile fast \
   --input "https://hk.trip.com/things-to-do/detail/45892282/" \
   --output /tmp/trip-jp-45892282.xlsx
 
@@ -117,8 +125,7 @@ go build -o /tmp/trip-score-cdp ./cmd/trip-score-cdp
 ```bash
 /tmp/trip-score-cdp \
   --run-mode mode1 \
-  --headless \
-  --delay-profile normal \
+  --delay-profile fast \
   --timeout 1800 \
   --urls-file ./urls.txt \
   --output ./trip_products.xlsx
@@ -142,8 +149,7 @@ mkdir -p "$RUN_DIR"
 
 /tmp/trip-score-cdp \
   --run-mode mode1 \
-  --headless \
-  --delay-profile normal \
+  --delay-profile fast \
   --timeout 1800 \
   --excel-input ./vendors.xlsx \
   --workers 3 \
@@ -158,8 +164,7 @@ mkdir -p "$RUN_DIR"
 
 ```text
 --run-mode mode1
---headless
---delay-profile normal
+--delay-profile fast
 --timeout 1800
 --workers 3
 --compare-vendor "TSIM 網址"
@@ -167,9 +172,9 @@ mkdir -p "$RUN_DIR"
 
 说明：
 
-- `normal` 已由用户更新为默认；`safe` 用于风控场景。
+- `fast` 已由用户更新为默认；`normal`/`safe`/`slow` 用于特殊情况。
 - `--timeout 1800` 用于降低复杂多 SKU 商品在 worker/session 超时下半截漏抓的风险。
-- `--headless` 是当前日常默认主抓取模式；低质量结果会自动切换为有头 `safe` 单工重跑补救。
+- **有头浏览器（visible Chrome）现在是默认模式**：mode1 和 mode2 都默认启动可见 Chrome 窗口。如需关闭，传入 `--headless`。低质量 SKU 补救重跑默认仍为有头 `safe`。
 - `--workers 3` 是当前每日厂商 Excel 模式的默认上限。
 - `--compare-vendor` 可指定任意输入表头作为基准厂商；当前日常任务使用 `TSIM 網址`。
 
@@ -242,7 +247,29 @@ mode1 = 有头完整抓取：评分 + 商品资讯 + SKU层级 + 外显价 + 实
 mode2 = 有头仅评分/商品资讯抓取：只输出 商品ID、URL、商品名称、商品资讯、预定数、评价数、评分、客户服务、方便程度、讯号状态、中差评价数；不抓 SKU、不写货币/外显价/实价/促销标签
 ```
 
-`mode2` 是固定兼容模式，对齐旧 GUI 中只勾选「仅抓取评分」+「抓取商品资讯」的行为；即使误传 `--real-price` 或 `--no-rating-only`，也不会进入 SKU/价格抓取路径。
+`mode2` 是固定兼容模式，对齐旧 GUI 中只勾选「仅抓取评分」+「抓取商品资讯」的行为；即使误传 `--real-price` 或 `--no-rating-only`，也不会进入 SKU/价格抓取路径。两个模式默认均为有头浏览器（visible Chrome）；如需 headless，传入 `--headless`。
+
+### Mode2 厂商表 × 多站点（多 worker，市场串行）
+
+当同时传入 `--excel-input <厂商表.xlsx>` 与 `--sites <站点列表>` 时，CLI 进入**多厂商多站点 mode2** 路径：
+
+- **市场（站点）严格串行**：先跑完一个站点所有厂商的产品，再进入下一个站点。
+- **同一站点内多厂商并行**：用 `--workers N`（最多 5）并发多个厂商 worker，同站不同厂商连续跑。
+- **输出**：一个合并 workbook，**每个站点一个 sheet**（大写 site code，如 `HK`/`TW`），每行带 **`厂商` 列**。
+- 每个站点下同时保留每厂商独立 XLSX（`<站点>/<厂商>_<stamp>.xlsx`）。
+
+```bash
+/tmp/trip-score-cdp \
+  -run-mode mode2 \
+  --excel-input /path/to/日常抓取目标.xlsx \
+  --sites hk,tw,jp \
+  --delay-profile fast \
+  --workers 3 \
+  --output-dir /path/to/run_dir \
+  --no-headless
+```
+
+`--excel-input` 的单元格须为 Trip 完整 URL（含 `http` + `trip.com`），列头即厂商标识（如 `TSIM 網址`/`BC`/`TGT`/`FR`/`JY`/`其他`）。若用户提供的是产品 ID，Hermes 应先按「URL 拼接约定」把 ID 转成 URL 再写入厂商表。
 
 ### SKU 接口批量价格
 
@@ -263,7 +290,7 @@ safe
 slow
 ```
 
-日常主抓取默认推荐 `normal`，并配合 `--headless`、`--timeout 1800`、`--workers 3`。如果仍出现风控、页面加载慢、SKU 点击失败，低质量补救重跑会自动使用有头 `safe`；不要默认使用 `fast`。
+日常主抓取默认推荐 `fast`，并配合 `--timeout 1800`、`--workers 3`。如果仍出现风控、页面加载慢、SKU 点击失败，低质量补救重跑会自动使用有头 `safe`；不要默认使用 `headless`。
 
 ## 浏览器与状态
 
@@ -328,7 +355,7 @@ readlink /Users/example/.hermes/plugins/trip-manual-delivery-guard
 
 Hermes Agent 发现 Skill 后，应完整读取其中对应章节。项目不再维护用户目录下的 Skill 或插件代码副本。当修改抓取、比价、cron 或报告逻辑时，应同步更新该 Skill。
 
-Hermes 手动抓取单个或数个指定产品时，固定使用项目根目录构建的 `./trip-score-price-scraper`，以重复 `-input` 传入产品，并使用 `-no-headless -delay-profile normal -product-info -no-quality-rerun -output-dir <manual-dir>`。运营提示词如 `【請抓取產品價格71827107】` 会按产品 ID 构造香港站 HKD URL。该流程是有头单 worker 顺序抓取；Cloudflare/风险拦截、未知价格状态或缺少产品名、SKU、货币、价格任一必填数据时，即使已保留原生 Excel 也返回非零退出码。有效成功时只交付原生 XLSX 附件，不发送平文本价格、产品/SKU 摘要或二次整理表。只有失败、部分 SKU 点击失败、反爬/API 拦截、超时/中断、部分产品失败或原生 Excel 校验异常可以显示单行提示。批量和 cron 任务继续使用各自章节的参数。
+Hermes 手动抓取单个或数个指定产品时，固定使用项目根目录构建的 `./trip-score-price-scraper`，以重复 `-input` 传入产品，并使用 `-delay-profile fast -product-info -no-quality-rerun -output-dir <manual-dir>`。运营提示词如 `【請抓取產品價格71827107】` 会按产品 ID 构造 URL（遵循上面的「URL 拼接约定」：默认只拼 `/detail/<ID>/`，不追加 `?locale=...&curr=...`，除非用户显式指定货币/站点）。该流程默认有头单 worker 顺序抓取；Cloudflare/风险拦截、未知价格状态或缺少产品名、SKU、货币、价格任一必填数据时，即使已保留原生 Excel 也返回非零退出码。有效成功时只交付原生 XLSX 附件，不发送平文本价格、产品/SKU 摘要或二次整理表。只有失败、部分 SKU 点击失败、反爬/API 拦截、超时/中断、部分产品失败或原生 Excel 校验异常可以显示单行提示。批量和 cron 任务继续使用各自章节的参数。
 
 ## 验证
 
