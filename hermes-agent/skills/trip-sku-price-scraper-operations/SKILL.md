@@ -423,6 +423,8 @@ The program auto-generates the standard output filename: `trip_score_results_<YY
 
 **After the run completes successfully (exit_code=0), deliver the program's own output XLSX directly via MEDIA:** — reference the exact file path from the `export_done` / `run_done` event. Do NOT read the XLSX, re-export, modify, or create a second copy. The program's file on disk IS the deliverable.
 
+**Delivery destination (mandatory rule): 任务完成时，将结果文件 MEDIA 发送到「发出本次抓取指令的那个会话/群组」**（即指令来源会话的 origin 群组），或其显式指定的目标。不要投递到无关群组或只保存到本地。若指令来自某群组 A，就发回群组 A；若指令显式指定了其他投递目标，则投递到该指定目标。此规则对所有抓取完成交付（Mode2 成功/失败、厂商 Excel 模式、cron 结果包、手动单产品抓取）一视同仁。
+
 Success delivery text (fixed template):
 
 ```

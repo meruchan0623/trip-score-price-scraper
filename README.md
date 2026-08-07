@@ -355,6 +355,15 @@ readlink /Users/example/.hermes/plugins/trip-manual-delivery-guard
 
 Hermes Agent 发现 Skill 后，应完整读取其中对应章节。项目不再维护用户目录下的 Skill 或插件代码副本。当修改抓取、比价、cron 或报告逻辑时，应同步更新该 Skill。
 
+### 交付目的地规则（完成时将结果文件发送到指令来源群组）
+
+**铁律：任务完成时，将结果文件（原生 XLSX / ZIP 包等 MEDIA 附件）发送到「发出本次抓取指令的那个会话/群组」，或其显式指定的目标。**
+
+- 若指令来自某群组 A → 把结果文件发送回群组 A（指令来源会话的 origin）。
+- 若指令显式指定了其他投递目标 → 投递到该指定目标。
+- 不要把结果只保存到本地、投递到无关群组，或忽略交付。
+- 该规则覆盖所有抓取完成交付：Mode2 成功/失败定型文、厂商 Excel 模式、cron 结果包、手动单产品抓取。
+
 Hermes 手动抓取单个或数个指定产品时，固定使用项目根目录构建的 `./trip-score-price-scraper`，以重复 `-input` 传入产品，并使用 `-delay-profile fast -product-info -no-quality-rerun -output-dir <manual-dir>`。运营提示词如 `【請抓取產品價格71827107】` 会按产品 ID 构造 URL（遵循上面的「URL 拼接约定」：默认只拼 `/detail/<ID>/`，不追加 `?locale=...&curr=...`，除非用户显式指定货币/站点）。该流程默认有头单 worker 顺序抓取；Cloudflare/风险拦截、未知价格状态或缺少产品名、SKU、货币、价格任一必填数据时，即使已保留原生 Excel 也返回非零退出码。有效成功时只交付原生 XLSX 附件，不发送平文本价格、产品/SKU 摘要或二次整理表。只有失败、部分 SKU 点击失败、反爬/API 拦截、超时/中断、部分产品失败或原生 Excel 校验异常可以显示单行提示。批量和 cron 任务继续使用各自章节的参数。
 
 ## 验证
