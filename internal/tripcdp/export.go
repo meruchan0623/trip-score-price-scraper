@@ -15,7 +15,68 @@ func exportRows(rows []map[string]string, outputPath string, ratingOnly bool, ex
 	if err := ensureParent(path); err != nil {
 		return "", err
 	}
+	return exportToFile(rows, path, ratingOnly, extractRealPrice, extractProductInfo, includeVendorColumn)
+}
 
+// exportMultiSiteRows writes rows to one workbook with a sheet per distinct site
+// code (read from the "站点" field). If no "站点" field exists, all rows go into
+// one default sheet.
+func exportMultiSiteRows(rows []map[string]string, outputPath string, ratingOnly bool, extractRealPrice bool, extractProductInfo bool, includeVendorColumn bool) (string, error) {
+	path := expandPath(outputPath)
+	if err := ensureParent(path); err != nil {
+		return "", err
+	}
+
+	// Group by site
+	sites := make(map[string][]map[string]string)
+	siteOrder := []string{}
+	for _, row := range rows {
+		code := strings.TrimSpace(row["站点"])
+		if code == "" {
+			code = "default"
+		}
+		if _, exists := sites[code]; !exists {
+			siteOrder = append(siteOrder, code)
+		}
+		sites[code] = append(sites[code], row)
+	}
+	// Only one site group — delegate to plain export
+	if len(siteOrder) <= 1 {
+		return exportToFile(rows, path, ratingOnly, extractRealPrice, extractProductInfo, includeVendorColumn)
+	}
+
+	// Multi-sheet workbook
+	file := excelize.NewFile()
+	// Don't try to DeleteSheet("Sheet1") because excelize refuses to delete
+	// the last sheet. Instead, rename the default sheet to the first site code.
+	firstSheetName := strings.ToUpper(siteOrder[0])
+	if err := file.SetSheetName(file.GetSheetName(file.GetActiveSheetIndex()), firstSheetName); err != nil {
+		file.Close()
+		return "", fmt.Errorf("rename default sheet to %q: %w", firstSheetName, err)
+	}
+	writeExportSheet(file, firstSheetName, sites[siteOrder[0]], ratingOnly, extractRealPrice, extractProductInfo, includeVendorColumn)
+
+	for _, code := range siteOrder[1:] {
+		sheetName := strings.ToUpper(code)
+		sheetRows := sites[code]
+		idx, err := file.NewSheet(sheetName)
+		if err != nil {
+			file.Close()
+			return "", fmt.Errorf("create sheet %q: %w", sheetName, err)
+		}
+		file.SetActiveSheet(idx)
+		writeExportSheet(file, sheetName, sheetRows, ratingOnly, extractRealPrice, extractProductInfo, includeVendorColumn)
+	}
+
+	if err := file.SaveAs(path); err != nil {
+		file.Close()
+		return "", err
+	}
+	_ = file.Close()
+	return absPath(path), nil
+}
+
+func exportToFile(rows []map[string]string, path string, ratingOnly bool, extractRealPrice bool, extractProductInfo bool, includeVendorColumn bool) (string, error) {
 	file := excelize.NewFile()
 	defer file.Close()
 	sheet := "Trip商品数据"
@@ -26,7 +87,14 @@ func exportRows(rows []map[string]string, outputPath string, ratingOnly bool, ex
 	if err := file.SetSheetName(defaultSheet, sheet); err != nil {
 		return "", err
 	}
+	writeExportSheet(file, sheet, rows, ratingOnly, extractRealPrice, extractProductInfo, includeVendorColumn)
+	if err := file.SaveAs(path); err != nil {
+		return "", err
+	}
+	return absPath(path), nil
+}
 
+func writeExportSheet(file *excelize.File, sheet string, rows []map[string]string, ratingOnly bool, extractRealPrice bool, extractProductInfo bool, includeVendorColumn bool) {
 	maxSKULayers := 0
 	hasScrapeNote := false
 	hasPriceQuality := false
@@ -74,9 +142,7 @@ func exportRows(rows []map[string]string, outputPath string, ratingOnly bool, ex
 	if extractProductInfo {
 		fields = append(fields, "商品资讯")
 	}
-	if !ratingOnly {
-		fields = append(fields, "总促销标签")
-	}
+	fields = append(fields, "总促销标签")
 	fields = append(fields, "月销量", "年销量", "总销量", "评价数", "评分", "好评率", "客户服务", "方便程度", "讯号状态", "中差评价数")
 	if hasScrapeNote {
 		fields = append(fields, "抓取备注")
@@ -111,15 +177,10 @@ func exportRows(rows []map[string]string, outputPath string, ratingOnly bool, ex
 	}
 	lastCell, _ := excelize.CoordinatesToCellName(len(fields), len(rows)+1)
 	_ = file.SetSheetDimension(sheet, "A1:"+lastCell)
-
-	if err := file.SaveAs(path); err != nil {
-		return "", err
-	}
-	return absPath(path), nil
 }
 
 func priceQualityExportFields() []string {
-	return []string{"价格状态", "原始捕获价格"}
+	return []string{"价格状态"}
 }
 
 func exportHeader(field string) string {
@@ -142,4 +203,50 @@ func mkdirAll(path string) error {
 
 func runeLen(value string) int {
 	return len([]rune(value))
+}
+
+// readExportRows reads a program-exported XLSX back into a slice of row maps,
+// using the first row's headers as keys. Used by scrapeVendorMultiSite to merge
+// per-vendor-per-market XLSX files into a combined multi-site workbook.
+func readExportRows(path string) ([]map[string]string, error) {
+	file, err := excelize.OpenFile(expandPath(path))
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	return exportRowsFromSheet(file, file.GetSheetName(0))
+}
+
+// readExportRowsFromSheet reads a program-exported XLSX from a specific sheet.
+func readExportRowsFromSheet(path, sheet string) ([]map[string]string, error) {
+	file, err := excelize.OpenFile(expandPath(path))
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	return exportRowsFromSheet(file, sheet)
+}
+
+func exportRowsFromSheet(file *excelize.File, sheet string) ([]map[string]string, error) {
+	raw, err := file.GetRows(sheet)
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) < 2 {
+		return nil, nil
+	}
+	headers := raw[0]
+	rows := make([]map[string]string, 0, len(raw)-1)
+	for _, line := range raw[1:] {
+		row := make(map[string]string, len(headers))
+		for i, h := range headers {
+			var v string
+			if i < len(line) {
+				v = line[i]
+			}
+			row[h] = v
+		}
+		rows = append(rows, row)
+	}
+	return rows, nil
 }
