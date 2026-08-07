@@ -819,6 +819,11 @@ When the reported symptom is repeated prices such as many rows at HKD22/HKD33/HK
 - `mode1`: headed full SKU/price/rating scrape.
 - `mode2`: headed rating-only + product-info scrape aligned to the legacy GUI options `仅获取评分` + `获取商品信息`. It outputs one row per URL/product with `商品ID/URL/商品名称/商品资讯/预定数/评价数/评分/客户服务/方便程度/讯号状态/中差评价数` only. It must not output SKU layers, currency, display price, real price, or promo labels. If Excel appears to show only one column, inspect/fix XLSX sheet dimensions before assuming data is missing.
 
+### 模式路由规则（自然语言）
+
+- 用户点名「SKU」（如"抓取SKU价格"、"抓SKU"、或要求价格/SKU层级/套餐/实价外显价/比价）→ 使用 `mode1`。
+- 用户未点名 SKU、或只提「商品信息/评分/商品资讯/评价数/预订数」（如"只抓评分"、"抓商品信息"、"Mode2 抓评分"）→ 使用 `mode2`。
+
 ## References
 
 - `references/automation-skill-cron-refresh-plan-2026-06-20.md` — session-derived checklist for reconciling updated SKU code, launcher cron, quality-rerun defaults, JSONL retention, dynamic vendor discovery, and skill/cron documentation before implementation.
