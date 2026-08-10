@@ -889,4 +889,58 @@ When the reported symptom is repeated prices such as many rows at HKD22/HKD33/HK
 - `references/daily-cron-recovery-and-vendor-attribution-2026-06-08.md` — recovery pattern for false-running daily cron failures caused by `set -e`, macOS Chrome 149 signed chromedriver pitfalls, concurrent driver-cache races, and the manual vendor attribution import/reference path.
 - `references/tsim-price-chart-generation-2026-06-10.md` — generate price-change bar charts and multi-day trajectory charts from TSIM trend XLSX files using matplotlib with Chinese font support on macOS.
 - `scripts/parse_trip_sku_run_failures.py` — parse a run folder's log for failed/risk/incomplete URLs and generate a rerun input workbook.
+
+## Daily Mode2 Multi-Site Cron Report Prompt
+
+This is the **fixed prompt template** that runs inside the second-stage cron job (agent mode) every day
+after the no_agent data-collection script finishes. The cron context_from chain injects the output JSON
+of the first stage, which looks like (actual data from the latest run):
+
+```json
+{"run_dir": "/Users/example/Documents/trip-sku-price-scrape/YYMMDD-mode2-daily",
+ "output_path": "/Users/example/Documents/trip-sku-price-scrape/YYMMDD-mode2-daily/trip_mode2_daily_6site.xlsx",
+ "processed_count": 966,
+ "url_count": 161,
+ "sites": "tw,hk,ru,jp,vn,th"}
+```
+
+### Prompt
+
+```
+你是携程商品信息分析助手。你已经拿到了今天凌晨 03:00 自动完成的 Mode2 六站抓取结果。
+
+前置任务的输出：
+- 原生 XLSX 路径：<output_path>
+- 已处理行数：<processed_count>（站点：TW/HK/RU/JP/VN/TH，覆盖 161 个商品）
+
+任务：
+1. 确认 EXCEL 文件存在无误（执行 `ls -la <output_path>` 输出文件信息）
+2. 使用 `python3 trip_deliver.py <output_path> --to telegram:YOUR_CHAT_ID --subject "携程 Mode2 六站日常列表"` 把原生 XLSX 发到运营自动化执行组
+   — 这个脚本自身返回 exit 0 才表示投递成功（回执写入 .delivered.json）；失败则写 .pending_delivery.json 并退出非零
+3. **重要**：模式2输出仅包含评分/评价数/商品资讯，不含价格或 SKU；报告中只引用原列数据
+4. 发送完成确认到运营自动化执行组，说明成功投递 + 处理行数
+
+交付模板（运营自动化执行组）：
+```
+✅ 携程日常列表 Mode2 六站抓取完成
+📅 日期：<today>
+📊 处理：<processed_count> 条（6 站 × 161 产品）
+📁 文件：已通过 trip_deliver 安全投递到本群
+
+各站概要（从原生 XLSX 读取）：
+| 站点 | 商品数 | 平均评分 |
+|------|--------|----------|
+| TW   | N      | X.X      |
+| HK   | N      | X.X      |
+| RU   | N      | X.X      |
+| JP   | N      | X.X      |
+| VN   | N      | X.X      |
+| TH   | N      | X.X      |
+```
+**如果任何步骤失败：**
+- 投递失败 → 输出 `.pending_delivery.json` 标记、不静默成功、报告原因
+- 分析失败 → 明确说明原因、不输出假数据
+```
+
+These prompt instructions are loaded by the cron job as an agent-mode task that receives context_from the first stage's output and follows them exactly.
 - `scripts/trip_sku_pair_region_compare.py` — build same-region TSim vs competitor comparison sheets from a completed run directory and the canonical product-pair workbook.
