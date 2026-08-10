@@ -832,7 +832,7 @@ func (s *tripScraper) scrapeOneAttempt(ctx context.Context, item ScrapeItem, tar
 	snapshot, waitMS := s.waitProductPageReady(ctx, 12*time.Second)
 	snapshot.withNavigationStatus(navStatus, navURL)
 	if s.recordCloudflareIfPresent("page_open", base) {
-		return []map[string]string{s.riskBlockedRow(item, "cloudflare overlay detected during navigation")}, snapshot, false, nil
+		s.emit(mergeEvent(Event{"event": "cloudflare_bypass", "stage": "page_open", "message": "cloudflare overlay detected but continuing extraction (data may be partial)", "scrape_note": s.currentScrapeNote}, base))
 	}
 	if isWhaleguardSnapshot(snapshot) {
 		s.emit(mergeEvent(Event{"event": "risk_challenge_detected", "stage": "page_open", "message": "whaleguard block detected during navigation", "risk_kind": snapshot.RiskKind, "http_status": snapshot.HTTPStatus, "body_preview": snapshot.BodyPreview, "final_url": snapshot.URL}, base))
@@ -846,7 +846,7 @@ func (s *tripScraper) scrapeOneAttempt(ctx context.Context, item ScrapeItem, tar
 		return nil, snapshot, false, ctx.Err()
 	}
 	if s.recordCloudflareIfPresent("after_page_delay", base) {
-		return []map[string]string{s.riskBlockedRow(item, "cloudflare overlay detected before extraction")}, snapshot, false, nil
+		s.emit(mergeEvent(Event{"event": "cloudflare_bypass", "stage": "after_page_delay", "message": "cloudflare overlay detected but continuing extraction (data may be partial)", "scrape_note": s.currentScrapeNote}, base))
 	}
 	risk := s.detectRiskChallenge()
 	if len(risk.Scripts) > 0 {
@@ -859,7 +859,7 @@ func (s *tripScraper) scrapeOneAttempt(ctx context.Context, item ScrapeItem, tar
 		s.emit(mergeEvent(Event{"event": "risk_challenge_detected", "stage": "risk", "message": risk.Reason, "risk_kind": risk.Kind, "http_status": snapshot.HTTPStatus, "body_preview": risk.BodyPreview, "risk_scripts_detected": risk.Scripts, "final_url": snapshot.URL}, base))
 		if risk.Kind == "cloudflare" {
 			s.markCloudflareBlocked("risk", base, risk.Reason, risk.BodyPreview)
-			return []map[string]string{s.riskBlockedRow(item, risk.Reason)}, snapshot, false, nil
+			s.emit(mergeEvent(Event{"event": "cloudflare_bypass", "stage": "risk", "message": risk.Reason + "; cloudflare challenge detected but continuing extraction (data may be partial)", "scrape_note": s.currentScrapeNote, "risk_kind": risk.Kind}, base))
 		} else {
 			if risk.Kind == "whaleguard" {
 				return nil, snapshot, true, nil
@@ -870,12 +870,12 @@ func (s *tripScraper) scrapeOneAttempt(ctx context.Context, item ScrapeItem, tar
 	s.emit(mergeEvent(Event{"event": "log", "stage": "lazy_load", "message": "scrolling page"}, base))
 	s.scrollPage(ctx)
 	if s.recordCloudflareIfPresent("after_scroll", base) {
-		return []map[string]string{s.riskBlockedRow(item, "cloudflare overlay detected after scroll")}, snapshot, false, nil
+		s.emit(mergeEvent(Event{"event": "cloudflare_bypass", "stage": "after_scroll", "message": "cloudflare overlay detected but continuing extraction (data may be partial)", "scrape_note": s.currentScrapeNote}, base))
 	}
 	snapshot, waitMS = s.waitProductPageExtractable(ctx, 12*time.Second, s.request.RatingOnly)
 	snapshot.withNavigationStatus(navStatus, navURL)
 	if s.recordCloudflareIfPresent("before_extract", base) {
-		return []map[string]string{s.riskBlockedRow(item, "cloudflare overlay detected before extraction")}, snapshot, false, nil
+		s.emit(mergeEvent(Event{"event": "cloudflare_bypass", "stage": "before_extract", "message": "cloudflare overlay detected but continuing extraction (data may be partial)", "scrape_note": s.currentScrapeNote}, base))
 	}
 	if snapshot.RiskChallenge {
 		risk := s.detectRiskChallenge()
@@ -886,12 +886,12 @@ func (s *tripScraper) scrapeOneAttempt(ctx context.Context, item ScrapeItem, tar
 			s.emit(mergeEvent(Event{"event": "risk_challenge_detected", "stage": "risk", "message": reason, "risk_kind": risk.Kind, "http_status": snapshot.HTTPStatus, "body_preview": risk.BodyPreview, "risk_scripts_detected": risk.Scripts, "final_url": snapshot.URL}, base))
 			if risk.Kind == "cloudflare" {
 				s.markCloudflareBlocked("lazy_load", base, reason, risk.BodyPreview)
-				return []map[string]string{s.riskBlockedRow(item, reason)}, snapshot, false, nil
+				s.emit(mergeEvent(Event{"event": "cloudflare_bypass", "stage": "lazy_load", "message": reason + "; cloudflare challenge detected after lazy-load but continuing extraction (data may be partial)", "scrape_note": s.currentScrapeNote, "risk_kind": risk.Kind}, base))
 			} else {
 				if risk.Kind == "whaleguard" {
 					return nil, snapshot, true, nil
 				}
-				return []map[string]string{s.riskBlockedRow(item, reason)}, snapshot, false, nil
+				s.emit(mergeEvent(Event{"event": "risk_bypass", "stage": "lazy_load", "message": reason + "; non-cloudflare challenge continuing extraction", "scrape_note": s.currentScrapeNote, "risk_kind": risk.Kind}, base))
 			}
 		}
 		snapshot.RiskChallenge = false
