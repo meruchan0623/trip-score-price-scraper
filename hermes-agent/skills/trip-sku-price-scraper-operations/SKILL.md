@@ -475,6 +475,17 @@ Mode2 must not enter SKU traversal or write `SKU层级`, `货币`, `外显价格
 - Verify no SKU/price columns are present.
 - Verify XLSX dimensions are correct (`A1:K<N>`). If Excel/openpyxl appears to show only one column, inspect/fix worksheet dimensions before assuming data is missing.
 
+### Mode2 长时间/多站点运行的稳定性保障
+
+Mode2 单 worker 多站点（`--urls-file` + `--sites`）会顺序爬大量页面（如 161×6=966），浏览器长时间运行容易遭遇反爬检测、Cloudflare overlay 或 Chrome 内存崩溃。为防止整个运行中途被杀死而毫无产物，强烈建议同时传入：
+
+- `--checkpoint-every-urls 20`：每 20 个 URL 写一次 partial `.xlsx`
+- `--browser-restart-every 25`：每 25 个 URL 重启 Chrome 降低内存压力
+- `--browser-memory-limit-mb 4096`（或更低）：在内存达到阈值时主动重启，而不是等系统 OOM kill
+- `--kill-orphans`：退出时清理残留 Chrome 进程
+
+如果中途被 kill（没有 `run_done` / 无 `exit 0`），检查 `output-dir` 中是否有 `_partial_*.xlsx` 或最近的 checkpoint 产物，**不是必须从零重跑所有 URL**；可用相同命令但将 `--urls-file` 替换为仅含剩余未覆盖 URL 的文件，CLI 会继续追加到同一输出。**绝不能重新写入包装脚本**，只通过 CLI 参数调整即可完成恢复。
+
 Full reference: `references/trip-score-cdp-input-mode.md`
 
 ## Multi-site mode2 product info scrape
