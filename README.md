@@ -366,6 +366,10 @@ Hermes Agent 发现 Skill 后，应完整读取其中对应章节。项目不再
 
 Hermes 手动抓取单个或数个指定产品时，固定使用项目根目录构建的 `./trip-score-price-scraper`，以重复 `-input` 传入产品，并使用 `-delay-profile fast -product-info -no-quality-rerun -output-dir <manual-dir>`。运营提示词如 `【請抓取產品價格71827107】` 会按产品 ID 构造 URL（遵循上面的「URL 拼接约定」：默认只拼 `/detail/<ID>/`，不追加 `?locale=...&curr=...`，除非用户显式指定货币/站点）。该流程默认有头单 worker 顺序抓取；Cloudflare/风险拦截、未知价格状态或缺少产品名、SKU、货币、价格任一必填数据时，即使已保留原生 Excel 也返回非零退出码。有效成功时只交付原生 XLSX 附件，不发送平文本价格、产品/SKU 摘要或二次整理表。只有失败、部分 SKU 点击失败、反爬/API 拦截、超时/中断、部分产品失败或原生 Excel 校验异常可以显示单行提示。批量和 cron 任务继续使用各自章节的参数。
 
+**手动抓取执行铁律：** Hermes 必须**直接用命令行传参运行** `./trip-score-price-scraper`，**绝不编写/运行任何 shell 包装脚本或临时调用脚本来执行抓取**；一次传参命令若被网关守卫误报（`ValueError: embedded null byte`），用后台方式重发同一条原样命令行即可，不得改写为脚本绕行。抓取成功（exit 0）后**禁止用 openpyxl 等二次读表、也不得 print 出 SKU/价格/评分/行数等明细到群聊**；成功只回原生工作簿路径，CLI 的 `run_done`/exit code 即成功判定。
+
+**结果一定不漏发（强制投递 + 成功回执）：** 抓取成功后的投递必须用项目脚本 `trip_deliver.py` 走 `hermes send` 完成，脚本校验文件存在且非空、调用 `hermes send --to telegram:<chat_id> "MEDIA:<path>"`，**仅当 hermes send 返回 exit 0 才算送达**（写 `.delivered.json` 并 exit 0）；投递失败则写 `.pending_delivery.json` 并返回非零、任务标记为「失败待补发」，绝不静默当作成功。目标 `chat_id` = 发起该次请求的会话/群组。
+
 ## 验证
 
 ```bash
