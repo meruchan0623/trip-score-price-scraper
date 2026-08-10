@@ -425,6 +425,17 @@ The program auto-generates the standard output filename: `trip_score_results_<YY
 
 **Delivery destination (mandatory rule): 任务完成时，将结果文件 MEDIA 发送到「发出本次抓取指令的那个会话/群组」**（即指令来源会话的 origin 群组），或其显式指定的目标。不要投递到无关群组或只保存到本地。若指令来自某群组 A，就发回群组 A；若指令显式指定了其他投递目标，则投递到该指定目标。此规则对所有抓取完成交付（Mode2 成功/失败、厂商 Excel 模式、cron 结果包、手动单产品抓取）一视同仁。
 
+**结果一定不漏发（强制投递 + 成功回执，方案 B）：** 抓取成功（exit 0）后，投递必须用项目脚本 `trip_deliver.py` 走 `hermes send` 完成，并由脚本**返回 exit 0 才算送达**；未确认送达前不得以成功结束任务。方式：
+
+```bash
+python3 trip_deliver.py <output_path.xlsx 或 run_dir> \
+  --to telegram:<发起该指令的 chat_id> [--subject "携程抓取结果"]
+```
+
+- 脚本会校验输出文件存在且非空 → 调用 `hermes send --to <target> "MEDIA:<path>"` → **仅当 hermes send exit 0** 才写 `.delivered.json` 并 exit 0。
+- 投递失败/文件缺失 → 脚本写在 run 目录写 `.pending_delivery.json` 并返回非零；此时任务必须标记为「失败待补发」，**绝不静默当作成功**，也不得以「已落盘」冒充送达。
+- 目标 `chat_id` = 发起该次抓取请求的会话/群组（当前会话来源），或显式指定项。
+
 Success delivery text (fixed template):
 
 ```
@@ -823,6 +834,15 @@ When the reported symptom is repeated prices such as many rows at HKD22/HKD33/HK
 
 - 用户点名「SKU」（如"抓取SKU价格"、"抓SKU"、或要求价格/SKU层级/套餐/实价外显价/比价）→ 使用 `mode1`。
 - 用户未点名 SKU、或只提「商品信息/评分/商品资讯/评价数/预订数」（如"只抓评分"、"抓商品信息"、"Mode2 抓评分"）→ 使用 `mode2`。
+
+### 手动抓取执行铁律（禁止脚本与成功刷屏）
+
+这是对「Manual single or selected products price scrape」的强制补充，任何手动/指定产品抓取都必须遵守：
+
+1. **只用命令行传参直接运行 Go CLI**：`./trip-score-price-scraper -input <URL> -input <URL> -output-dir <dir> -delay-profile fast -product-info -no-quality-rerun`。**绝不编写/运行任何 shell 包装脚本、临时调用脚本或 wrapper 来执行抓取。** 若一次传参的终端命令因网关生命周期守卫误报（`ValueError: embedded null byte`）被拒绝，改用后台方式重发同一条**原样命令行**即可，不要改写成脚本文件绕行。
+2. **抓取成功（exit 0）后禁止二次读表/打印数据**：不要用 openpyxl/python 重新读取工作簿来"验证"，更不要 `print()` 出 SKU 行、价格、评分、行数等明细到群聊。CLI 自身的 `run_done`/exit code 已是成功判定。
+3. **成功交付只回一条内容**：原生工作簿的裸绝对路径（`MEDIA:<path>`）+ 现有固定成功文案。不附产品名、价格、SKU 数、行数、评分摘要。投递必须经 `trip_deliver.py` 走 `hermes send` 并取得 exit 0 回执才算送达（见上节「结果一定不漏发」），未送达前不以成功收尾。
+4. 仅当 `exit≠0` 或 CLI 明确报告失败/风险拦截时才做最小化诊断，且诊断日志不得原文粘贴进用户正文。
 
 ## References
 
