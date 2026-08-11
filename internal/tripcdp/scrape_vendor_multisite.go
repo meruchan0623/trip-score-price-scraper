@@ -48,6 +48,12 @@ func scrapeVendorMultiSite(request TaskRequest, reporter Reporter, runMode strin
 	if len(markets) == 0 {
 		return TaskResult{Success: false, Error: "no markets to scrape", ExitCode: 2}
 	}
+	// The coordinator is the sole writer: all worker rows are accumulated in
+	// memory and emitted once into this workbook after every market completes.
+	combinedOutputPath := filepath.Join(baseOutputDir, fmt.Sprintf("trip_mode2_%s.xlsx", stamp))
+	if len(markets) == 1 {
+		combinedOutputPath = filepath.Join(baseOutputDir, fmt.Sprintf("trip_score_%s.xlsx", stamp))
+	}
 
 	state := resolveRuntimeState(request)
 	for _, warning := range state.Warnings {
@@ -100,13 +106,9 @@ func scrapeVendorMultiSite(request TaskRequest, reporter Reporter, runMode strin
 		if ctx.Err() != nil {
 			break
 		}
-		// Per-market output directory to avoid per-vendor file collisions.
+		// Workers have isolated browser state only; they do not write shard XLSX
+		// files. The coordinator writes combinedOutputPath once at the end.
 		marketDir := baseOutputDir
-		if len(markets) > 1 {
-			marketDir = filepath.Join(baseOutputDir, strings.ToUpper(market.Code))
-			_ = os.MkdirAll(marketDir, 0o755)
-		}
-		// This market's own worker results (for read-back / session save).
 		var marketResults []workerResult
 
 		savedMarket := request.Market
@@ -156,8 +158,8 @@ func scrapeVendorMultiSite(request TaskRequest, reporter Reporter, runMode strin
 			nextID++
 			active++
 			workerID := nextID
-			outputPath := filepath.Join(marketDir, fmt.Sprintf("%s_%s.xlsx", safeFilename(group.FileVendor), stamp))
-			workerDir := filepath.Join(marketDir, "_workers", fmt.Sprintf("%02d_%s", workerID, safeFilename(group.FileVendor)))
+			outputPath := combinedOutputPath
+			workerDir := filepath.Join(marketDir, "_workers", strings.ToUpper(market.Code), fmt.Sprintf("%02d_%s", workerID, safeFilename(group.FileVendor)))
 			workerRequest := request
 			workerRequest.OutputPath = outputPath
 			workerRequest.BrowserOptions.SessionFile = filepath.Join(workerDir, "session.json")
@@ -166,7 +168,7 @@ func scrapeVendorMultiSite(request TaskRequest, reporter Reporter, runMode strin
 			reporter(Event{"event": "worker_spawn_started", "vendor": group.Vendor, "worker_id": workerID, "message": "spawning worker", "url_count": len(group.Items)})
 			workerCtx, workerCancel := context.WithCancel(ctx)
 			forceWorkers.add(workerCancel)
-			go runVendorWorker(workerCtx, workerID, group, workerRequest, outputPath, len(items), workerReporter, resultCh, forceWorkers.add, qualityRerunLimiter)
+			go runVendorWorker(workerCtx, workerID, group, workerRequest, outputPath, true, len(items), workerReporter, resultCh, forceWorkers.add, qualityRerunLimiter)
 			if request.StartupStagger > 0 {
 				_ = cancellableSleep(ctx, request.StartupStagger)
 			}
@@ -193,9 +195,6 @@ func scrapeVendorMultiSite(request TaskRequest, reporter Reporter, runMode strin
 			if !result.Success {
 				failures++
 				failedVendors = append(failedVendors, result.Vendor)
-			}
-			if result.OutputPath != "" && (result.Success || result.Rows > 0) {
-				outputPaths = append(outputPaths, result.OutputPath)
 			}
 			reporter(result.Event())
 			reporter(Event{
@@ -232,21 +231,15 @@ func scrapeVendorMultiSite(request TaskRequest, reporter Reporter, runMode strin
 			}
 		}
 
-		// Read back this market's per-vendor XLSX rows and tag the site.
+		// Workers return rows directly. Tag their vendor and market before the
+		// coordinator performs the only final workbook export.
 		for _, result := range marketResults {
-			if result.OutputPath == "" {
-				continue
+			for i := range result.CollectedRows {
+				result.CollectedRows[i]["厂商"] = result.Vendor
+				result.CollectedRows[i]["站点"] = market.Code
 			}
-			rowsRead, rerr := readExportRows(result.OutputPath)
-			if rerr != nil {
-				reporter(Event{"event": "warning", "stage": "readback", "message": "failed to read back " + result.OutputPath, "error": rerr.Error()})
-				continue
-			}
-			for i := range rowsRead {
-				rowsRead[i]["站点"] = market.Code
-			}
-			allRows = append(allRows, rowsRead...)
-			rows += len(rowsRead)
+			allRows = append(allRows, result.CollectedRows...)
+			rows += len(result.CollectedRows)
 		}
 		processedMarkets++
 
@@ -254,17 +247,8 @@ func scrapeVendorMultiSite(request TaskRequest, reporter Reporter, runMode strin
 		request.Market = savedMarket // restore for next market
 	}
 
-	// Combined multi-site export (sheet per site, vendor column included).
-	outputPath := ""
-	if len(markets) == 1 {
-		outputPath = filepath.Join(baseOutputDir, fmt.Sprintf("trip_scoreandprice_%s.xlsx", stamp))
-		if request.RatingOnly {
-			outputPath = filepath.Join(baseOutputDir, fmt.Sprintf("trip_score_%s.xlsx", stamp))
-		}
-	} else {
-		outputPath = filepath.Join(baseOutputDir, fmt.Sprintf("trip_mode2_%s.xlsx", stamp))
-	}
-	savedPath, exportErr := exportMultiSiteRows(allRows, outputPath, request.RatingOnly, request.ExtractRealPrice, request.ExtractProductInfo, true)
+	// One and only one final workbook, with a sheet per site and a vendor column.
+	savedPath, exportErr := exportMultiSiteRows(allRows, combinedOutputPath, request.RatingOnly, request.ExtractRealPrice, request.ExtractProductInfo, true)
 	if exportErr != nil {
 		return TaskResult{Success: false, OutputPath: baseOutputDir, OutputPaths: outputPaths, LogFile: request.LogFile, Error: "combined export failed: " + exportErr.Error(), ExitCode: 4}
 	}
