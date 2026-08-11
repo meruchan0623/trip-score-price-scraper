@@ -67,8 +67,8 @@ cat > "$RUN_DIR/任务说明.md" <<'MD'
 
 - 任务：抓取 Trip.com SKU/价格/厂商结果。
 - 输入：INPUT.xlsx
-- 参数：mode1，有头浏览器，fast 延迟，timeout=1800，workers=3。
-- 说明：按厂商列并发抓取，输出 XLSX 到本运行目录；cron 场景默认使用 fast + workers=3。
+- 参数：mode1，有头浏览器，fast 延迟，timeout=1800，workers=2。
+- 说明：按厂商列并发抓取，输出 XLSX 到本运行目录；cron 场景默认使用 fast + workers=2。
 MD
 
 /tmp/trip-score-cdp \
@@ -76,12 +76,12 @@ MD
   --delay-profile fast \
   --timeout 1800 \
   --excel-input INPUT.xlsx \
-  --workers 3 \
+  --workers 2 \
   --log-level verbose \
   --output-dir "$RUN_DIR"
 ```
 
-For a partial resume with only TSIM/FR/JY, use `--workers 3` when the resume input has only those three vendor columns. Resume run folders should still use the same timestamped `/Users/example/Documents/trip-sku-price-scrape/YYMMDD-HHMM/` convention and include `任务说明.md` describing the previous run, resume boundary, and pending vendor counts.
+For a partial resume with only TSIM/FR/JY, use `--workers 2` when the resume input has only those three vendor columns. Resume run folders should still use the same timestamped `/Users/example/Documents/trip-sku-price-scrape/YYMMDD-HHMM/` convention and include `任务说明.md` describing the previous run, resume boundary, and pending vendor counts.
 
 ## Input table pattern (Excel vendor mode)
 
@@ -102,7 +102,7 @@ When validating a new target workbook or changed workflow, run a bounded per-ven
 
 1. Generate a temporary workbook with columns `TSIM`, `BC`, `TGT`, `FR`, `JY`, `其他`.
 2. Put at most the requested first `N` Trip URLs under each vendor.
-3. Run the same Go CLI command with `--workers 3 --delay-profile fast --timeout 1800` for cron-default smoke tests. If testing legacy speed/stress behavior, explicitly label any non-default profile such as `normal`, `safe`, or `slow` in the run folder notes.
+3. Run the same Go CLI command with `--workers 2 --delay-profile fast --timeout 1800` for cron-default smoke tests. If testing legacy speed/stress behavior, explicitly label any non-default profile such as `normal`, `safe`, or `slow` in the run folder notes.
 4. Verify exit code `0`, all URL counts completed, and price records appear in output XLSX or terminal `combination price` lines.
 5. If the user asks to delete a previous smoke run before re-running, delete only the exact smoke run directories involved; never delete `_state/`.
 
@@ -207,7 +207,7 @@ When the user asks to scrape multiple specific destinations (e.g. "抓取泰国�
 
 1. Read the canonical config workbook (`config/非TSIM厂商价格抓取输入.xlsx`) and filter rows by 目的地 keyword match.
 2. Create a filtered input workbook with only matching rows (copy headers + matched rows, preserve all vendor columns).
-3. Launch with default parameters (`mode1 + headed + normal + timeout=1800 + workers=3 + compare-vendor`).
+3. Launch with default parameters (`mode1 + headed + normal + timeout=1800 + workers=2 + compare-vendor`).
 4. For small runs (<50 URLs), use `nohup` background process directly; no launcher/watcher architecture needed.
 
 Reference: `references/ad-hoc-multi-destination-sku-scrape-2026-06-17.md`.
@@ -409,7 +409,7 @@ print(ws.max_row, ws.max_column)  # correct
 ## Ad-hoc rating-only score/sales scrape via `--urls-file`
 
 When the user asks to scrape *only* product scores, booking counts, review counts, and product info (not SKU prices) from a flat list of product IDs/URLs, use the fixed Mode2 contract:
-- CLI 的 mode2 默认使用 `fast` 延迟（与 mode1 一致），该工作流可直接运行默认参数。如需调整延迟，显式传入 `--delay-profile normal`/`safe`/`slow`。
+- CLI 的 mode2 默认使用 `normal` 延迟（与 mode1 一致），该工作流可直接运行默认参数。如需调整延迟，显式传入 `--delay-profile fast`/`safe`/`slow`。
 
 ```bash
 /tmp/trip-score-cdp \
@@ -527,9 +527,9 @@ Product ID to URL 构造规则：
 当同时传入 **`--excel-input <厂商表.xlsx>`** 与 **`--sites <站点列表>`** 时，CLI 进入新增的**多厂商多站点 mode2** 路径（`scrapeVendorMultiSite`）：
 
 - **市场（站点）严格串行**：外层 `for markets` 顺序遍历，先跑完一个站点所有厂商的产品，再进入下一个站点（满足“先跑完一个市场的所有产品，再跑下一个市场”）。
-- **同一站点内多厂商并行**：每个站点内用 `--workers N`（≤5）并发多个厂商 worker（同站不同厂商连续跑）；每个厂商写一个独立 XLSX 到 `<站点>/<厂商>_<stamp>.xlsx`。
-- **行标记**：每行同时打上 `厂商`（来自 exportRows includeVendorColumn=true）与 `站点`。
-- **合并输出**：一个 workbook，**每个站点一个 sheet**（大写 site code），每行带 `厂商` 列；文件名 `trip_mode2_<stamp>.xlsx`（多站）或 `trip_score_<stamp>.xlsx`（单站 rating-only）。
+- **同一站点内多厂商并行**：每个站点内用 `--workers N`（≤5）并发多个厂商 worker（同站不同厂商连续跑）；worker 仅回传行数据，**不创建厂商分片 XLSX**。
+- **行标记**：协调器为每行写入 `厂商`（来自厂商列）与 `站点`。
+- **唯一输出**：无论 worker 数量，协调器只在全部市场完成后写入一个 workbook，**每个站点一个 sheet**（大写 site code），每行带 `厂商` 列；文件名 `trip_mode2_<stamp>.xlsx`（多站）或 `trip_score_<stamp>.xlsx`（单站 rating-only）。
 - `--excel-input` 单元格须为 Trip 完整 URL（含 `http` + `trip.com`），列头即厂商标识。若用户给的是产品 ID，Hermes 先按「URL 拼接约定」转成 URL。
 
 ```bash
@@ -538,7 +538,7 @@ Product ID to URL 构造规则：
   --excel-input /path/to/日常抓取目标.xlsx \
   --sites hk,tw,jp \
   --delay-profile fast \
-  --workers 3 \
+  --workers 2 \
   --output-dir <run_dir> \
   --no-headless
 ```
@@ -563,7 +563,7 @@ Canonical daily setup:
 - Default comparison target: launcher constant `DEFAULT_COMPARE_VENDOR = 'TSIM 網址'`; this is a default baseline, not a hard project identity. Change this constant/config when the daily baseline changes.
 - Watcher cron (`every 60m`): enabled as fallback; reads current state/logs and sends meaningful progress summaries. Primary final ZIP/report delivery now happens inside the detached runner via `trip_sku_non_tsim_final_delivery.py` immediately after finalization; watcher retries final delivery only when a finalized run lacks `.delivered_daily_trend`.
 - Storage/packaging/log policy: scheduled runs must retain `terminal_output.txt` after final delivery, because it is the primary forensic source for Whaleguard/session/SKU-price anomalies. The daily launcher should pass `--json-lines` so `terminal_output.txt` contains machine-readable JSONL events plus terminal messages. Final ZIP should include `terminal_output.txt`; keep excluding `trip-score-cdp-help.txt` and `finalize_output.json`.
-- Default scheduled-run parameter policy: cron/default SKU 实价抓取 should follow the current project README/CLI before launch. As of the 2026-08-06 code refresh, the main daily scrape defaults to visible Chrome (headed) with `--delay-profile fast`. The recommended daily command shape is `--run-mode mode1 --delay-profile fast --timeout 1800 --workers 3`. Low-quality URL recovery is handled by the CLI quality-rerun path, which defaults to visible-browser `safe` recovery unless overridden. Keep this convention in launcher/state metadata, generated shell command, and 任务说明.md. `headless` 不建议作为默认参数；如需 headless，显式传入 `--headless`。`normal`/`safe`/`slow` 仅在风控或异常诊断场景临时使用。
+- Default scheduled-run parameter policy: cron/default SKU 实价抓取 should follow the current project README/CLI before launch. As of the 2026-08-06 code refresh, the main daily scrape defaults to visible Chrome (headed) with `--delay-profile fast`. The recommended daily command shape is `--run-mode mode1 --delay-profile fast --timeout 1800 --workers 2`. Low-quality URL recovery is handled by the CLI quality-rerun path, which defaults to visible-browser `safe` recovery unless overridden. Keep this convention in launcher/state metadata, generated shell command, and 任务说明.md. `headless` 不建议作为默认参数；如需 headless，显式传入 `--headless`。`normal`/`safe`/`slow` 仅在风控或异常诊断场景临时使用。
 
 ### Default speed profile update protocol
 
@@ -648,7 +648,7 @@ When a Trip SKU run is corrupted by anti-bot detection, session loss, or browser
 - If the user asks to **preserve good rows and rerun only bad parts**, stop the run, export whatever partial XLSX the CLI produced, then parse failure/incomplete URLs and build a rerun input workbook.
 - If the user explicitly asks to **fully delete** a bad run and its data, kill the wrapper and child processes first, remove the run directory, verify the directory no longer exists, and verify no matching processes remain.
 - Do not claim a rerun can be merged back into a deleted run folder. If the user asks both to delete and to merge later, clarify that the merge base must either be preserved before deletion or reconstructed from a fresh clean run.
-- For reruns after anti-bot instability, prefer 默认 `--delay-profile fast`，除非用户要求；如出现风控，可改为 `--delay-profile normal` 或 `--delay-profile safe`, 配套 `--timeout 1800`, `--workers 3`。
+- For reruns after anti-bot instability, prefer 默认 `--delay-profile fast`，除非用户要求；如出现风控，可改为 `--delay-profile normal` 或 `--delay-profile safe`, 配套 `--timeout 1800`, `--workers 2`。
 
 ## Launcher config-CLI mismatch pitfall
 
@@ -678,7 +678,7 @@ The Go CLI has a built-in generic vendor comparison component (`internal/tripcdp
   --excel-input INPUT.xlsx \
   --compare-vendor "TSIM 網址" \
   --output-dir "$RUN_DIR" \
-  --delay-profile fast --timeout 1800 --workers 3
+  --delay-profile fast --timeout 1800 --workers 2
 ```
 
 `--compare-vendor <name>`: After scraping completes, automatically compare all vendors against the named base vendor. The base vendor name must match a column header in the input Excel.
@@ -772,7 +772,7 @@ FR | 85地区 1935SKU匹配 | 均价差: +18.24 | 基准更优: 66% | 基准更�
 
 This section applies to batch, comparison, trend, and scheduled deliveries only. It does not override the attachment-only success response required by `Manual single or selected products price scrape`.
 
-The user prefers XLSX deliverables. Keep all generated files for this workflow under `/Users/example/Documents/trip-sku-price-scrape/YYMMDD-HHMM/`, with `任务说明.md` in the run folder. Cron/default scheduled runs for SKU 实价抓取 should use `--delay-profile fast`, `--timeout 1800`, and `--workers 3` unless the user explicitly asks for a different mode. For delivery, send a ZIP containing XLSX files and concise validation artifacts. In Telegram, include the final package as:
+The user prefers XLSX deliverables. Keep all generated files for this workflow under `/Users/example/Documents/trip-sku-price-scrape/YYMMDD-HHMM/`, with `任务说明.md` in the run folder. Cron/default scheduled runs for SKU 实价抓取 should use `--delay-profile fast`, `--timeout 1800`, and `--workers 2` unless the user explicitly asks for a different mode. For delivery, send a ZIP containing XLSX files and concise validation artifacts. In Telegram, include the final package as:
 
 ```text
 MEDIA:/absolute/path/to/package.zip
@@ -829,7 +829,7 @@ If Trip shows challenge/risk events, missing SKU containers, suspiciously low UR
 4. Re-run a small subset with `--workers 1` or `--workers 2`.
 5. Use `--delay-profile safe` or `slow` if Whaleguard/risk events continue.
 6. If necessary, temporarily switch delay/profile settings for diagnosis: reduce workers and use `safe`/`slow`; keep visible browser as the default unless headless itself is being tested.
-7. Compare URL completion, `combination price` counts, `resourceId=0` frequency, and repeated fixed-price PID counts before scaling back to the current daily default `workers=3`.
+7. Compare URL completion, `combination price` counts, `resourceId=0` frequency, and repeated fixed-price PID counts before scaling back to the current daily default `workers=2`.
 5. For historical “when did the anomaly start?” audits, inspect both final vendor XLSX files **and** run logs/ZIP-contained logs. A run may leave only `terminal_output.txt` and no vendor XLSX; those log-only runs can contain the earliest evidence. See `references/price-anomaly-start-audit-2026-06-17.md`.
 
 ### Fixed-price identity anomaly audit

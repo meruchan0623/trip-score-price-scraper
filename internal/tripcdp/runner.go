@@ -172,9 +172,9 @@ func scrapeSingle(request TaskRequest, reporter Reporter, runMode string) TaskRe
 
 	var savedPath string
 	if len(markets) > 1 || request.MultiSiteOutput {
-		savedPath, err = exportMultiSiteRows(allRows, outputPath, request.RatingOnly, request.ExtractRealPrice, request.ExtractProductInfo, false)
+		savedPath, err = exportMultiSiteRows(allRows, outputPath, request.RatingOnly, request.ExtractRealPrice, request.ExtractProductInfo, true)
 	} else {
-		savedPath, err = exportRows(allRows, outputPath, request.RatingOnly, request.ExtractRealPrice, request.ExtractProductInfo, false)
+		savedPath, err = exportRows(allRows, outputPath, request.RatingOnly, request.ExtractRealPrice, request.ExtractProductInfo, true)
 	}
 	if err != nil {
 		return TaskResult{Success: false, OutputPath: outputPath, ProcessedCount: len(allRows), LogFile: request.LogFile, Error: err.Error(), ExitCode: 4}
@@ -384,7 +384,7 @@ func scrapeVendorBatches(request TaskRequest, reporter Reporter, runMode string)
 		reporter(Event{"event": "worker_spawn_started", "vendor": group.Vendor, "worker_id": workerID, "message": "spawning worker"})
 		workerCtx, workerCancel := context.WithCancel(ctx)
 		forceWorkers.add(workerCancel)
-		go runVendorWorker(workerCtx, workerID, group, workerRequest, outputPath, len(items), workerReporter, resultCh, forceWorkers.add, qualityRerunLimiter)
+		go runVendorWorker(workerCtx, workerID, group, workerRequest, outputPath, false, len(items), workerReporter, resultCh, forceWorkers.add, qualityRerunLimiter)
 		reporter(Event{"event": "vendor_started", "vendor": group.Vendor, "worker_id": workerID, "url_count": len(group.Items)})
 		if request.StartupStagger > 0 {
 			return cancellableSleep(ctx, request.StartupStagger)
@@ -764,11 +764,15 @@ func cancellableSleep(ctx context.Context, duration time.Duration) bool {
 }
 
 type workerResult struct {
-	Vendor                    string
-	WorkerID                  int
-	Success                   bool
-	Stopped                   bool
-	Rows                      int
+	Vendor   string
+	WorkerID int
+	Success  bool
+	Stopped  bool
+	Rows     int
+	// CollectedRows is populated only for coordinated multi-worker Mode2 runs.
+	// The coordinator owns the single final workbook and writes it once after
+	// all workers have completed; workers must not create shard workbooks.
+	CollectedRows             []map[string]string
 	OutputPath                string
 	SessionFile               string
 	ProfileDir                string
@@ -819,7 +823,7 @@ func (r workerResult) Event() Event {
 	}
 }
 
-func runVendorWorker(ctx context.Context, workerID int, group vendorGroup, request TaskRequest, outputPath string, globalTotal int, reporter Reporter, resultCh chan<- workerResult, registerForceClose func(func()), qualityRerunLimiter chan struct{}) {
+func runVendorWorker(ctx context.Context, workerID int, group vendorGroup, request TaskRequest, outputPath string, collectRows bool, globalTotal int, reporter Reporter, resultCh chan<- workerResult, registerForceClose func(func()), qualityRerunLimiter chan struct{}) {
 	rows := []map[string]string{}
 	result := workerResult{Vendor: group.Vendor, WorkerID: workerID, OutputPath: outputPath, SessionFile: request.BrowserOptions.SessionFile, ProfileDir: request.BrowserOptions.UserDataDir, URLCount: len(group.Items), LogFile: request.LogFile}
 	workerCtx, workerCancel := context.WithCancel(ctx)
@@ -877,7 +881,7 @@ func runVendorWorker(ctx context.Context, workerID int, group vendorGroup, reque
 		itemRows := scraper.scrapeOne(workerCtx, item, index+1, len(group.Items))
 		rows = append(rows, itemRows...)
 		result.URLsDone++
-		if request.Runtime.CheckpointEveryURLs > 0 && result.URLsDone%request.Runtime.CheckpointEveryURLs == 0 && len(rows) > 0 {
+		if !collectRows && request.Runtime.CheckpointEveryURLs > 0 && result.URLsDone%request.Runtime.CheckpointEveryURLs == 0 && len(rows) > 0 {
 			checkpointPath := checkpointOutputPath(outputPath, group.FileVendor, result.URLsDone)
 			if savedPath, err := exportRows(rows, checkpointPath, request.RatingOnly, request.ExtractRealPrice, request.ExtractProductInfo, true); err == nil {
 				localReporter(Event{"event": "partial_checkpoint_done", "stage": "export", "rows": len(rows), "urls_done": result.URLsDone, "output_path": savedPath})
@@ -894,27 +898,34 @@ func runVendorWorker(ctx context.Context, workerID int, group vendorGroup, reque
 		localReporter(Event{"event": "warning", "stage": "session_save", "message": "session save failed"})
 	}
 	scraper.close()
-	rows, rerunStats := runQualityReruns(workerCtx, rows, request, group.Vendor, outputPath, globalTotal, localReporter, qualityRerunLimiter)
-	result.QualityRerunAttemptedURLs = rerunStats.Attempted
-	result.QualityRerunRecoveredURLs = rerunStats.Recovered
-	result.FinalQualityFailedURLs = rerunStats.FinalFailed
-	result.QualityFailedURLs = rerunStats.FinalFailed
-	result.QualityFailures = filterQualityFailuresForRows(result.QualityFailures, rows)
+	if !collectRows {
+		rows, rerunStats := runQualityReruns(workerCtx, rows, request, group.Vendor, outputPath, globalTotal, localReporter, qualityRerunLimiter)
+		result.QualityRerunAttemptedURLs = rerunStats.Attempted
+		result.QualityRerunRecoveredURLs = rerunStats.Recovered
+		result.FinalQualityFailedURLs = rerunStats.FinalFailed
+		result.QualityFailedURLs = rerunStats.FinalFailed
+		result.QualityFailures = filterQualityFailuresForRows(result.QualityFailures, rows)
+	}
 	if len(rows) > 0 {
-		savedPath, err := exportRows(rows, outputPath, request.RatingOnly, request.ExtractRealPrice, request.ExtractProductInfo, true)
-		if err != nil {
-			result.Error = "export failed: " + err.Error()
-			result.ErrorType = "ExportFailed"
-			result.Stage = "export"
-			return
-		}
-		result.OutputPath = savedPath
 		result.Rows = len(rows)
-		eventName := "export_done"
-		if result.Stopped || workerCtx.Err() != nil {
-			eventName = "partial_export_done"
+		if collectRows {
+			result.CollectedRows = rows
+			localReporter(Event{"event": "worker_rows_collected", "stage": "collect", "rows": len(rows), "message": "rows returned to coordinator for single workbook export"})
+		} else {
+			savedPath, err := exportRows(rows, outputPath, request.RatingOnly, request.ExtractRealPrice, request.ExtractProductInfo, true)
+			if err != nil {
+				result.Error = "export failed: " + err.Error()
+				result.ErrorType = "ExportFailed"
+				result.Stage = "export"
+				return
+			}
+			result.OutputPath = savedPath
+			eventName := "export_done"
+			if result.Stopped || workerCtx.Err() != nil {
+				eventName = "partial_export_done"
+			}
+			localReporter(Event{"event": eventName, "rows": len(rows), "output_path": savedPath})
 		}
-		localReporter(Event{"event": eventName, "rows": len(rows), "output_path": savedPath})
 	}
 	if result.Stopped || workerCtx.Err() != nil {
 		result.Stopped = true
