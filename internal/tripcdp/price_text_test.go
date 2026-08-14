@@ -44,3 +44,30 @@ func TestParseDisplayPriceRejectsWrongPrefix(t *testing.T) {
 		}
 	}
 }
+
+func TestClearRepeatedProductFieldsKeepsSKUIdentity(t *testing.T) {
+	row := map[string]string{
+		"厂商":     "TSIM 網址",
+		"商品ID":   "57490039",
+		"URL":    "https://hk.trip.com/things-to-do/detail/57490039/",
+		"商品名称":   "菲律宾 5G eSIM",
+		"SKU层级1": "1天",
+		"评分":     "4.8",
+		"商品资讯":   "product details",
+	}
+	clearRepeatedProductFields(row, true)
+	for field, want := range map[string]string{
+		"厂商":     "TSIM 網址",
+		"商品ID":   "57490039",
+		"URL":    "https://hk.trip.com/things-to-do/detail/57490039/",
+		"商品名称":   "菲律宾 5G eSIM",
+		"SKU层级1": "1天",
+	} {
+		if got := row[field]; got != want {
+			t.Errorf("%s = %q, want %q", field, got, want)
+		}
+	}
+	if row["评分"] != "" || row["商品资讯"] != "" {
+		t.Fatalf("optional repeated fields were not cleared: %#v", row)
+	}
+}

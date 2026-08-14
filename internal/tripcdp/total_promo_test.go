@@ -34,14 +34,17 @@ func TestTotalPromoContentsUseProductSaleDiscountPreferenceDescription(t *testin
 	}
 }
 
-func TestClearRepeatedProductFieldsClearsTotalPromoOnSKUContinuation(t *testing.T) {
+func TestClearRepeatedProductFieldsKeepsIdentityAndClearsOptionalFields(t *testing.T) {
 	row := map[string]string{
 		"商品ID":  "45892282",
 		"商品资讯":  "Europe eSIM",
 		"总促销标签": "50% off selected option(s) when you book between Jul 1, 2026 and Dec 31, 2026",
 	}
 	clearRepeatedProductFields(row, true)
-	for _, field := range []string{"商品ID", "商品资讯", "总促销标签"} {
+	if row["商品ID"] != "45892282" {
+		t.Fatalf("continuation row 商品ID = %q, want retained identity", row["商品ID"])
+	}
+	for _, field := range []string{"商品资讯", "总促销标签"} {
 		if row[field] != "" {
 			t.Fatalf("continuation row %s = %q, want blank", field, row[field])
 		}
