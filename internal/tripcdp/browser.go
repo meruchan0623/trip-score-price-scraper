@@ -3184,8 +3184,12 @@ func (s *tripScraper) totalPromoContents() []string {
 	return values
 }
 
+// clearRepeatedProductFields removes optional product-level display fields from
+// subsequent SKU rows. Identity fields are intentionally never cleared: every
+// exported SKU row must remain independently traceable to its vendor, product,
+// and source URL even after filtering, sorting, or copying in Excel.
 func clearRepeatedProductFields(row map[string]string, includeProductInfo bool) {
-	for _, key := range []string{"厂商", "商品ID", "URL", "商品名称", "评分", "好评率", "评价数", "预定数", "月销量", "年销量", "总销量", "客户服务", "方便程度", "讯号状态", "中差评价数", "货币", "总促销标签"} {
+	for _, key := range []string{"评分", "好评率", "评价数", "预定数", "月销量", "年销量", "总销量", "客户服务", "方便程度", "讯号状态", "中差评价数", "货币", "总促销标签"} {
 		row[key] = ""
 	}
 	if includeProductInfo {
