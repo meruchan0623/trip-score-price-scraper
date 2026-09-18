@@ -273,9 +273,11 @@ mode2 = 有头仅评分/商品资讯抓取：只输出 商品ID、URL、商品�
 
 ### SKU 接口批量价格
 
-`mode1` 会优先复用真实商品页加载期间捕获的 `getProductInfo` 与 `getProductPriceCalendar` 响应：前者提供合法 SKU 叶子、`packageId`、`resourceId` 与销售属性，后者提供当前日期的原价、折后价、促销和库存。程序按 `packageId + resourceId` 合并，不会用所有属性值的笛卡尔积虚构 SKU。
+`mode1` 会优先复用真实商品页加载期间捕获的 `getProductInfo` 与 `getProductPriceCalendar` 响应：前者提供合法 SKU 叶子、`packageId`、`resourceId` 与销售属性；前者不可用时，从价格日历的 `packageInfos` 建立 SKU 边界，包括尚未报价的资源。价格日历提供原价、折后价、促销和库存。程序按 `packageId + resourceId` 合并，不会用所有属性值的笛卡尔积虚构 SKU。
 
-当当前价格覆盖率达到 80% 时，程序直接使用批量接口价格，并在 JSON 事件中输出 `sku_api_batch_used`、树节点数、已报价数和缺价数；未报价的树节点只计入边界诊断，不伪造价格行。接口缺失、失败、资源 ID 不一致或覆盖率低于 80% 时，输出 `sku_api_batch_fallback` 并继续使用原有 CDP 逐 SKU 交互和价格质量门禁。
+当当前价格覆盖率达到 100% 时，程序直接使用批量接口价格，并在 JSON 事件中输出 `sku_api_batch_used`、树节点数、已报价数和缺价数；未报价的树节点只计入边界诊断，不伪造价格行。接口缺失、失败、资源 ID 不一致或覆盖率不足 100% 时，输出 `sku_api_batch_fallback` 并继续使用原有 CDP 逐 SKU 交互和价格质量门禁。
+
+商品详情若在加载期间跳转到同站 `/things-to-do/experiences/` 列表页，程序仅从实际列表页正常进入原商品一次，再校验商品 ID；不会将列表页价格作为商品报价。2026-09-18 实测，直接导航可能返回无初始商品数据的 `/xticket` 客户端渲染页，商品信息请求被拦截后会触发香港列表页默认跳转；从真实列表页进入则可取得 `/xttd` 服务端渲染的商品数据。该恢复不修改请求响应或伪造 Referer。
 
 接口字段映射：`priceInfo.originalPrice` → 外显价格，`priceInfo.price` → 实价，`preferentialPriceDetails` → SKU 促销标签。这里的实价是当前公开可预订折后价；结账价仍可能受日期、数量、附加产品或用户权益影响。产品级「总促销标签」与 SKU 级「促销标签」继续分开保存。
 

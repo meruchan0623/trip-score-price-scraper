@@ -1,6 +1,9 @@
 package tripcdp
 
-import "testing"
+import (
+	"os"
+	"testing"
+)
 
 func TestParseCapturedAPISKUPricesJoinsTreeAndCurrentPrices(t *testing.T) {
 	responses := []capturedAPIResponse{
@@ -149,8 +152,8 @@ func TestParseCapturedAPISKUPricesRejectsFailedOrUntrustedPrices(t *testing.T) {
 
 func TestAPISKUPriceCoverageUsableForHighCoverageBatch(t *testing.T) {
 	coverage := apiSKUPriceCoverage{TreeCount: 216, PricedCount: 197, MissingPriceCount: 19}
-	if !coverage.usable() {
-		t.Fatalf("high coverage batch should be usable: %+v", coverage)
+	if coverage.usable() {
+		t.Fatalf("incomplete batch must not be accepted: %+v", coverage)
 	}
 }
 
@@ -158,5 +161,47 @@ func TestAPISKUPriceCoverageRejectsLowCoverageBatch(t *testing.T) {
 	coverage := apiSKUPriceCoverage{TreeCount: 2, PricedCount: 1, MissingPriceCount: 1}
 	if coverage.usable() {
 		t.Fatalf("low coverage batch should fall back: %+v", coverage)
+	}
+}
+
+func TestCalendarTreeSurvivesBlockedProductInfo(t *testing.T) {
+	responses := []capturedAPIResponse{
+		{URL: "/restapi/soa2/21052/getProductInfo", Status: 200, Text: "whaleguard block"},
+		{URL: "/restapi/soa2/14580/getProductPriceCalendar", Status: 200, Text: `{"data":{"packageInfos":[{"packageId":11,"resourceInfos":[{"resourceId":101}],"salesProperties":[{"salesProperty":{"salesPropertyId":208,"salesPropertyName":"Days"},"salesPropertyValues":[{"salesPropertyId":1,"salesPropertyName":"1 day"}]}],"priceInfo":{"originalPrice":1.46,"price":0.73,"preferentialPriceDetails":[{"preferentialTitle":"Sale","preferentialName":"50% off"}]}},{"packageId":12,"resourceInfos":[{"resourceId":102}]}]}}`},
+	}
+	rows, coverage := parseCapturedAPISKUPrices(responses, "HKD", true)
+	if len(rows) != 1 || coverage.TreeCount != 2 || coverage.MissingPriceCount != 1 || coverage.usable() {
+		t.Fatalf("rows=%v coverage=%+v", rows, coverage)
+	}
+	if rows[0]["price"] != "1.46" || rows[0]["real_price"] != "0.73" || rows[0]["combination"] != "1 day" {
+		t.Fatal(rows)
+	}
+	if capturedAPISKULeafCount(responses) != 2 {
+		t.Fatal("calendar leaves lost")
+	}
+}
+
+func TestLiveCalendar65892026CompletePrices(t *testing.T) {
+	raw, err := os.ReadFile("testdata/calendar_65892026.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, c := parseCapturedAPISKUPrices([]capturedAPIResponse{{URL: "/restapi/soa2/14580/getProductPriceCalendar", Status: 200, Text: string(raw)}}, "HKD", true)
+	if len(rows) != 127 || !c.Complete || !c.usable() {
+		t.Fatalf("rows=%d coverage=%+v", len(rows), c)
+	}
+	seen := map[string]bool{}
+	for _, row := range rows {
+		key := row["package_id"] + ":" + row["resource_id"]
+		if seen[key] || row["combination"] == "" || row["promo_tag"] == "" || row["price"] == "" || row["real_price"] == "" {
+			t.Fatal(row)
+		}
+		seen[key] = true
+		if row["resource_id"] == "70334649" && (row["price"] != "1.46" || row["real_price"] != "0.73") {
+			t.Fatal(row)
+		}
+		if row["resource_id"] == "96274729" && (row["price"] != "5.11" || row["real_price"] != "4.7") {
+			t.Fatal(row)
+		}
 	}
 }
