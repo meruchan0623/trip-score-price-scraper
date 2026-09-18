@@ -184,6 +184,17 @@ Do not replace these manual-task defaults with `-headless`, another delay profil
 
 When a previous manual workbook has repeated fixed prices, `无SKU选项` rows for a product whose visible page shows package selectors, a generic `香港好去處` title, or missing SKU identity, preserve that old run as forensic evidence and create a timestamped `manual-<ids>-rerun-YYMMDD-HHMM` output directory. Do not overwrite it. A re-run is eligible for delivery only if every requested product passes the normal manual validation above; a display-price fallback is permitted only when the product API and visible page both show no SKU packages. A generic page shell, absent requested product identity, or unavailable saved-session cookies is a hard failure, never a successful price row.
 
+### Current SKU-price reliability rules (2026-09-18)
+
+Before a manual or production mode1 run, build the current repository binary and verify it with `go test ./...`, `python3 -m pytest -q`, and `./trip-score-price-scraper --help`. The current implementation has two fail-closed safeguards:
+
+1. **100% API boundary rule.** Batch API prices are trusted only when every declared `(packageId, resourceId)` SKU leaf is priced. `getProductPriceCalendar.packageInfos` may define the SKU boundary when `getProductInfo` is unavailable; an incomplete response must fall back to CDP SKU interaction and normal quality gates. Never treat an 80%/partial API response, a page-level minimum price, or a list-page price as a complete SKU result.
+2. **Same-site list-redirect recovery.** Direct detail navigation can land on `/things-to-do/experiences/` after an `/xticket` client-rendered page provides no initial product data. The CLI may enter the observed same-site list page and navigate once to the requested `/detail/<id>/`; it must then re-check the requested product ID. It must never export a list page as the requested product or fabricate a Referer/header to bypass this flow.
+
+For a bounded availability probe, run one publicly reachable product with a unique `/tmp` or dedicated diagnostic output directory, visible browser, and the intended `--browser`, `--site`, `--locale`, and `--currency`. Validate in normal `openpyxl` mode that `Trip商品数据` is the only worksheet; all data rows have the requested product ID, non-empty SKU identity, requested currency, non-empty price, and only `trusted_base` or `trusted_promo` price status. Do not deliver diagnostic artifacts.
+
+`session cookies unavailable` does not establish a usable authenticated session. It only means this browser run did not import usable session cookies. Public-product probes may still demonstrate anonymous scraping availability; any workflow that needs authentication must refresh and verify the explicit session separately, without printing cookies or other credentials.
+
 ### Native manual-product workbook contract
 
 The delivered workbook is the unmodified Go CLI output for all requested products. It has exactly one worksheet named `Trip商品数据`. Keep the native row values and native column order; do not fill down, delete, rename, reorder, or summarize fields.

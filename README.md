@@ -296,8 +296,9 @@ slow
 
 ## 浏览器与状态
 
-- 仅支持 Chrome。
-- 程序自己管理 Chrome/CDP worker profile，不依赖旧 Python session。
+- 支持 Chrome 与 Edge；`--browser chrome|edge`，默认 Chrome。用户明确需要使用已登录 Edge 或排查 Edge 页面行为时，显式传 `--browser edge`。
+- 程序自己管理 CDP worker profile，不依赖已删除的 Python session 流程。`--fresh-profile` 会创建空白临时 profile；它不能证明登录态可用。
+- `--session-file` 仅用于显式导入已授权的 CLI session。日志出现 `session cookies unavailable` 时，不能把它作为登录态已恢复的证据；公开商品可继续做匿名可用性探测，但需要登录态的操作必须另行恢复并验证 session，且不得输出认证内容。
 - 厂商 Excel 模式按厂商 worker 隔离浏览器状态。
 - SIGINT/SIGTERM 会尽量导出已完成结果后退出。
 
