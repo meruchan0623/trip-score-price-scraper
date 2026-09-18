@@ -129,7 +129,7 @@ func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bo
 	fs.BoolVar(&multiSiteOutput, "multi-site-output", false, "Export rows into one workbook with a sheet per site code. Only meaningful for single-input mode with rating-only; ignored otherwise.")
 	fs.IntVar(&stopGrace, "stop-grace-seconds", 30, "Seconds to wait for partial exports after SIGINT/SIGTERM before terminating workers.")
 	fs.StringVar(&runMode, "run-mode", "", "Preset run mode: mode1=visible full SKU/price/rating scrape; mode2=visible rating-only + product-info scrape (no SKU, no price columns).")
-	fs.StringVar(&browser, "browser", "chrome", "Browser to use. Only chrome is supported.")
+	fs.StringVar(&browser, "browser", "chrome", "Browser to use: chrome or edge.")
 	fs.StringVar(&site, "site", "hk", "Trip subsite to scrape.")
 	fs.Var(&sitesList, "sites", "Comma-separated Trip subsites to scrape one workbook across. If set, --site is ignored.")
 	fs.StringVar(&locale, "locale", "", "Trip Things-to-Do locale override (advertised locale).")
@@ -186,8 +186,8 @@ func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bo
 	if err := fs.Parse(argv); err != nil {
 		return TaskRequest{}, "", "", false, false, err
 	}
-	if browser != "chrome" {
-		return TaskRequest{}, "", "", false, false, fmt.Errorf("--browser must be chrome")
+	if browser != "chrome" && browser != "edge" {
+		return TaskRequest{}, "", "", false, false, fmt.Errorf("--browser must be chrome or edge")
 	}
 	market, err := resolveMarketContext(site, locale, currency)
 	if err != nil {
@@ -268,8 +268,8 @@ func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bo
 	if err != nil {
 		return TaskRequest{}, "", "", false, false, err
 	}
-	// mode1 defaults to normal delay unless the user explicitly sets a different profile.
-	if runMode == "mode1" && delayProfile == "fast" && !flagPassed(argv, "delay-profile") {
+	// mode1 and mode2 default to normal delay unless the user explicitly sets a different profile.
+	if (runMode == "mode1" || runMode == "mode2") && delayProfile == "fast" && !flagPassed(argv, "delay-profile") {
 		delayProfile = "normal"
 	}
 	delayOptions, err := resolveDelayOptions(delayProfile, overrides)
@@ -315,8 +315,8 @@ func parseArgs(argv []string, stderr io.Writer) (TaskRequest, string, string, bo
 			MemoryLimitMB:      memoryLimit,
 			RestartEvery:       restartEvery,
 		},
-		CompareVendor:  compareVendor,
-		Sites:          sites,
+		CompareVendor:   compareVendor,
+		Sites:           sites,
 		MultiSiteOutput: multiSiteOutput || len(sites) > 0,
 	}, runMode, logLevel, jsonLines, noColor, nil
 }

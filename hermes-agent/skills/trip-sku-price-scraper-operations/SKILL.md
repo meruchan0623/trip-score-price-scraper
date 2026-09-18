@@ -130,15 +130,13 @@ Extract the decimal product ID following `產品價格` / `产品价格`. If the
 https://hk.trip.com/things-to-do/detail/<product-id>/
 ```
 
-The valid success response contains only the native workbook's bare absolute path:
+After structural verification, call `trip_deliver.py`; it is the **only** attachment sender. Its successful `.delivered.json` receipt is the delivery fact.
 
-```text
-/Users/example/Documents/trip-sku-price-scrape/manual-<ids>/trip_scoreandprice_results_<YYMMDD-HHMM>.xlsx
-```
+After that receipt, the Agent's final response must be exactly `附件已发送。` — never a workbook path, `MEDIA:` line, `[media attachment]`, progress message, product title, price, SKU count, summary, table, or output-path explanation. Tool/runtime logs remain internal and are not copied into the user-facing response.
 
-Hermes Gateway converts the bare path into a native attachment and removes the path from visible chat text. Before the path, send no acknowledgement, progress message, product title, price, SKU count, minimum/maximum price, Markdown table, plain-text list, run summary, or output-path explanation. After it, send nothing else. Tool/runtime logs remain internal and are not copied into the user-facing response.
+The project plugin `hermes-agent/plugins/trip-manual-delivery-guard/` enforces this contract with `pre_llm_call` and `transform_llm_output`. It suppresses any media path whose adjacent `.delivered.json` receipt matches, including retry/follow-up turns that do not repeat product IDs. Do not bypass, disable, or work around the guard. Workbook reads are permitted only for the structural validation required below; never inspect the workbook to compose product, price, rating, booking, promotion, SKU-count, minimum-price, or comparison prose.
 
-The project plugin `hermes-agent/plugins/trip-manual-delivery-guard/` enforces this contract with `pre_llm_call` and `transform_llm_output`. It removes any Agent-generated summary immediately before delivery. Do not bypass, disable, or work around the guard. Workbook reads are permitted only for the structural validation required below; never inspect the workbook to compose product, price, rating, booking, promotion, SKU-count, minimum-price, or comparison prose.
+Run this manual workflow in the foreground with a bounded timeout; do not start it as a background process with completion notifications. This prevents a second completion callback from attempting to attach the same workbook.
 
 The delivered file is always the Go CLI native workbook. Never create or attach a secondary workbook named like `product_<id>_pricelist_HKD.xlsx`. A workbook with a `價格清單` sheet, top summary fields such as `產品名稱 / 產品ID / 幣種 / 最低價 / SKU總數`, or a rebuilt `套餐名稱 / 實價 / 原價 / resourceId` table is an invalid Agent-generated deliverable.
 
@@ -181,6 +179,10 @@ Do not replace these manual-task defaults with `-headless`, another delay profil
 6. Verify the final `run_done` event and the generated workbook at `<output-dir>/trip_scoreandprice_results_<YYMMDD-HHMM>.xlsx`. Success requires `success=true`, exit code `0`, and at least one captured row for every requested product.
 7. Verify that the workbook has exactly one sheet named `Trip商品数据` and that its header follows the native field contract below. Every product must have a product name, at least one SKU level, currency, a non-empty display/real price, and only `trusted_base` or `trusted_promo` price statuses. Any `risk_blocked`, Cloudflare/Whaleguard note, unknown/untrusted status, missing required field, or visibly incomplete product makes the run unsuccessful even if the workbook exists.
 8. On valid success, emit only the bare absolute native workbook path specified above. The delivery guard performs the final allowlist check.
+
+### Re-run guard for an anomalous selected-product workbook
+
+When a previous manual workbook has repeated fixed prices, `无SKU选项` rows for a product whose visible page shows package selectors, a generic `香港好去處` title, or missing SKU identity, preserve that old run as forensic evidence and create a timestamped `manual-<ids>-rerun-YYMMDD-HHMM` output directory. Do not overwrite it. A re-run is eligible for delivery only if every requested product passes the normal manual validation above; a display-price fallback is permitted only when the product API and visible page both show no SKU packages. A generic page shell, absent requested product identity, or unavailable saved-session cookies is a hard failure, never a successful price row.
 
 ### Native manual-product workbook contract
 

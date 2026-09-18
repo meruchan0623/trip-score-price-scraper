@@ -161,6 +161,9 @@ func writeExportSheet(file *excelize.File, sheet string, rows []map[string]strin
 		widths[i] = max(12, runeLen(field)+2)
 	}
 	for rowIndex, row := range rows {
+		// Identity fields (厂商/商品ID/URL/商品名称) are written on every SKU row,
+		// including continuation rows of the same 商品ID, so each row is
+		// self-describing when filtered or sorted.
 		for col, field := range fields {
 			value := row[field]
 			if value == "" {
@@ -177,6 +180,14 @@ func writeExportSheet(file *excelize.File, sheet string, rows []map[string]strin
 	}
 	lastCell, _ := excelize.CoordinatesToCellName(len(fields), len(rows)+1)
 	_ = file.SetSheetDimension(sheet, "A1:"+lastCell)
+}
+
+func isProductIdentityField(field string) bool {
+	switch field {
+	case "厂商", "商品ID", "URL", "商品名称":
+		return true
+	}
+	return false
 }
 
 func priceQualityExportFields() []string {
@@ -245,6 +256,16 @@ func exportRowsFromSheet(file *excelize.File, sheet string) ([]map[string]string
 				v = line[i]
 			}
 			row[h] = v
+		}
+		// Continuation rows are exported with blank identity cells; forward-fill
+		// them from the previous row so readback reconstructs the full rows.
+		if strings.TrimSpace(row["商品ID"]) == "" && len(rows) > 0 {
+			prev := rows[len(rows)-1]
+			for _, h := range headers {
+				if isProductIdentityField(h) && row[h] == "" {
+					row[h] = prev[h]
+				}
+			}
 		}
 		rows = append(rows, row)
 	}

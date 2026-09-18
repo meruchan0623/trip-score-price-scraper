@@ -144,6 +144,51 @@ func TestExportRowsFieldShape(t *testing.T) {
 	}
 }
 
+func TestManualInputVendorProvenanceSurvivesSKURowsAndExport(t *testing.T) {
+	items, _, err := loadItems(TaskRequest{InputPaths: []string{"https://hk.trip.com/things-to-do/detail/82793537/"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Vendor != defaultVendor {
+		t.Fatalf("manual item vendor = %+v, want %q", items, defaultVendor)
+	}
+
+	baseRow := baseRowFromBundle(items[0], "Africa eSIM", "", baseRatingBundle{Score: "4.8"}, false)
+	rows := []map[string]string{}
+	for index, sku := range []string{"1天", "3天", "7天"} {
+		row := cloneRow(baseRow)
+		if index > 0 {
+			clearRepeatedProductFields(row, false)
+		}
+		row["SKU层级1"] = sku
+		row["货币"] = "HKD"
+		row["外显价格"] = "10"
+		rows = append(rows, row)
+	}
+	for i, row := range rows {
+		if row["厂商"] != defaultVendor {
+			t.Fatalf("row %d 厂商 = %q before export, want %q", i, row["厂商"], defaultVendor)
+		}
+	}
+
+	path := filepath.Join(t.TempDir(), "manual.xlsx")
+	if _, err := exportRows(rows, path, false, false, false, true); err != nil {
+		t.Fatal(err)
+	}
+	back, err := readExportRows(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(back) != len(rows) {
+		t.Fatalf("exported %d rows, want %d", len(back), len(rows))
+	}
+	for i, row := range back {
+		if strings.TrimSpace(row["厂商"]) != defaultVendor {
+			t.Fatalf("exported row %d 厂商 = %q, want %q", i, row["厂商"], defaultVendor)
+		}
+	}
+}
+
 func TestResolvedMarketPricePrefixRejectsDifferentCurrency(t *testing.T) {
 	jp, err := resolveMarketContext("jp", "", "")
 	if err != nil {

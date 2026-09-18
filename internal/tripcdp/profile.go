@@ -11,33 +11,52 @@ import (
 	"strings"
 )
 
-func defaultChromeUserDataDir() string {
+func defaultChromeUserDataDir() string { return defaultBrowserUserDataDir("chrome") }
+
+func defaultBrowserUserDataDir(browser string) string {
 	home, _ := os.UserHomeDir()
+	if browser == "" {
+		browser = "chrome"
+	}
 	switch runtime.GOOS {
 	case "darwin":
+		if browser == "edge" {
+			return filepath.Join(home, "Library", "Application Support", "Microsoft Edge")
+		}
 		return filepath.Join(home, "Library", "Application Support", "Google", "Chrome")
 	case "windows":
-		if localAppData := os.Getenv("LOCALAPPDATA"); localAppData != "" {
-			return filepath.Join(localAppData, "Google", "Chrome", "User Data")
+		vendor, product := "Google", "Chrome"
+		if browser == "edge" {
+			vendor, product = "Microsoft", "Edge"
 		}
-		return filepath.Join(home, "AppData", "Local", "Google", "Chrome", "User Data")
+		if localAppData := os.Getenv("LOCALAPPDATA"); localAppData != "" {
+			return filepath.Join(localAppData, vendor, product, "User Data")
+		}
+		return filepath.Join(home, "AppData", "Local", vendor, product, "User Data")
 	default:
+		if browser == "edge" {
+			return filepath.Join(home, ".config", "microsoft-edge")
+		}
 		return filepath.Join(home, ".config", "google-chrome")
 	}
 }
 
 func resolveChromeUserDataDir(configured string) string {
+	return resolveBrowserUserDataDir("chrome", configured)
+}
+func resolveBrowserUserDataDir(browser, configured string) string {
 	if strings.TrimSpace(configured) != "" {
 		return expandPath(configured)
 	}
-	return defaultChromeUserDataDir()
+	return defaultBrowserUserDataDir(browser)
 }
 
-func isDefaultChromeUserDataDir(path string) bool {
+func isDefaultChromeUserDataDir(path string) bool { return isDefaultBrowserUserDataDir("chrome", path) }
+func isDefaultBrowserUserDataDir(browser, path string) bool {
 	if strings.TrimSpace(path) == "" {
 		return true
 	}
-	return filepath.Clean(expandPath(path)) == filepath.Clean(defaultChromeUserDataDir())
+	return filepath.Clean(expandPath(path)) == filepath.Clean(defaultBrowserUserDataDir(browser))
 }
 
 func chromeProfileLocked(userDataDir string) bool {
@@ -118,6 +137,37 @@ func copyChromeProfile(src string, dst string) error {
 		if !info.Mode().IsRegular() {
 			return nil
 		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return err
+		}
+		return copyFile(path, target, info.Mode().Perm())
+	})
+}
+
+// copyBrowserCookieSidecars preserves live SQLite cookie WAL sidecars only for
+// a copied browser profile. Chromium keeps recent authenticated cookies in the
+// WAL while its source browser is running; omitting it produces a valid but
+// anonymous profile.
+func copyBrowserCookieSidecars(src string, dst string) error {
+	src = expandPath(src)
+	dst = expandPath(dst)
+	return filepath.WalkDir(src, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil || entry.IsDir() || !entry.Type().IsRegular() {
+			return nil
+		}
+		name := entry.Name()
+		if name != "Cookies-wal" && name != "Cookies-shm" {
+			return nil
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return nil
+		}
+		target := filepath.Join(dst, rel)
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			return err
 		}

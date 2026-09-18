@@ -69,6 +69,23 @@ type apiSKUKey struct {
 	ResourceID int64
 }
 
+// capturedAPISKULeafCount detects API-declared SKU packages independently of
+// price-calendar coverage, so they cannot be downgraded to a no-SKU fallback.
+func capturedAPISKULeafCount(responses []capturedAPIResponse) int {
+	seen := map[apiSKUKey]struct{}{}
+	for _, response := range responses {
+		if response.Status < 200 || response.Status >= 300 || strings.TrimSpace(response.Text) == "" || !strings.Contains(response.URL, "/restapi/soa2/21052/getProductInfo") {
+			continue
+		}
+		for _, leaf := range parseAPISKUTree(response.Text) {
+			if leaf.PackageID > 0 {
+				seen[apiSKUKey{PackageID: leaf.PackageID, ResourceID: leaf.ResourceID}] = struct{}{}
+			}
+		}
+	}
+	return len(seen)
+}
+
 func parseCapturedAPISKUPrices(responses []capturedAPIResponse, expectedCurrency string, extractRealPrice bool) ([]map[string]string, apiSKUPriceCoverage) {
 	tree := map[apiSKUKey]apiSKUTreeLeaf{}
 	prices := map[apiSKUKey]apiSKUPrice{}

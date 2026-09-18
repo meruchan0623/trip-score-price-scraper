@@ -66,6 +66,19 @@ func TestParseCapturedAPISKUPricesReportsTreeBoundaryWithoutInventingRows(t *tes
 	if rows[0]["combination"] != "1 day" {
 		t.Fatalf("unexpected row: %+v", rows[0])
 	}
+	if got := capturedAPISKULeafCount(responses); got != 2 {
+		t.Fatalf("captured API SKU leaf count = %d, want 2", got)
+	}
+}
+
+func TestCapturedAPISKULeafCountIgnoresUnsuccessfulOrNonProductResponses(t *testing.T) {
+	responses := []capturedAPIResponse{
+		{URL: "/restapi/soa2/21052/getProductInfo", Status: 403, Text: `{"productInfos":[{"basicInfo":{"packages":[{"packageId":11,"resourceIds":[101]}]}}]}`},
+		{URL: "/restapi/soa2/14580/getProductPriceCalendar", Status: 200, Text: `{"data":{"packageInfos":[{"packageId":12}]}}`},
+	}
+	if got := capturedAPISKULeafCount(responses); got != 0 {
+		t.Fatalf("captured API SKU leaf count = %d, want 0", got)
+	}
 }
 
 func TestCapturedAPISKUPricesUseExpectedCurrencyWhenResponseOmitsIt(t *testing.T) {

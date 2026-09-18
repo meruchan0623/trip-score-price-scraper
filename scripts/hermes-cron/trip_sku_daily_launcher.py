@@ -26,6 +26,7 @@ CONFIG_INPUT = ROOT / 'config' / '非TSIM厂商价格抓取输入.xlsx'
 REPO = Path('/Users/example/Develop/trip-score-price-scraper')
 BINARY = Path('/tmp/trip-score-cdp')
 FINALIZER = REPO / 'scripts' / 'hermes-cron' / 'trip_sku_trend_finalize.py'
+VENDOR_STABILIZER = REPO / 'scripts' / 'stabilize_vendor_attribution.py'
 FINAL_DELIVERY = Path('/Users/example/.hermes/scripts/trip_sku_non_tsim_final_delivery.py')
 DEFAULT_COMPARE_VENDOR = 'TSIM 網址'
 DEFAULT_DELAY_PROFILE = 'normal'
@@ -228,6 +229,10 @@ PY
 if [ "$code" -ne 0 ]; then
   exit "$code"
 fi
+for workbook in "$RUN_DIR"/*.xlsx; do
+  [ -f "$workbook" ] || continue
+  /usr/local/bin/python3 {str(VENDOR_STABILIZER)!r} "$workbook"
+done
 /usr/bin/env python3 {str(FINALIZER)!r} "$RUN_DIR" > "$RUN_DIR/finalize_output.json" 2> "$RUN_DIR/finalize_error.log" || true
 /usr/bin/env python3 - <<'PY'
 import json,time

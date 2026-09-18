@@ -469,11 +469,11 @@ func (s *tripScraper) start(ctx context.Context) error {
 	s.emit(Event{"event": "chrome_detect_done", "stage": "chrome_detect", "message": fmt.Sprintf("chrome=%s version_main=%s", driverInfo.ChromePath, valueOr(driverInfo.VersionMain, "unknown")), "chrome_path": driverInfo.ChromePath, "version_main": driverInfo.VersionMain})
 	s.emit(Event{"event": "browser_prepare", "stage": "driver_prepare", "message": fmt.Sprintf("chromedriver=%s reused=%v", driverInfo.DriverPath, driverInfo.DriverReused), "driver_path": driverInfo.DriverPath, "driver_cache_dir": driverInfo.CacheDir, "driver_reused": driverInfo.DriverReused, "driver_version": driverInfo.VersionFull, "elapsed_ms": driverInfo.PrepareMS})
 	s.emit(Event{"event": "browser_start_started", "message": "starting Chrome"})
-	profileSourceDir := resolveChromeUserDataDir(s.request.BrowserOptions.UserDataDir)
+	profileSourceDir := resolveBrowserUserDataDir(s.request.BrowserOptions.Browser, s.request.BrowserOptions.UserDataDir)
 	userDataDir := profileSourceDir
 	profileMode := "configured_profile"
 	removeUserDataDir := false
-	if isDefaultChromeUserDataDir(s.request.BrowserOptions.UserDataDir) {
+	if isDefaultBrowserUserDataDir(s.request.BrowserOptions.Browser, s.request.BrowserOptions.UserDataDir) {
 		userDataDir, err = os.MkdirTemp("", "trip_cdp_chrome_profile_*")
 		if err != nil {
 			return err
@@ -484,6 +484,12 @@ func (s *tripScraper) start(ctx context.Context) error {
 		if err := copyChromeProfile(profileSourceDir, userDataDir); err != nil {
 			s.close()
 			return err
+		}
+		if s.request.BrowserOptions.Browser == "edge" {
+			if err := copyBrowserCookieSidecars(profileSourceDir, userDataDir); err != nil {
+				s.close()
+				return err
+			}
 		}
 	} else {
 		if err := os.MkdirAll(userDataDir, 0o755); err != nil {
@@ -521,23 +527,31 @@ func (s *tripScraper) start(ctx context.Context) error {
 		return err
 	}
 	s.emit(Event{"event": "browser_prepare", "stage": "browser_start", "message": "profile=" + userDataDir, "source_profile_dir": profileSourceDir, "runtime_profile_dir": userDataDir, "profile_dir": userDataDir, "profile_mode": profileMode, "debugger_address": debuggerAddress})
-	runtime, err := startChromeDriver(ctx, driverInfo.DriverPath)
-	if err != nil {
-		s.emit(Event{"event": "browser_start_failed", "message": "chromedriver start failed", "stage": "browser_start", "error_type": fmt.Sprintf("%T", err), "error": err.Error(), "elapsed_ms": elapsedMS(started)})
-		s.close()
-		return err
+	var runtime *chromeDriverRuntime
+	if s.request.BrowserOptions.Browser == "edge" {
+		// ChromeDriver rejects Microsoft's Edg/<version> product token even when
+		// the Chromium major version matches. Rod talks CDP directly, so Edge can
+		// use the already-open debugging endpoint without a ChromeDriver attach.
+		s.emit(Event{"event": "browser_prepare", "stage": "browser_start", "message": "Edge direct CDP connection; chromedriver attach skipped", "debugger_address": debuggerAddress})
+	} else {
+		runtime, err = startChromeDriver(ctx, driverInfo.DriverPath)
+		if err != nil {
+			s.emit(Event{"event": "browser_start_failed", "message": "chromedriver start failed", "stage": "browser_start", "error_type": fmt.Sprintf("%T", err), "error": err.Error(), "elapsed_ms": elapsedMS(started)})
+			s.close()
+			return err
+		}
+		s.driverRuntime = runtime
+		if err := ctx.Err(); err != nil {
+			s.close()
+			return err
+		}
+		if err := runtime.attachSession(ctx, debuggerAddress); err != nil {
+			s.emit(Event{"event": "browser_start_failed", "message": "chromedriver attach failed", "stage": "browser_start", "error_type": fmt.Sprintf("%T", err), "error": err.Error(), "elapsed_ms": elapsedMS(started)})
+			s.close()
+			return err
+		}
+		s.emit(Event{"event": "browser_prepare", "stage": "browser_start", "message": "chromedriver attached to debugger", "debugger_address": runtime.debuggerAddress})
 	}
-	s.driverRuntime = runtime
-	if err := ctx.Err(); err != nil {
-		s.close()
-		return err
-	}
-	if err := runtime.attachSession(ctx, debuggerAddress); err != nil {
-		s.emit(Event{"event": "browser_start_failed", "message": "chromedriver attach failed", "stage": "browser_start", "error_type": fmt.Sprintf("%T", err), "error": err.Error(), "elapsed_ms": elapsedMS(started)})
-		s.close()
-		return err
-	}
-	s.emit(Event{"event": "browser_prepare", "stage": "browser_start", "message": "chromedriver attached to debugger", "debugger_address": runtime.debuggerAddress})
 	browser := rod.New().ControlURL(controlURL)
 	if s.request.BrowserOptions.Timeout > 0 {
 		browser = browser.Timeout(s.request.BrowserOptions.Timeout)
@@ -789,13 +803,31 @@ func invalidateUnexpectedCurrencyRows(rows []map[string]string, expected string)
 
 func (s *tripScraper) scrapeOneAttempt(ctx context.Context, item ScrapeItem, target navigationTarget, base Event, attempt int) ([]map[string]string, pageSnapshot, bool, error) {
 	s.emit(mergeEvent(Event{"event": "log", "stage": "page_open", "message": "opening URL", "attempt": attempt}, base))
+	// A fresh Chrome page is about:blank. Establish the target origin before
+	// importing a saved session, because Chrome rejects domain cookies on some
+	// blank-page CDP sessions. The product navigation still occurs only after
+	// cookies are imported.
+	if strings.TrimSpace(s.request.BrowserOptions.SessionFile) != "" {
+		if origin := targetOrigin(target.NavigateURL); origin != "" {
+			if err := s.page.Context(ctx).Navigate(origin); err != nil {
+				s.emit(mergeEvent(Event{"event": "warning", "stage": "session_load", "message": "session origin warmup failed", "error": err.Error(), "session_nav_skipped": true}, base))
+			} else {
+				_ = s.page.WaitLoad()
+				_ = s.waitReady(ctx)
+			}
+		}
+	}
 	sessionResult, err := loadSession(ctx, s.page, s.request.BrowserOptions.SessionFile, target.NavigateURL)
 	if err != nil {
 		s.emit(mergeEvent(Event{"event": "warning", "stage": "session_load", "message": "session load failed", "error": err.Error(), "session_nav_skipped": true}, base))
 	} else if sessionResult.Loaded {
-		s.emit(mergeEvent(Event{"event": "log", "stage": "session_load", "message": "session cookies loaded", "session_cookie_count": sessionResult.CookieCount, "session_nav_skipped": true}, base))
+		s.emit(mergeEvent(Event{"event": "log", "stage": "session_load", "message": "session cookies loaded", "session_cookie_count": sessionResult.CookieCount, "session_cookie_failed_count": sessionResult.CookieFailedCount, "session_nav_skipped": true}, base))
 	} else {
-		s.emit(mergeEvent(Event{"event": "log", "stage": "session_load", "message": "session not loaded or unavailable", "session_nav_skipped": true}, base))
+		message := "session cookies unavailable"
+		if sessionResult.LastCookieError != "" {
+			message += ": " + sessionResult.LastCookieError
+		}
+		s.emit(mergeEvent(Event{"event": "warning", "stage": "session_load", "message": message, "session_cookie_failed_count": sessionResult.CookieFailedCount, "session_cookie_error": sessionResult.LastCookieError, "session_nav_skipped": true}, base))
 	}
 	if err := applyUCStealth(ctx, s.page, target.Market.AcceptLanguage); err != nil && ctx.Err() != nil {
 		return nil, pageSnapshot{}, false, err
@@ -823,7 +855,16 @@ func (s *tripScraper) scrapeOneAttempt(ctx context.Context, item ScrapeItem, tar
 		if loaded, err := applySessionStorage(ctx, s.page, sessionResult.Data); err != nil {
 			s.emit(mergeEvent(Event{"event": "warning", "stage": "session_load", "message": "session storage load failed", "error": err.Error(), "session_nav_skipped": true}, base))
 		} else if loaded {
-			s.emit(mergeEvent(Event{"event": "log", "stage": "session_load", "message": "session storage loaded", "session_nav_skipped": true}, base))
+			s.emit(mergeEvent(Event{"event": "log", "stage": "session_load", "message": "session storage loaded; reloading product with session state", "session_nav_skipped": true}, base))
+			// Storage can be written only after the first origin navigation. Reload
+			// the requested product so its product/SKU API calls see that state;
+			// otherwise a fresh profile may remain on Trip's generic HK shell.
+			if err := s.page.Context(navCtx).Navigate(target.NavigateURL); err != nil {
+				return nil, pageSnapshot{}, false, err
+			}
+			_ = s.page.WaitLoad()
+			_ = s.waitReady(ctx)
+			navStatus, navURL, _ = monitor.snapshot()
 		}
 	}
 	if ctx.Err() != nil {
@@ -831,6 +872,12 @@ func (s *tripScraper) scrapeOneAttempt(ctx context.Context, item ScrapeItem, tar
 	}
 	snapshot, waitMS := s.waitProductPageReady(ctx, 12*time.Second)
 	snapshot.withNavigationStatus(navStatus, navURL)
+	if expectedID := productID(item.URL); expectedID != "" && !s.waitExpectedProductID(ctx, expectedID, 30*time.Second) {
+		snapshot = s.currentPageSnapshot()
+		snapshot.withNavigationStatus(navStatus, navURL)
+		s.emit(mergeEvent(Event{"event": "page_unhealthy", "stage": "page_open", "message": "product DOM did not expose the requested product ID", "product_id": expectedID, "wait_ms": waitMS, "snapshot": snapshot}, base))
+		return nil, snapshot, true, nil
+	}
 	if s.recordCloudflareIfPresent("page_open", base) {
 		s.emit(mergeEvent(Event{"event": "cloudflare_bypass", "stage": "page_open", "message": "cloudflare overlay detected but continuing extraction (data may be partial)", "scrape_note": s.currentScrapeNote}, base))
 	}
@@ -1050,6 +1097,12 @@ func (s *tripScraper) extractRows(ctx context.Context, item ScrapeItem, snapshot
 			row := s.errorRow(item, "价格质量检查失败: "+quality.failReason)
 			row["价格状态"] = priceStatusUntrustedResourceMiss
 			row["抓取备注"] = "价格质量检查失败: " + quality.failReason
+			return []map[string]string{row}, true
+		}
+		if capturedAPISKULeafCount(s.capturedAPIResponses()) > 0 {
+			row := s.errorRow(item, "SKU价格接口未返回完整价格")
+			row["价格状态"] = priceStatusUntrustedPriceMissing
+			row["抓取备注"] = "已发现SKU套餐，但未获得完整SKU价格"
 			return []map[string]string{row}, true
 		}
 		if !allowNoSKUFallback(baseRow, snapshot) {
@@ -2623,6 +2676,31 @@ func (s *tripScraper) waitProductPageReady(ctx context.Context, maxWait time.Dur
 	}
 }
 
+func (s *tripScraper) waitExpectedProductID(ctx context.Context, expectedID string, maxWait time.Duration) bool {
+	if strings.TrimSpace(expectedID) == "" {
+		return true
+	}
+	deadline := time.Now().Add(maxWait)
+	for {
+		if ctx.Err() != nil {
+			return false
+		}
+		matched := s.evalString(`(id) => {
+			const text = (document.body && (document.body.innerText || document.body.textContent)) || '';
+			return text.includes(String(id)) ? 'true' : 'false';
+		}`, expectedID)
+		if matched == "true" {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		if !sleepFixed(ctx, 300*time.Millisecond) {
+			return false
+		}
+	}
+}
+
 func (s *tripScraper) waitProductPageExtractable(ctx context.Context, maxWait time.Duration, ratingOnly bool) (pageSnapshot, int) {
 	started := time.Now()
 	deadline := started.Add(maxWait)
@@ -3214,18 +3292,18 @@ func joinTotalPromoTags(values []string) string {
 func (s *tripScraper) skuLayerCount() int {
 	var count int
 	_ = s.evalJSON(&count, `() => {
-		const containerSelectors = ['div[testid="act_sku_wrapper"]', 'div.style_sku_wrapper_container__Lq9RG', 'div.style_m_container__ssZE4', 'div[class*="style_sku_wrapper_container"]'];
-		let container = null;
-		for (const selector of containerSelectors) {
-			container = document.querySelector(selector);
-			if (container) break;
-		}
-		if (!container) return 0;
-		for (const selector of ['div.sku_tab_ceil.style_m_sku_tab_ceil__D9OYQ', 'div.xtaro-xview.xt-xview.sku_tab_ceil', 'div[class*="sku_tab_ceil"]']) {
-			const elements = Array.from(container.querySelectorAll(selector)).filter(el => el.offsetParent !== null);
-			if (elements.length && elements.length <= 5) return elements.length;
-		}
-		return 0;
+		// Do not anchor this lookup to the first SKU wrapper. Trip can retain a
+		// hidden hydration wrapper ahead of the visible selector tree; anchoring
+		// there incorrectly turns a real multi-SKU product into "no SKU options".
+		const visible = (el) => {
+			if (!el) return false;
+			const style = window.getComputedStyle(el);
+			return !!style && style.display !== 'none' && style.visibility !== 'hidden' && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+		};
+		const layers = Array.from(document.querySelectorAll('div[class*="sku_tab_ceil"]')).filter((el) => {
+			return visible(el) && !!el.querySelector('span[testid^="title_saleproperty_"]');
+		});
+		return layers.length > 0 && layers.length <= 5 ? layers.length : 0;
 	}`)
 	return count
 }
@@ -3751,25 +3829,41 @@ func compactText(value string) string {
 	return strings.Join(strings.Fields(strings.TrimSpace(value)), " ")
 }
 
-func detectChromePath() string {
+func detectChromePath() string { return detectBrowserPath("chrome") }
+
+func detectBrowserPath(browser string) string {
 	candidates := []string{}
+	if browser == "" {
+		browser = "chrome"
+	}
 	switch runtime.GOOS {
 	case "darwin":
 		home, _ := os.UserHomeDir()
-		candidates = []string{
-			"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-			filepath.Join(home, "Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
-			"google-chrome",
-			"chrome",
+		if browser == "edge" {
+			candidates = []string{
+				"/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+				filepath.Join(home, "Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+			}
+		} else {
+			candidates = []string{
+				"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+				filepath.Join(home, "Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+				"google-chrome",
+				"chrome",
+			}
 		}
 	case "windows":
-		candidates = []string{
-			os.ExpandEnv(`${ProgramFiles}\Google\Chrome\Application\chrome.exe`),
-			os.ExpandEnv(`${ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe`),
-			os.ExpandEnv(`${LocalAppData}\Google\Chrome\Application\chrome.exe`),
+		if browser == "edge" {
+			candidates = []string{os.ExpandEnv(`${ProgramFiles}\Microsoft\Edge\Application\msedge.exe`), os.ExpandEnv(`${ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe`), os.ExpandEnv(`${LocalAppData}\Microsoft\Edge\Application\msedge.exe`)}
+		} else {
+			candidates = []string{os.ExpandEnv(`${ProgramFiles}\Google\Chrome\Application\chrome.exe`), os.ExpandEnv(`${ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe`), os.ExpandEnv(`${LocalAppData}\Google\Chrome\Application\chrome.exe`)}
 		}
 	default:
-		candidates = []string{"google-chrome", "chromium", "chromium-browser"}
+		if browser == "edge" {
+			candidates = []string{"microsoft-edge", "microsoft-edge-stable"}
+		} else {
+			candidates = []string{"google-chrome", "chromium", "chromium-browser"}
+		}
 	}
 	for _, candidate := range candidates {
 		path := candidate

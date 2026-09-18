@@ -64,7 +64,7 @@ func prepareUndetectedChromeDriver(ctx context.Context, options BrowserOptions) 
 	}
 	chromePath := options.ChromePath
 	if chromePath == "" {
-		chromePath = detectChromePath()
+		chromePath = detectBrowserPath(options.Browser)
 	}
 	if chromePath == "" {
 		return chromeDriverInfo{}, fmt.Errorf("Google Chrome not found")

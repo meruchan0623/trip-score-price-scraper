@@ -23,6 +23,23 @@ import subprocess
 import sys
 from pathlib import Path
 
+STABILIZER = Path(__file__).resolve().parent / "scripts" / "stabilize_vendor_attribution.py"
+
+
+def _stabilize_vendor_attribution(output_path: Path) -> None:
+    """Best-effort attribution stabilization; never send an unverified failure as success."""
+    if output_path.suffix.lower() != ".xlsx":
+        return
+    if not STABILIZER.exists():
+        raise RuntimeError(f"vendor stabilizer missing: {STABILIZER}")
+    result = subprocess.run(
+        ["/usr/local/bin/python3", str(STABILIZER), str(output_path)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "vendor stabilizer failed")
+
 
 def _find_output_path(run_source: str, run_dir: Path) -> Path | None:
     p = Path(run_source)
@@ -58,6 +75,19 @@ def _write_marker(run_dir: Path, payload: dict) -> None:
             fallback.write_text(json.dumps(payload))
         except OSError:
             pass
+
+
+def _already_delivered(run_dir: Path, output_path: Path, target: str) -> bool:
+    """Idempotency guard for duplicate manual-run delivery invocations."""
+    try:
+        payload = json.loads((run_dir / ".delivered.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return False
+    return (
+        payload.get("status") == "delivered"
+        and payload.get("path") == str(output_path)
+        and payload.get("target") == target
+    )
 
 
 def _deliver(target: str, output_path: Path, subject: str | None) -> int:
@@ -106,6 +136,17 @@ def main(argv: list[str]) -> int:
     if not output_path.exists() or output_path.stat().st_size == 0:
         print(f"output workbook missing/empty: {output_path}", file=sys.stderr)
         _write_marker(run_dir, {"error": "empty_or_missing", "path": str(output_path)})
+        return 1
+
+    if _already_delivered(run_dir, output_path, target):
+        print(f"already delivered: {output_path} -> {target}", file=sys.stderr)
+        return 0
+
+    try:
+        _stabilize_vendor_attribution(output_path)
+    except RuntimeError as exc:
+        print(f"vendor attribution stabilization failed: {exc}", file=sys.stderr)
+        _write_marker(run_dir, {"error": "vendor_stabilization_failed", "path": str(output_path)})
         return 1
 
     rc = _deliver(target, output_path, subject)

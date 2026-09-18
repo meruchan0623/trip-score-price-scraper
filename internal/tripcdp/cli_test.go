@@ -73,8 +73,8 @@ func TestParseRunModeDelayDefaults(t *testing.T) {
 	if mode2.QualityRerun.Enabled {
 		t.Fatalf("mode2 quality rerun should be disabled: %+v", mode2.QualityRerun)
 	}
-	if mode2.DelayOptions.Profile != "fast" {
-		t.Fatalf("mode2 delay profile = %q, want fast", mode2.DelayOptions.Profile)
+	if mode2.DelayOptions.Profile != "normal" {
+		t.Fatalf("mode2 delay profile = %q, want normal", mode2.DelayOptions.Profile)
 	}
 	if mode2.PriceQualityRetry.MaxRetries != 0 {
 		t.Fatalf("mode2 price quality retries = %d, want 0", mode2.PriceQualityRetry.MaxRetries)

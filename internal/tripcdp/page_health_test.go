@@ -13,6 +13,12 @@ func TestPageSnapshotEmptyURLIsUnhealthy(t *testing.T) {
 	}
 }
 
+func TestProductIDParsesExactDetailIdentifier(t *testing.T) {
+	if got := productID("https://hk.trip.com/things-to-do/detail/65892026/?curr=HKD"); got != "65892026" {
+		t.Fatalf("productID = %q, want 65892026", got)
+	}
+}
+
 func TestPageSnapshotValidNoSKUAllowsFallback(t *testing.T) {
 	snapshot := pageSnapshot{
 		URL:             "https://hk.trip.com/things-to-do/detail/123/?locale=zh-hk&curr=HKD",

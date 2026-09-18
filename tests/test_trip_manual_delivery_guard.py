@@ -353,6 +353,39 @@ class TripManualDeliveryGuardTests(unittest.TestCase):
             self.assertEqual(result_b, str(workbook_b))
             self.assertEqual(result_a, str(workbook_a))
 
+    def test_untracked_manual_retry_media_is_suppressed_by_delivery_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_root = Path(tmp)
+            context = FakePluginContext()
+            self.plugin.register(context, output_root=output_root)
+            workbook = self.make_workbook(output_root, ("71827107",))
+            (workbook.parent / ".delivered.json").write_text(
+                '{"status":"delivered","path":"' + str(workbook) + '"}',
+                encoding="utf-8",
+            )
+
+            result = context.hooks["transform_llm_output"](
+                response_text=f"MEDIA:{workbook}",
+                session_id="continuation-without-product-ids",
+            )
+
+            self.assertEqual(result, "附件已发送。")
+
+    def test_tracked_delivery_receipt_never_returns_empty_response(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_root = Path(tmp)
+            workbook = self.make_workbook(output_root, ("71827107",))
+            (workbook.parent / ".delivered.json").write_text(
+                '{"status":"delivered","path":"' + str(workbook) + '"}',
+                encoding="utf-8",
+            )
+            turn = self.plugin.ManualTurn(("71827107",), workbook.parent, 0.0)
+
+            self.assertEqual(
+                self.plugin.filter_manual_response(f"MEDIA:{workbook}", turn),
+                "附件已发送。",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
