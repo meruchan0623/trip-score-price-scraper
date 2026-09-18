@@ -18,10 +18,12 @@ type sessionData struct {
 }
 
 type sessionLoadResult struct {
-	Loaded      bool
-	Data        sessionData
-	CookieCount int
-	HasStorage  bool
+	Loaded            bool
+	Data              sessionData
+	CookieCount       int
+	CookieFailedCount int
+	LastCookieError   string
+	HasStorage        bool
 }
 
 func loadSession(ctx context.Context, page *rod.Page, path string, targetURL string) (result sessionLoadResult, err error) {
@@ -70,6 +72,9 @@ func loadSession(ctx context.Context, page *rod.Page, path string, targetURL str
 		}); err == nil {
 			result.Loaded = true
 			result.CookieCount++
+		} else {
+			result.CookieFailedCount++
+			result.LastCookieError = err.Error()
 		}
 	}
 	return result, nil

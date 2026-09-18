@@ -36,3 +36,16 @@ func TestParseInputConfigUsesNamedCategoryAndDestinationColumns(t *testing.T) {
 		t.Fatalf("category/destination = %q/%q, want 亞洲/Philippines", groups[0].category, groups[0].destination)
 	}
 }
+
+func TestSelectComparableSKULayersSkipsQRCodePresentationLayer(t *testing.T) {
+	row := []string{"QR code", "10天", "總量-10GB"}
+	cols := map[string]int{"SKU层级1": 0, "SKU层级2": 1, "SKU层级3": 2}
+	sku1, sku2 := selectComparableSKULayers(row, cols)
+	if sku1 != "10天" || sku2 != "總量-10GB" {
+		t.Fatalf("comparable layers = %q/%q, want 10天/總量-10GB", sku1, sku2)
+	}
+	spec := parseSKUSpec(sku1, sku2, "")
+	if !spec.Valid || spec.DurationDays != 10 || spec.DataType != "total" || spec.DataMB != 10*1024 {
+		t.Fatalf("unexpected spec: %+v", spec)
+	}
+}

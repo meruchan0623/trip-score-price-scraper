@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import time
@@ -186,12 +187,65 @@ def _normalized_warning(response_text: str, turn: ManualTurn) -> str | None:
     return f"抓取重要警告：{'；'.join(unique_warnings)}。"
 
 
+def _already_sent_by_trip_deliver(workbook: Path, turn: ManualTurn) -> bool:
+    """Whether the dedicated sender already delivered this exact manual run.
+
+    `trip_deliver.py` invokes `hermes send` itself. Returning the workbook from
+    this final-response hook would cause the gateway to attach it a second time.
+    The receipt path must match exactly so a new run in the same manual folder
+    is never incorrectly suppressed.
+    """
+    marker = turn.output_dir / ".delivered.json"
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return False
+    return payload.get("status") == "delivered" and payload.get("path") == str(workbook)
+
+
+def _suppress_already_delivered_media(response_text: str) -> str | None:
+    """Remove MEDIA/bare workbook lines already sent by ``trip_deliver.py``.
+
+    A manual retry can be a follow-up without product IDs, so it is not always
+    represented in ``active_turns``. The receipt beside the workbook remains
+    the authoritative cross-path idempotency key in either case.
+    """
+    kept: list[str] = []
+    suppressed = False
+    for line in response_text.splitlines():
+        candidate = line.strip()
+        if candidate.startswith("MEDIA:"):
+            candidate = candidate.removeprefix("MEDIA:").strip()
+        workbook = Path(candidate)
+        if (
+            workbook.suffix.lower() == ".xlsx"
+            and workbook.parent.name.startswith("manual-")
+            and _already_sent_by_trip_deliver(
+                workbook, ManualTurn((), workbook.parent, 0.0)
+            )
+        ):
+            suppressed = True
+            continue
+        kept.append(line)
+    if not suppressed:
+        return None
+    remaining = "\n".join(kept).strip()
+    # An empty transformed response can be retried by the gateway as if the
+    # hook did not handle it, recreating the duplicate attachment.
+    return remaining or "附件已发送。"
+
+
 def filter_manual_response(response_text: str, turn: ManualTurn) -> str:
-    """Replace a manual scrape response with an allowlisted warning and attachment."""
+    """Replace a manual scrape response with one allowed delivery path only."""
 
     workbook = _fresh_native_workbook(turn)
     if workbook is None:
         return f"抓取失败：未生成原生Excel（{turn.output_dir}）"
+
+    # The receipt makes trip_deliver.py the sole sender and prevents the final
+    # gateway response from attaching an identical workbook a second time.
+    if _already_sent_by_trip_deliver(workbook, turn):
+        return "附件已发送。"
 
     warning = _normalized_warning(response_text, turn)
     if warning:
@@ -245,7 +299,7 @@ def register(ctx, *, output_root: Path = DEFAULT_OUTPUT_ROOT):
         del kwargs
         turn = active_turns.pop(session_id, None)
         if turn is None:
-            return None
+            return _suppress_already_delivered_media(response_text)
         return filter_manual_response(response_text, turn)
 
     ctx.register_hook("pre_llm_call", pre_llm_call)

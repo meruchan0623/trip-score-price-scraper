@@ -149,6 +149,22 @@ func TestCopyChromeProfileSkipsLocksAndKeepsCoreFiles(t *testing.T) {
 	}
 }
 
+func TestCopyBrowserCookieSidecarsPreservesLiveCookieWAL(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "source")
+	dst := filepath.Join(root, "destination")
+	mustWrite(t, filepath.Join(src, "Default", "Network", "Cookies-wal"), []byte("wal"))
+	mustWrite(t, filepath.Join(src, "Default", "Network", "Cookies-shm"), []byte("shm"))
+	if err := copyBrowserCookieSidecars(src, dst); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"Cookies-wal", "Cookies-shm"} {
+		if _, err := os.Stat(filepath.Join(dst, "Default", "Network", name)); err != nil {
+			t.Fatalf("%s was not copied: %v", name, err)
+		}
+	}
+}
+
 func TestFixChromeExitType(t *testing.T) {
 	dir := t.TempDir()
 	preferencesPath := filepath.Join(dir, "Default", "Preferences")

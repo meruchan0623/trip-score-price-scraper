@@ -48,6 +48,7 @@ type productSKU struct {
 	RealPrice    float64
 	Currency     string
 	DisplayPrice string
+	DisplayNum   float64 // parsed 外显价格; 0 when missing/unparseable
 	PromoTag     string
 	Bookings     string
 	Reviews      string
@@ -157,6 +158,45 @@ func skuKey(s productSKU) string {
 		return s.Spec.MatchKey
 	}
 	return strings.TrimSpace(s.SKU1) + "|" + normalizeSKU2(s.SKU2)
+}
+
+func selectComparableSKULayers(row []string, colIdx map[string]int) (string, string) {
+	layers := make([]string, 0, 8)
+	for i := 1; i <= 16; i++ {
+		idx, ok := colIdx[fmt.Sprintf("SKU层级%d", i)]
+		if !ok || idx >= len(row) {
+			continue
+		}
+		value := strings.TrimSpace(row[idx])
+		if value == "" {
+			continue
+		}
+		norm := strings.ToLower(strings.NewReplacer(" ", "", "-", "", "_", "").Replace(value))
+		if norm == "qrcode" || norm == "qr碼" || norm == "二维码" || norm == "二維碼" {
+			continue
+		}
+		layers = append(layers, value)
+	}
+	if len(layers) == 0 {
+		return "", ""
+	}
+	durationIdx, dataIdx := -1, -1
+	for i, value := range layers {
+		if durationIdx < 0 && parseDurationDays(value) > 0 {
+			durationIdx = i
+		}
+		_, hasAmount, _ := parseAmountMB(value)
+		if dataIdx < 0 && (parseDataType(value) != "unknown" || hasAmount) {
+			dataIdx = i
+		}
+	}
+	if durationIdx >= 0 && dataIdx >= 0 && durationIdx != dataIdx {
+		return layers[durationIdx], layers[dataIdx]
+	}
+	if len(layers) == 1 {
+		return layers[0], ""
+	}
+	return layers[0], layers[1]
 }
 
 func parseFloatSafe(v interface{}) float64 {
@@ -312,7 +352,9 @@ func loadVendorProducts(xlsxPath string) (map[string][]productSKU, error) {
 		if realPriceStr == "" {
 			realPrice = parseFloatSafe(getVal(row, "外显价格"))
 		}
-		sku := productSKU{ProductID: currentPID, URL: currentURL, ProductName: currentName, SKU1: getVal(row, "SKU层级1"), SKU2: getVal(row, "SKU层级2"), Currency: getVal(row, "货币"), DisplayPrice: getVal(row, "外显价格"), RealPrice: realPrice, PromoTag: getVal(row, "促销标签"), Bookings: getVal(row, "预定数"), Reviews: getVal(row, "评价数"), Rating: getVal(row, "评分")}
+		sku1, sku2 := selectComparableSKULayers(row, colIdx)
+		sku := productSKU{ProductID: currentPID, URL: currentURL, ProductName: currentName, SKU1: sku1, SKU2: sku2, Currency: getVal(row, "货币"), DisplayPrice: getVal(row, "外显价格"), RealPrice: realPrice, PromoTag: getVal(row, "促销标签"), Bookings: getVal(row, "预定数"), Reviews: getVal(row, "评价数"), Rating: getVal(row, "评分")}
+		sku.DisplayNum = parseFloatSafe(sku.DisplayPrice)
 		sku.SKU2Norm = normalizeSKU2(sku.SKU2)
 		sku.Spec = parseSKUSpec(sku.SKU1, sku.SKU2, sku.ProductName)
 		products[currentPID] = append(products[currentPID], sku)
