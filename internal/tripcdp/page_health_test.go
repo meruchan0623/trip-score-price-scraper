@@ -123,3 +123,20 @@ func TestRestartAfterURLMarkedWhenClickFailsOnUnhealthyPage(t *testing.T) {
 		t.Fatalf("restart reason = %q", scraper.restartReason)
 	}
 }
+
+func TestProductListRedirectRecoveryIsSameSiteAndBoundedToList(t *testing.T) {
+	target := "https://hk.trip.com/things-to-do/detail/65892026/"
+	for _, tc := range []struct {
+		url  string
+		want bool
+	}{
+		{"https://hk.trip.com/things-to-do/experiences/hongkong/", true},
+		{"https://other.example/things-to-do/experiences/hongkong/", false},
+		{"https://hk.trip.com/things-to-do/detail/12345/", false},
+		{"https://hk.trip.com/passport/login", false},
+	} {
+		if got := canRecoverProductListRedirect(tc.url, target); got != tc.want {
+			t.Fatalf("%s: %v", tc.url, got)
+		}
+	}
+}

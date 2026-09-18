@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -872,7 +873,7 @@ func (s *tripScraper) scrapeOneAttempt(ctx context.Context, item ScrapeItem, tar
 	}
 	snapshot, waitMS := s.waitProductPageReady(ctx, 12*time.Second)
 	snapshot.withNavigationStatus(navStatus, navURL)
-	if expectedID := productID(item.URL); expectedID != "" && !s.waitExpectedProductID(ctx, expectedID, 30*time.Second) {
+	if expectedID := productID(item.URL); expectedID != "" && !s.waitExpectedProductID(ctx, expectedID, 30*time.Second) && !canRecoverProductListRedirect(s.currentPageSnapshot().URL, target.NavigateURL) {
 		snapshot = s.currentPageSnapshot()
 		snapshot.withNavigationStatus(navStatus, navURL)
 		s.emit(mergeEvent(Event{"event": "page_unhealthy", "stage": "page_open", "message": "product DOM did not expose the requested product ID", "product_id": expectedID, "wait_ms": waitMS, "snapshot": snapshot}, base))
@@ -943,6 +944,23 @@ func (s *tripScraper) scrapeOneAttempt(ctx context.Context, item ScrapeItem, tar
 		}
 		snapshot.RiskChallenge = false
 		snapshot.RiskKind = ""
+	}
+	if expected := productID(item.URL); expected != "" && productID(snapshot.URL) != expected {
+		if canRecoverProductListRedirect(snapshot.URL, target.NavigateURL) {
+			s.emit(mergeEvent(Event{"event": "product_list_redirect_recovery", "stage": "page_open", "message": "entering requested product from the observed list page", "from_url": snapshot.URL}, base))
+			if _, err := s.page.Context(navCtx).Eval(`(url) => { window.location.assign(url); }`, target.NavigateURL); err != nil {
+				return nil, snapshot, false, err
+			}
+			if s.waitExpectedProductID(ctx, expected, 30*time.Second) {
+				snapshot, waitMS = s.waitProductPageExtractable(ctx, 12*time.Second, s.request.RatingOnly)
+				navStatus, navURL, _ = monitor.snapshot()
+				snapshot.withNavigationStatus(navStatus, navURL)
+			}
+		}
+		if productID(snapshot.URL) != expected || snapshot.RiskChallenge {
+			s.emit(mergeEvent(Event{"event": "page_unhealthy", "stage": "extract", "message": "product URL changed before extraction", "final_url": snapshot.URL}, base))
+			return nil, snapshot, true, nil
+		}
 	}
 	if !isProductPageExtractable(snapshot, s.request.RatingOnly) {
 		s.emit(mergeEvent(Event{"event": "page_unhealthy", "stage": "lazy_load", "message": "product DOM is not extractable after lazy-load scrolling", "wait_ms": waitMS, "snapshot": snapshot}, base))
@@ -2687,7 +2705,8 @@ func (s *tripScraper) waitExpectedProductID(ctx context.Context, expectedID stri
 		}
 		matched := s.evalString(`(id) => {
 			const text = (document.body && (document.body.innerText || document.body.textContent)) || '';
-			return text.includes(String(id)) ? 'true' : 'false';
+			const match = location.pathname.match(/\/detail\/(\d+)/);
+            return match && match[1] === String(id) && text.includes(String(id)) ? 'true' : 'false';
 		}`, expectedID)
 		if matched == "true" {
 			return true
@@ -3766,6 +3785,16 @@ func formatPriceNumber(value float64) string {
 		return "0"
 	}
 	return text
+}
+
+// Recovery uses real same-site navigation, without fabricating a Referer header.
+func canRecoverProductListRedirect(current, target string) bool {
+	from, err := url.Parse(current)
+	if err != nil {
+		return false
+	}
+	to, err := url.Parse(target)
+	return err == nil && from.Scheme == "https" && to.Scheme == "https" && from.Host == to.Host && strings.HasPrefix(from.Path, "/things-to-do/experiences/") && strings.HasPrefix(to.Path, "/things-to-do/detail/")
 }
 
 func productID(url string) string {

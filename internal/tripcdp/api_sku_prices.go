@@ -38,7 +38,7 @@ func (c apiSKUPriceCoverage) usable() bool {
 	if c.TreeCount <= 0 || c.PricedCount <= 0 || c.PricedCount > c.TreeCount {
 		return false
 	}
-	return float64(c.PricedCount)/float64(c.TreeCount) >= 0.80
+	return c.PricedCount == c.TreeCount
 }
 
 type apiSKUProperty struct {
@@ -74,16 +74,34 @@ type apiSKUKey struct {
 func capturedAPISKULeafCount(responses []capturedAPIResponse) int {
 	seen := map[apiSKUKey]struct{}{}
 	for _, response := range responses {
-		if response.Status < 200 || response.Status >= 300 || strings.TrimSpace(response.Text) == "" || !strings.Contains(response.URL, "/restapi/soa2/21052/getProductInfo") {
+		if response.Status < 200 || response.Status >= 300 || strings.TrimSpace(response.Text) == "" {
 			continue
 		}
-		for _, leaf := range parseAPISKUTree(response.Text) {
+		for _, leaf := range capturedResponseSKUTree(response) {
 			if leaf.PackageID > 0 {
 				seen[apiSKUKey{PackageID: leaf.PackageID, ResourceID: leaf.ResourceID}] = struct{}{}
 			}
 		}
 	}
 	return len(seen)
+}
+
+// The calendar declares concrete packages and resources even when the separate
+// product-info request is unavailable. Keep unpriced leaves in the coverage boundary.
+func capturedResponseSKUTree(response capturedAPIResponse) []apiSKUTreeLeaf {
+	if strings.Contains(response.URL, "/restapi/soa2/21052/getProductInfo") {
+		return parseAPISKUTree(response.Text)
+	}
+	if !strings.Contains(response.URL, "/restapi/soa2/14580/getProductPriceCalendar") {
+		return nil
+	}
+	var leaves []apiSKUTreeLeaf
+	for _, price := range parseAPIPriceCalendar(response.Text) {
+		if price.PackageID > 0 && price.ResourceID > 0 {
+			leaves = append(leaves, apiSKUTreeLeaf{PackageID: price.PackageID, ResourceID: price.ResourceID, Properties: price.Properties})
+		}
+	}
+	return leaves
 }
 
 func parseCapturedAPISKUPrices(responses []capturedAPIResponse, expectedCurrency string, extractRealPrice bool) ([]map[string]string, apiSKUPriceCoverage) {
@@ -112,6 +130,19 @@ func parseCapturedAPISKUPrices(responses []capturedAPIResponse, expectedCurrency
 				if price.PackageID > 0 && price.ResourceID > 0 && price.OriginalPrice > 0 && price.Price > 0 {
 					prices[apiSKUKey{PackageID: price.PackageID, ResourceID: price.ResourceID}] = price
 				}
+			}
+		}
+	}
+
+	// Only use the calendar as the SKU authority when product info supplied no tree.
+	// Otherwise preserve its independent boundary, including mismatched resource IDs.
+	if len(tree) == 0 {
+		for _, response := range responses {
+			if response.Status < 200 || response.Status >= 300 {
+				continue
+			}
+			for _, leaf := range capturedResponseSKUTree(response) {
+				tree[apiSKUKey{PackageID: leaf.PackageID, ResourceID: leaf.ResourceID}] = leaf
 			}
 		}
 	}
