@@ -112,6 +112,8 @@ Reference examples:
 
 ## Manual single or selected products price scrape
 
+**Current caution readme:** before every selected-product manual run, read [`references/current-manual-price-cautions.md`](references/current-manual-price-cautions.md). It is the consolidated 2026-09-18 reliability and delivery contract: HK/HKD normalization, visible `normal` mode1 command, list-redirect handling, 100% SKU API coverage, structural validation, and attachment-only success delivery.
+
 Use this workflow whenever the user supplies, names, or asks Hermes to resolve one product or a small set of specific products. This includes requests such as “抓这个链接”, “抓取 BC 日本的产品价格”, or “只抓这几个指定产品”.
 
 ### Hard trigger and user-visible output contract
