@@ -1,6 +1,30 @@
-# Trip.com SKU / 价格抓取工具（Go CDP-only）
+# Trip.com SKU / 价格抓取工具
 
-本项目现在只保留 **Go + Chrome DevTools Protocol (CDP)** 抓取程序。旧版 Python CLI、Python GUI、Selenium/undetected-chromedriver 流程以及 PyInstaller 打包 spec 已删除并停止跟踪；用于自动化机器执行的支持脚本仍保留在仓库中。
+本项目使用 Go + Chrome DevTools Protocol (CDP) 抓取 Trip.com Things-to-Do 商品的 SKU 价格。下面的「给 Agent 的当前抓取契约」是执行抓取、排障和验收时的唯一准则；网页与接口为实时外部状态，旧的录制结果不能代替本次运行证据。
+
+## 给 Agent 的当前抓取契约（2026-09-18）
+
+Trip.com 的商品加载方式已经变化，不能再把「打开详情 URL 后页面有价格」当成抓取成功。
+
+| 环节 | 旧假设 | 当前实际行为与 Agent 动作 |
+|---|---|---|
+| 商品页面 | 直接打开 `/things-to-do/detail/<id>/` 就是可抓取的详情页。 | 直接导航可能先获得 `/xticket` 客户端渲染壳，随后跳到同站 `/things-to-do/experiences/<city>/` 列表页。列表页价格绝不能作为商品价格。程序会仅在已观察到该同站列表页时，从该页正常进入原商品一次，并验证最终详情 URL 与商品 ID。 |
+| 商品资讯接口 | `21052/getProductInfo` 稳定提供 SKU 树。 | 本次实测该请求可返回 HTTP 430、正文 `whaleguard block`。不可因它失败而放弃已正常返回的价格日历，也不可重放或伪造请求绕过风控。 |
+| SKU 与价格接口 | SKU 依赖 `getProductInfo`，价格依赖 `getProductPriceCalendar`。 | `14580/getProductPriceCalendar` 的 `data.packageInfos` 本身已有 `packageId`、`resourceId`、销售属性、原价、折后价和促销。`getProductInfo` 缺失时，价格日历就是 SKU 边界来源。 |
+| 折扣 | 页面显示的低至价可作为所有 SKU 的价格。 | 每个 SKU 使用 `priceInfo.originalPrice` 作为外显原价，`priceInfo.price` 作为公开折后实价，`preferentialPriceDetails` 作为 SKU 促销标签。无促销时原价等于实价、促销标签为空、状态为 `trusted_base`，这是正常结果。 |
+| 成功条件 | HTTP 200、页面渲染或有一条价格即可交付。 | 每个已声明 SKU 必须有价格：`tree_count == priced_count`、`missing_price_count == 0`、`sku_api_batch_used`，且导出行的币种、原价、实价和可信标签完整。覆盖不足 100% 时必须走浏览器逐 SKU 回退并通过质量门禁，不能静默交付部分结果。 |
+
+已验证的香港站批量样本：商品 `65892026`、`56224625`、`46275998`、`52144171`、`85662276`、`57690281` 共导出 729 条可信 SKU 价格行。该样本只证明当时状态；后续运行仍须以本次日志和工作簿为准。
+
+### Agent 执行步骤
+
+1. 将产品 ID 组装为 `https://hk.trip.com/things-to-do/detail/<id>/`；除非用户明确指定市场、语言或币种，不在输入 URL 上附加参数。
+2. 使用 `mode1`、有头 Chrome 和默认香港站运行抓取。程序会为实际导航补齐 `curr=HKD&locale=zh-HK` 并校验返回市场。
+3. 读取 JSON 事件。只有出现 `url_done`、`page_valid=true`、`trusted_rows > 0` 且无价格质量失败，才可把该商品计为完成；批量接口路径还必须出现 `sku_api_batch_used` 和零缺价。
+4. 打开导出的 XLSX，按商品 ID 核对行数。每行必须具有 SKU 层级、HKD 货币、外显价格、实价和 `trusted_promo` 或 `trusted_base`。只有优惠 SKU 必须有促销标签。
+5. 输出默认 XLSX 和运行日志；不要把浏览器截图、登录页、列表页或单次 API 成功替代工作簿验证。
+
+本项目只保留 Go CDP 抓取程序。旧 Python CLI、GUI、Selenium/undetected-chromedriver 和 PyInstaller 打包流程均已移除。
 
 唯一入口：
 
@@ -273,13 +297,31 @@ mode2 = 有头仅评分/商品资讯抓取：只输出 商品ID、URL、商品�
 
 ### SKU 接口批量价格
 
-`mode1` 会优先复用真实商品页加载期间捕获的 `getProductInfo` 与 `getProductPriceCalendar` 响应：前者提供合法 SKU 叶子、`packageId`、`resourceId` 与销售属性；前者不可用时，从价格日历的 `packageInfos` 建立 SKU 边界，包括尚未报价的资源。价格日历提供原价、折后价、促销和库存。程序按 `packageId + resourceId` 合并，不会用所有属性值的笛卡尔积虚构 SKU。
+`mode1` 捕获详情页实际加载的响应，不自行重放 API。当前路径应按以下优先级理解：
 
-当当前价格覆盖率达到 100% 时，程序直接使用批量接口价格，并在 JSON 事件中输出 `sku_api_batch_used`、树节点数、已报价数和缺价数；未报价的树节点只计入边界诊断，不伪造价格行。接口缺失、失败、资源 ID 不一致或覆盖率不足 100% 时，输出 `sku_api_batch_fallback` 并继续使用原有 CDP 逐 SKU 交互和价格质量门禁。
+```text
+14580/getProductPriceCalendar
+  data.packageInfos[]
+    packageId + resourceInfos[].resourceId + salesProperties
+    priceInfo.originalPrice / priceInfo.price / preferentialPriceDetails
+```
 
-商品详情若在加载期间跳转到同站 `/things-to-do/experiences/` 列表页，程序仅从实际列表页正常进入原商品一次，再校验商品 ID；不会将列表页价格作为商品报价。2026-09-18 实测，直接导航可能返回无初始商品数据的 `/xticket` 客户端渲染页，商品信息请求被拦截后会触发香港列表页默认跳转；从真实列表页进入则可取得 `/xttd` 服务端渲染的商品数据。该恢复不修改请求响应或伪造 Referer。
+当 `21052/getProductInfo` 可用时，程序会与它的 SKU 树按 `packageId + resourceId` 对齐；当它被 Whaleguard 拦截时，程序只使用价格日历中已经声明的包、资源和销售属性建立 SKU 边界。不会对属性值做笛卡尔积，也不会补造不存在的 SKU。
 
-接口字段映射：`priceInfo.originalPrice` → 外显价格，`priceInfo.price` → 实价，`preferentialPriceDetails` → SKU 促销标签。这里的实价是当前公开可预订折后价；结账价仍可能受日期、数量、附加产品或用户权益影响。产品级「总促销标签」与 SKU 级「促销标签」继续分开保存。
+只有 `tree_count == priced_count` 且 `missing_price_count == 0`，程序才输出 `sku_api_batch_used` 并使用批量价格。接口缺失、失败、资源不一致或覆盖不足时，输出 `sku_api_batch_fallback`，继续浏览器逐 SKU 路径并执行价格质量门禁。不能把部分 API 行当作完整交付。
+
+字段映射：`priceInfo.originalPrice` → `外显价格`，`priceInfo.price` → `实价`，`preferentialPriceDetails` → `促销标签`。实价是当前公开可预订的折后价；结账价仍可能受日期、数量、附加产品或用户权益影响。产品级「总促销标签」与 SKU 级「促销标签」分开保存。
+
+### 详情页跳转与风控诊断
+
+出现下列现象时，按原因处理，不要误判为商品无 SKU：
+
+| 观察到的现象 | 说明 | 处理 |
+|---|---|---|
+| 最终 URL 是 `/things-to-do/experiences/...` | 前端脚本把无初始商品状态的详情壳重定向到列表页。 | 等待程序的 `product_list_redirect_recovery`。恢复后最终 URL 必须回到原商品 ID；否则该 URL 失败，不导出列表价格。 |
+| `21052/getProductInfo` 返回 430 / `whaleguard block` | 商品信息接口被风控，价格日历可能仍可用。 | 观察 `14580/getProductPriceCalendar` 与其覆盖率；不可手工重放该请求。 |
+| 页面有“低至”价格但没有目标商品 ID 或 SKU | 多半是列表页或通用壳页。 | 判为页面不健康，不能写成单 SKU 成功行。 |
+| `价格可信标签=trusted_base` 且促销标签为空 | 此 SKU 没有活动折扣，原价等于实价。 | 保留，属于完整可信价格。 |
 
 ## 延迟档位
 
@@ -296,9 +338,9 @@ slow
 
 ## 浏览器与状态
 
-- 支持 Chrome 与 Edge；`--browser chrome|edge`，默认 Chrome。用户明确需要使用已登录 Edge 或排查 Edge 页面行为时，显式传 `--browser edge`。
-- 程序自己管理 CDP worker profile，不依赖已删除的 Python session 流程。`--fresh-profile` 会创建空白临时 profile；它不能证明登录态可用。
-- `--session-file` 仅用于显式导入已授权的 CLI session。日志出现 `session cookies unavailable` 时，不能把它作为登录态已恢复的证据；公开商品可继续做匿名可用性探测，但需要登录态的操作必须另行恢复并验证 session，且不得输出认证内容。
+- 支持 Chrome 与 Edge；`--browser chrome|edge`，默认 Chrome。按本 README 的常规和指定产品契约使用可视 Chrome；只有用户明确要求已登录 Edge 或需复现 Edge 页面行为时才传 `--browser edge`。
+- 程序自己管理 CDP worker profile，不依赖已移除的 Python session 流程。`--fresh-profile` 创建空白临时 profile，不能证明登录态可用。
+- `--session-file` 仅导入已授权的 CLI session。出现 `session cookies unavailable` 时，不可把它视为登录恢复成功；公开商品可继续做匿名可用性探测，需要登录态的流程必须另行恢复并验证，且不得输出认证内容。
 - 厂商 Excel 模式按厂商 worker 隔离浏览器状态。
 - SIGINT/SIGTERM 会尽量导出已完成结果后退出。
 
@@ -367,9 +409,9 @@ Hermes Agent 发现 Skill 后，应完整读取其中对应章节。项目不再
 - 不要把结果只保存到本地、投递到无关群组，或忽略交付。
 - 该规则覆盖所有抓取完成交付：Mode2 成功/失败定型文、厂商 Excel 模式、cron 结果包、手动单产品抓取。
 
-Hermes 手动抓取单个或数个指定产品时，固定使用项目根目录构建的 `./trip-score-price-scraper`，以重复 `-input` 传入产品，并使用 `-delay-profile fast -product-info -no-quality-rerun -output-dir <manual-dir>`。运营提示词如 `【請抓取產品價格71827107】` 会按产品 ID 构造 URL（遵循上面的「URL 拼接约定」：默认只拼 `/detail/<ID>/`，不追加 `?locale=...&curr=...`，除非用户显式指定货币/站点）。该流程默认有头单 worker 顺序抓取；Cloudflare/风险拦截、未知价格状态或缺少产品名、SKU、货币、价格任一必填数据时，即使已保留原生 Excel 也返回非零退出码。有效成功时只交付原生 XLSX 附件，不发送平文本价格、产品/SKU 摘要或二次整理表。只有失败、部分 SKU 点击失败、反爬/API 拦截、超时/中断、部分产品失败或原生 Excel 校验异常可以显示单行提示。批量和 cron 任务继续使用各自章节的参数。
+Hermes 手动抓取单个或数个指定产品时，固定使用项目根目录构建的 `./trip-score-price-scraper`，以重复 `-input` 传入产品。无论用户给出哪个 Trip 站点链接，均规范为 `hk.trip.com` 且固定 `locale=zh-HK`、`curr=HKD`。固定参数为 `-run-mode mode1 -no-headless -delay-profile normal -product-info -no-quality-rerun -output-dir <manual-dir>`。该流程默认有头单 worker 顺序抓取；Cloudflare/风险拦截、未知价格状态或缺少产品名、SKU、货币、价格任一必填数据时，即使已保留原生 Excel 也返回非零退出码。有效成功时只通过 `trip_deliver.py` 交付原生 XLSX 附件，不发送确认、进度、平文本价格、产品/SKU 摘要、对比、总结或二次整理表。只有失败、部分 SKU 点击失败、反爬/API 拦截、超时/中断、部分产品失败或原生 Excel 校验异常可以显示 Skill 规定的单行提示。批量和 cron 任务继续使用各自章节的参数。
 
-**手动抓取执行铁律：** Hermes 必须**直接用命令行传参运行** `./trip-score-price-scraper`，**绝不编写/运行任何 shell 包装脚本或临时调用脚本来执行抓取**；一次传参命令若被网关守卫误报（`ValueError: embedded null byte`），用后台方式重发同一条原样命令行即可，不得改写为脚本绕行。抓取成功（exit 0）后**禁止用 openpyxl 等二次读表、也不得 print 出 SKU/价格/评分/行数等明细到群聊**；成功只回原生工作簿路径，CLI 的 `run_done`/exit code 即成功判定。
+**手动抓取执行铁律：** Hermes 必须**直接用命令行传参运行** `./trip-score-price-scraper`，**绝不编写/运行任何 shell 包装脚本或临时调用脚本来执行抓取**；一次传参命令若被网关守卫误报（`ValueError: embedded null byte`），用后台方式重发同一条原样命令行即可，不得改写为脚本绕行。抓取成功后完成结构校验并由 `trip_deliver.py` 发送原生工作簿；**禁止**向群聊输出确认、路径、SKU/价格/评分/行数等明细。`run_done`、退出码和 `.delivered.json` 回执共同构成成功判定。
 
 **结果一定不漏发（强制投递 + 成功回执）：** 抓取成功后的投递必须用项目脚本 `trip_deliver.py` 走 `hermes send` 完成，脚本校验文件存在且非空、调用 `hermes send --to telegram:<chat_id> "MEDIA:<path>"`，**仅当 hermes send 返回 exit 0 才算送达**（写 `.delivered.json` 并 exit 0）；投递失败则写 `.pending_delivery.json` 并返回非零、任务标记为「失败待补发」，绝不静默当作成功。目标 `chat_id` = 发起该次请求的会话/群组。
 
