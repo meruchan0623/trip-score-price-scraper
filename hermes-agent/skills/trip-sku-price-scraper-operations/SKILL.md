@@ -132,7 +132,7 @@ https://hk.trip.com/things-to-do/detail/<product-id>/
 
 After structural verification, call `trip_deliver.py`; it is the **only** attachment sender. Its successful `.delivered.json` receipt is the delivery fact.
 
-After that receipt, the Agent's final response must be exactly `附件已发送。` — never a workbook path, `MEDIA:` line, `[media attachment]`, progress message, product title, price, SKU count, summary, table, or output-path explanation. Tool/runtime logs remain internal and are not copied into the user-facing response.
+After that receipt, do not send a separate user-visible confirmation, workbook path, `MEDIA:` line, `[media attachment]`, progress message, product title, price, SKU count, summary, table, or output-path explanation. The attachment delivery is the only success output. Tool/runtime logs remain internal and are not copied into the user-facing response.
 
 The project plugin `hermes-agent/plugins/trip-manual-delivery-guard/` enforces this contract with `pre_llm_call` and `transform_llm_output`. It suppresses any media path whose adjacent `.delivered.json` receipt matches, including retry/follow-up turns that do not repeat product IDs. Do not bypass, disable, or work around the guard. Workbook reads are permitted only for the structural validation required below; never inspect the workbook to compose product, price, rating, booking, promotion, SKU-count, minimum-price, or comparison prose.
 
@@ -155,7 +155,12 @@ go build -o ./trip-score-price-scraper ./cmd/trip-score-cdp
 
 ```bash
 ./trip-score-price-scraper \
-  -delay-profile fast \
+  -run-mode mode1 \
+  -no-headless \
+  -site hk \
+  -locale zh-HK \
+  -currency HKD \
+  -delay-profile normal \
   -input "https://hk.trip.com/things-to-do/detail/109223304/" \
   -output-dir /Users/example/Documents/trip-sku-price-scrape/manual-109223304 \
   -product-info \
@@ -166,7 +171,12 @@ For several selected products, the command shape is:
 
 ```bash
 ./trip-score-price-scraper \
-  -delay-profile fast \
+  -run-mode mode1 \
+  -no-headless \
+  -site hk \
+  -locale zh-HK \
+  -currency HKD \
+  -delay-profile normal \
   -input "<product-url-1>" \
   -input "<product-url-2>" \
   -output-dir /Users/example/Documents/trip-sku-price-scrape/manual-<id-1>-<id-2> \
@@ -174,11 +184,11 @@ For several selected products, the command shape is:
   -no-quality-rerun
 ```
 
-Do not replace these manual-task defaults with `-headless`, another delay profile, `-excel-input`, `-urls-file`, `-output`, or quality-rerun flags. Run selected products sequentially with the CLI's single worker. Batch and scheduled workflows keep their separate parameters elsewhere in this skill.
+Do not replace these manual-task defaults with `-headless`, another delay profile, another site/locale/currency, `-excel-input`, `-urls-file`, `-output`, or quality-rerun flags. Normalize every supplied Trip.com URL to `hk.trip.com` with `locale=zh-HK` and `curr=HKD`; run selected products sequentially with the CLI's single worker. Batch and scheduled workflows keep their separate parameters elsewhere in this skill.
 
 6. Verify the final `run_done` event and the generated workbook at `<output-dir>/trip_scoreandprice_results_<YYMMDD-HHMM>.xlsx`. Success requires `success=true`, exit code `0`, and at least one captured row for every requested product.
 7. Verify that the workbook has exactly one sheet named `Trip商品数据` and that its header follows the native field contract below. Every product must have a product name, at least one SKU level, currency, a non-empty display/real price, and only `trusted_base` or `trusted_promo` price statuses. Any `risk_blocked`, Cloudflare/Whaleguard note, unknown/untrusted status, missing required field, or visibly incomplete product makes the run unsuccessful even if the workbook exists.
-8. On valid success, emit only the bare absolute native workbook path specified above. The delivery guard performs the final allowlist check.
+8. On valid success, call `trip_deliver.py` for the native workbook and stop after its `.delivered.json` receipt. Do not emit a textual success message; the attachment is the entire successful delivery.
 
 ### Re-run guard for an anomalous selected-product workbook
 
