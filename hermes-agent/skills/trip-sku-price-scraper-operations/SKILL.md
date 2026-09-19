@@ -226,7 +226,7 @@ The native columns are:
 
 The following are not manual-product deliverables: one workbook per requested URL, `product_<id>_pricelist_HKD.xlsx`, a `價格清單` sheet, a two/four-column rebuilt price list, a cleaned workbook, or a workbook with Agent-created `摘要` / `SKU价格明细` sheets.
 
-Validate the workbook with normal `openpyxl.load_workbook(path)` mode before delivery. If the native workbook exists but has no data rows, missing required columns, an unexpected sheet, or other anomalies, the response may contain exactly two lines: `抓取结果异常：<short reason>` followed by the bare absolute native workbook path. If the scrape encountered partial SKU-level click failures, anti-bot/API blocking, timeout/interruption, or partial product failures, use one `抓取重要警告：<short reason>` line followed by the bare path. Never include captured prices, product names, ratings, bookings, promotions, SKU counts, minimum prices, or comparisons. If the native workbook does not exist, report exactly `抓取失败：未生成原生Excel（<run-dir>）`; do not create a replacement workbook from terminal or JSONL logs.
+Validate the workbook with normal `openpyxl.load_workbook(path)` mode before delivery. If the native workbook exists but has no data rows, missing required columns, an unexpected sheet, or other anomalies, the response may contain exactly two lines: `抓取结果异常：<short reason>` followed by the bare absolute native workbook path. If the scrape encountered partial SKU-level click failures, anti-bot/API blocking, timeout/interruption, or partial product failures, use one `抓取重要警告：<short reason>` line followed by the bare path. Never include captured prices, product names, ratings, bookings, promotions, SKU counts, minimum prices, or comparisons. If the native workbook does not exist, report exactly `抓取失败：未生成原生Excel（<run-dir>）`; do not create a replacement workbook from terminal or JSONL logs. Evaluate and reference only the current invocation's run directory: never surface this failure for a historical base directory after a timestamped rerun has passed validation and delivery.
 
 ## Ad-hoc multi-destination price scrape
 
@@ -509,9 +509,22 @@ Mode2 单 worker 多站点（`--urls-file` + `--sites`）会顺序爬大量页�
 - `--checkpoint-every-urls 20`：每 20 个 URL 写一次 partial `.xlsx`
 - `--browser-restart-every 25`：每 25 个 URL 重启 Chrome 降低内存压力
 - `--browser-memory-limit-mb 4096`（或更低）：在内存达到阈值时主动重启，而不是等系统 OOM kill
-- `--kill-orphans`：退出时清理残留 Chrome 进程
+- 退出后以 run-local worker PID、`run_done` 与 `.collection_done` 核对清理状态；`--kill-orphans` 已移除，绝不可传入。
 
 如果中途被 kill（没有 `run_done` / 无 `exit 0`），检查 `output-dir` 中是否有 `_partial_*.xlsx` 或最近的 checkpoint 产物，**不是必须从零重跑所有 URL**；可用相同命令但将 `--urls-file` 替换为仅含剩余未覆盖 URL 的文件，CLI 会继续追加到同一输出。**绝不能重新写入包装脚本**，只通过 CLI 参数调整即可完成恢复。
+
+### TW/HK/RU/JP/VN/TH daily Mode2 schedule (03:00)
+
+The canonical daily six-site job is Hermes cron `024fba50c324`, scheduled `0 3 * * *` (local UTC+8), `no_agent=True`, `deliver=local`, script `trip_mode2_daily_launcher.py`, working directory `/Users/example/Develop/trip-score-price-scraper`.
+
+- The scheduler must run the short launcher, never the long collector directly: Hermes cron has a bounded execution window while the five-worker collector may run for hours.
+- Project source: `scripts/hermes-cron/trip_mode2_daily_launcher.py`; deployed copy: `~/.hermes/scripts/trip_mode2_daily_launcher.py`. The deployed file must match the project copy. Do not use a symlink here: Hermes cron rejects scripts whose resolved path escapes `~/.hermes/scripts/`.
+- The launcher records `launcher_state.json` and `launcher_collector.log` in `/Users/example/Documents/trip-sku-price-scrape/<YYMMDD>-mode2-daily/`, skips an existing `.collection_done`, and refuses a second live runner. The long collector remains the only owner of the five Go workers, final merge, `.collection_done`, workbook enrichment, and direct delivery.
+- Keep the old direct Hermes cron paused/replaced; do not enable a second LaunchAgent or another direct collector schedule, or two independent runs can contend for the shared Mode2 lock.
+- The collector uses exactly `tw,hk,ru,jp,vn,th`, normal profile, 1–5 workers (production 5), and the explicit refreshed session. Its Google target snapshot defines expected rows (`538 × 6 = 3,228` for the current target only; always validate the frozen run-local expected count).
+- Workbook promotion rule: insert `昨日总促销标签` immediately before `总促销标签`, fill it by `(site, 商品ID)` from the previous calendar day's finalized workbook, and color the current `总促销标签` red only when a non-empty previous label differs. Baseline absence remains blank.
+- Text promotion report rule: use `trip_mode2_direct_delivery.py` after verified collection/delivery. Report real percentage-discount signature changes grouped by product/site as `旧折扣 → 新折扣`; do not report wording/language-only changes. The native workbook is delivered separately by `trip_deliver.py`.
+- Before claiming setup or collection success, read back the cron job as `active`, verify its next execution is `03:00`, validate the deployed launcher hash, then, after a collection, require no active runner, `.collection_done`, a six-sheet workbook with per-site/total counts matching the frozen target, `.delivery_done`, and `.promo_change_reported` when a prior-day baseline exists.
 
 Full reference: `references/trip-score-cdp-input-mode.md`
 
