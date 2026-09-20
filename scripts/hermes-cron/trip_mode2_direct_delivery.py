@@ -220,7 +220,12 @@ def main() -> int:
         pending = run_dir / ".pending_delivery.json"
         last_error = ""
         for attempt in range(1, 4):
-            result = subprocess.run([sys.executable, str(DELIVER), str(output), "--to", TARGET, "--subject", "Trip Mode2 Daily"], capture_output=True, text=True)
+            command = [sys.executable, str(DELIVER), str(output), "--to", TARGET, "--subject", "Trip Mode2 Daily"]
+            if force:
+                # A forced resend is an explicit operator action, so the
+                # duplicate-safe guard must be bypassed deliberately.
+                command.append("--force")
+            result = subprocess.run(command, capture_output=True, text=True)
             if result.returncode == 0:
                 delivery.write_text(json.dumps({"delivered_at": datetime.now().isoformat(), "output_path": str(output), "target": TARGET, "processed_count": payload.get("processed_count")}))
                 pending.unlink(missing_ok=True)

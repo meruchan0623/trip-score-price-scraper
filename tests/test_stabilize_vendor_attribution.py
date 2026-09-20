@@ -203,10 +203,35 @@ def test_main_fails_when_no_row_can_be_resolved(tmp_path: Path, capsys) -> None:
         {site: [("手动输入", "777777", "https://hk.trip.com/things-to-do/detail/777777/")] for site in SITES},
     )
     rc = _run_main(
-        ["--target-table", str(target), "--manual-attribution", str(tmp_path / "none.json"), str(workbook)]
+        [
+            "--target-table",
+            str(target),
+            "--manual-attribution",
+            str(tmp_path / "none.json"),
+            "--require-attribution",
+            str(workbook),
+        ]
     )
     assert rc == MODULE.EXIT_NO_MATCHES
     assert "FATAL" in capsys.readouterr().err
+    assert _vendor_column(workbook, "HK") == ["手动输入"]
+
+
+def test_fill_only_mode_never_blocks_a_manual_delivery(tmp_path: Path, capsys) -> None:
+    """Ad-hoc scrapes may target products absent from the daily table: warn, do not fail."""
+    target = _write_target(
+        tmp_path / "target.xlsx",
+        [[1001.0, "歐洲", "Europe", 1001.0, 2001.0, 3001.0, 4001.0, 5001.0, None]],
+    )
+    workbook = _write_workbook(
+        tmp_path / "manual.xlsx",
+        {site: [("手动输入", "555555", "https://hk.trip.com/things-to-do/detail/555555/")] for site in SITES},
+    )
+    rc = _run_main(
+        ["--target-table", str(target), "--manual-attribution", str(tmp_path / "none.json"), str(workbook)]
+    )
+    assert rc == 0
+    assert "WARNING" in capsys.readouterr().err
     assert _vendor_column(workbook, "HK") == ["手动输入"]
 
 

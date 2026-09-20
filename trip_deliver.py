@@ -13,6 +13,8 @@ trip_deliver.py — 携程 SKU/商品信息抓取「结果一定不漏发」投�
 5. 任何失败（缺文件/空文件/hermes send 非 0）→ 写 .pending_delivery 标记、返回非零，
    让调用方/上层把该任务标记为「失败待补发」，绝不静默当作成功。
 
+6. `--force` 显式覆盖重复投递保护（仅用于操作者确认的「修正后重发同一 run」）。
+
 退出码：0=已送达；1=投递失败/后端错误；2=用法错误。
 """
 from __future__ import annotations
@@ -106,13 +108,14 @@ def _deliver(target: str, output_path: Path, subject: str | None) -> int:
 def main(argv: list[str]) -> int:
     if len(argv) < 2 or "--to" not in argv:
         print(
-            "usage: trip_deliver.py <output.xlsx | run_dir> --to telegram:<chat_id> [--subject TEXT]",
+            "usage: trip_deliver.py <output.xlsx | run_dir> --to telegram:<chat_id> [--subject TEXT] [--force]",
             file=sys.stderr,
         )
         return 2
     run_source = argv[0]
     target = None
     subject = None
+    force = False
     i = 1
     while i < len(argv):
         if argv[i] == "--to" and i + 1 < len(argv):
@@ -121,6 +124,11 @@ def main(argv: list[str]) -> int:
         elif argv[i] == "--subject" and i + 1 < len(argv):
             subject = argv[i + 1]
             i += 2
+        elif argv[i] == "--force":
+            # Explicit operator override for a corrected re-send of the same
+            # run. Never implied: the default stays duplicate-safe.
+            force = True
+            i += 1
         else:
             i += 1
     if not target:
@@ -138,7 +146,7 @@ def main(argv: list[str]) -> int:
         _write_marker(run_dir, {"error": "empty_or_missing", "path": str(output_path)})
         return 1
 
-    if _already_delivered(run_dir, output_path, target):
+    if not force and _already_delivered(run_dir, output_path, target):
         print(f"already delivered: {output_path} -> {target}", file=sys.stderr)
         return 0
 
