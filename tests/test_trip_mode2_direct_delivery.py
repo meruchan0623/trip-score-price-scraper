@@ -87,3 +87,30 @@ def test_split_plaintext_keeps_complete_lines() -> None:
     assert len(chunks) > 1
     assert all(len(chunk) <= 80 for chunk in chunks)
     assert "\n".join(chunks) == text
+
+
+def test_legacy_vendor_placeholder_never_reaches_the_report(tmp_path: Path) -> None:
+    """A stale baseline workbook must not turn 厂商 into "BC/手动输入"."""
+    current_path = tmp_path / "260818-mode2-daily" / "trip_mode2_daily_6site.xlsx"
+    previous_path = tmp_path / "260817-mode2-daily" / "trip_mode2_daily_6site.xlsx"
+    current = {("100", "HK"): ("預訂指定套票減50%", "哈薩克斯坦 eSIM", "BC")}
+    # Yesterday's workbook still carries the Go CLI's unresolved placeholder.
+    previous = {("100", "HK"): ("預訂指定套票減8%", "哈薩克斯坦 eSIM", "手动输入")}
+
+    with patch.object(MODULE, "tags", side_effect=[current, previous]):
+        message = MODULE.promo_message(current_path, previous_path)
+
+    assert "手动输入" not in message
+    assert "手動輸入" not in message
+    assert "｜BC｜" in message
+
+
+def test_deployed_delivery_script_matches_project_copy() -> None:
+    """The collector runs the deployed copy; drift would silently drop the fixes."""
+    deployed = Path.home() / ".hermes" / "scripts" / "trip_mode2_direct_delivery.py"
+    if not deployed.is_file():
+        return
+    assert deployed.read_bytes() == SCRIPT.read_bytes(), (
+        "deployed ~/.hermes/scripts/trip_mode2_direct_delivery.py is out of sync with "
+        "scripts/hermes-cron/trip_mode2_direct_delivery.py; copy the project file over it"
+    )

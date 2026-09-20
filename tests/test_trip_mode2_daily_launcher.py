@@ -149,3 +149,16 @@ def test_env_overrides_apply(tmp_path, monkeypatch):
 def test_default_paths_point_at_external_collector():
     assert str(MODULE.DEFAULT_COLLECTOR) == "/Users/example/.hermes/scripts/trip_daily_mode2_cron.sh"
     assert str(MODULE.DEFAULT_ROOT) == "/Users/example/Documents/trip-sku-price-scrape"
+
+
+def test_deployed_collector_matches_project_copy() -> None:
+    """The 03:00 job runs the deployed collector; drift would drop the vendor gate."""
+    project = Path(__file__).parents[1] / "scripts" / "hermes-cron" / "trip_daily_mode2_cron.sh"
+    deployed = Path.home() / ".hermes" / "scripts" / "trip_daily_mode2_cron.sh"
+    assert project.is_file(), f"collector missing from the project: {project}"
+    if not deployed.is_file():
+        return
+    assert deployed.read_bytes() == project.read_bytes(), (
+        "deployed ~/.hermes/scripts/trip_daily_mode2_cron.sh is out of sync with "
+        "scripts/hermes-cron/trip_daily_mode2_cron.sh; copy the project file over it"
+    )

@@ -13,6 +13,8 @@ PROJECT = Path("/Users/example/Develop/trip-score-price-scraper")
 DELIVER = PROJECT / "trip_deliver.py"
 TARGET = "telegram:YOUR_CHAT_ID"
 SITES = {"TW", "HK", "RU", "JP", "VN", "TH"}
+# The Go CLI defaults 厂商 to this when nothing real was attributed.
+LEGACY_VENDOR_PLACEHOLDERS = {"手动输入", "手動輸入"}
 
 
 def send(text: str) -> None:
@@ -115,13 +117,26 @@ def _product_vendor(pid: str, current: dict, previous: dict) -> str:
         for site in ("HK", "TW", "JP", "TH", "VN", "RU"):
             value = source.get((pid, site), ("", "", ""))
             vendor = value[2].strip() if len(value) > 2 else ""
-            if vendor and vendor not in vendors:
+            # Legacy workbooks wrote the CLI placeholder instead of a real vendor;
+            # never let it leak into a business report as if it were a vendor name.
+            if vendor and vendor not in LEGACY_VENDOR_PLACEHOLDERS and vendor not in vendors:
                 vendors.append(vendor)
     if not vendors:
         return "未返回厂商"
     if len(vendors) == 1:
         return vendors[0]
     return "/".join(vendors)
+
+
+def _promo_label_text(labels: list[str]) -> str:
+    """Show source promotion labels without letting one row exhaust a message."""
+    values = []
+    for label in labels:
+        normalized = " ".join(str(label).split())
+        if normalized and normalized not in values:
+            values.append(normalized)
+    text = " / ".join(values) if values else "无"
+    return text if len(text) <= 120 else f"{text[:117]}…"
 
 
 def _report_date(path: Path) -> str:
@@ -168,8 +183,11 @@ def promo_message(today: Path, previous: Path | None) -> str:
         for index, ((old_sig, now_sig), sites) in enumerate(transitions):
             site_text = "/".join(sorted(sites, key=lambda site: order.get(site, 99)))
             product_text = f"{pid}｜{name}｜{vendor}" if index == 0 else f"{pid}｜{name}｜{vendor}（续）"
+            old_labels = [yesterday.get((pid, site), ("", "", ""))[0] for site in sites]
+            new_labels = [current.get((pid, site), ("", "", ""))[0] for site in sites]
             lines.append(
                 f"• {product_text}｜{site_text}｜{discount_text(old_sig)} → {discount_text(now_sig)}"
+                f"｜标签：{_promo_label_text(old_labels)} → {_promo_label_text(new_labels)}"
             )
     return "\n".join(lines)
 
