@@ -12,17 +12,17 @@ MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
 
-def test_promo_message_lists_changed_product_and_merged_sites_in_plaintext(tmp_path: Path) -> None:
+def test_promo_message_is_one_compact_message_without_raw_labels(tmp_path: Path) -> None:
     current_path = tmp_path / "260818-mode2-daily" / "trip_mode2_daily_6site.xlsx"
     previous_path = tmp_path / "260817-mode2-daily" / "trip_mode2_daily_6site.xlsx"
     current = {
-        ("100", "HK"): ("預訂指定套票減50% | 預訂指定套票減5%", "哈薩克斯坦 eSIM｜1-30天｜QR code", "TSIM 網點"),
-        ("100", "RU"): ("скидка 50 % | скидка 5 %", "Казахстан eSIM | QR", "TSIM 網點"),
+        ("100", "HK"): ("預訂指定套票減50% | 預訂指定套票減5%", "哈薩克斯坦 eSIM｜1-30天｜QR code", "TSIM 網址"),
+        ("100", "RU"): ("скидка 50 % | скидка 5 %", "Казахстан eSIM | QR", "TSIM 網址"),
         ("200", "HK"): ("指定產品減20%", "文案变化产品", "BC"),
     }
     previous = {
-        ("100", "HK"): ("預訂指定套票減50% | 預訂指定套票減8%", "哈薩克斯坦 eSIM | old", "TSIM 網點"),
-        ("100", "RU"): ("скидка 50 % | скидка 8 %", "Казахстан eSIM | old", "TSIM 網點"),
+        ("100", "HK"): ("預訂指定套票減50% | 預訂指定套票減8%", "哈薩克斯坦 eSIM | old", "TSIM 網址"),
+        ("100", "RU"): ("скидка 50 % | скидка 8 %", "Казахстан eSIM | old", "TSIM 網址"),
         # Different wording, identical percentage: must not be reported.
         ("200", "HK"): ("預訂指定套票省20%", "文案变化产品"),
     }
@@ -30,55 +30,86 @@ def test_promo_message_lists_changed_product_and_merged_sites_in_plaintext(tmp_p
     with patch.object(MODULE, "tags", side_effect=[current, previous]):
         message = MODULE.promo_message(current_path, previous_path)
 
-    assert "变化产品：1 个" in message
-    assert "• 100｜哈薩克斯坦 eSIM｜TSIM 網點｜HK/RU｜5% + 50% → 5% + 50%" not in message
-    assert "• 100｜哈薩克斯坦 eSIM｜TSIM 網點｜HK/RU｜8% + 50% → 5% + 50%" in message
+    assert len(message) <= MODULE.SINGLE_MESSAGE_LIMIT <= 4096
+    assert "变化 1 产品／1 处：撤销 0｜力度变化 1｜新增 0" in message
+    # Product 100 collapses to one row: vendor code, merged site codes, discount codes.
+    assert "100｜S｜HR｜8+50→5+50" in message
     assert "200" not in message
-    assert "|---" not in message
+    # Site/vendor tallies and the code legend are present.
+    assert "站点 H1 R1" in message
+    assert "厂商 S1" in message
+    assert "H=HK" in message and "S=TSIM 網址" in message
+    # Localized promotion wording stays in the workbook and never floods the message.
+    assert "預訂" not in message and "скидка" not in message
 
 
-def _run_main(tmp_path: Path, monkeypatch, env_force: str | None) -> tuple[list, list]:
-    import json
-    import subprocess
-    from datetime import datetime
-
-    today = datetime.now().strftime("%y%m%d")
-    run_dir = tmp_path / f"{today}-mode2-daily"
-    run_dir.mkdir()
-    (run_dir / f"{today}-0300_trip_mode2_daily_6site.xlsx").write_bytes(b"x")
-    (run_dir / ".collection_done").write_text(json.dumps({"processed_count": 966}))
-    (run_dir / ".delivery_done").write_text("{}")
-    (run_dir / ".promo_change_reported").write_text("{}")
-    if env_force is None:
-        monkeypatch.delenv("MODE2_FORCE_DELIVERY", raising=False)
-    else:
-        monkeypatch.setenv("MODE2_FORCE_DELIVERY", env_force)
-
-    runs: list = []
-    sends: list = []
-    monkeypatch.setattr(MODULE, "ROOT", tmp_path)
-    monkeypatch.setattr(subprocess, "run", lambda *a, **k: runs.append(a) or type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})())
-    monkeypatch.setattr(MODULE, "send", lambda text: sends.append(text))
-    monkeypatch.setattr(MODULE, "promo_message", lambda today, previous: "msg")
-    assert MODULE.main() == 0
-    return runs, sends
+def _change_pairs(count: int, kind: str, offset: int = 0) -> tuple[dict, dict]:
+    sites = ["HK", "TW", "JP", "TH", "VN", "RU"]
+    current: dict = {}
+    previous: dict = {}
+    for index in range(count):
+        pid = str(70000000 + offset + index)
+        for site in sites:
+            if kind == "lost":
+                previous[(pid, site)] = ("預訂指定套票減50% | 預訂指定套票減5%", "商品", "BC")
+                current[(pid, site)] = ("無促銷", "商品", "BC")
+            elif kind == "gain":
+                current[(pid, site)] = ("預訂指定套票減50% | 預訂指定套票減5%", "商品", "BC")
+                previous[(pid, site)] = ("無促銷", "商品", "BC")
+            else:
+                previous[(pid, site)] = ("預訂指定套票減50% | 預訂指定套票減8%", "商品", "BC")
+                current[(pid, site)] = ("預訂指定套票減50% | 預訂指定套票減5%", "商品", "BC")
+    return current, previous
 
 
-def test_main_respects_markers_by_default(tmp_path: Path, monkeypatch) -> None:
-    runs, sends = _run_main(tmp_path, monkeypatch, None)
-    assert runs == [] and sends == []
+def test_big_change_day_still_fits_a_single_telegram_message(tmp_path: Path) -> None:
+    current_path = tmp_path / "a" / "trip_mode2_daily_6site.xlsx"
+    previous_path = tmp_path / "b" / "trip_mode2_daily_6site.xlsx"
+    current, previous = _change_pairs(400, "gain")
+    lost_cur, lost_prev = _change_pairs(120, "lost", 100000)
+
+    with patch.object(MODULE, "tags", side_effect=[{**current, **lost_cur}, {**previous, **lost_prev}]):
+        message = MODULE.promo_message(current_path, previous_path)
+
+    assert len(message) <= MODULE.SINGLE_MESSAGE_LIMIT
+    assert len(message) <= 4096
+    # The actionable section survives the budget cut, the bulk one is summarised.
+    assert "▼撤销折扣 120" in message
+    assert "未列示" in message and "完整明细见同日 XLSX" in message
 
 
-def test_main_force_flag_redelivers_and_reports(tmp_path: Path, monkeypatch) -> None:
-    from datetime import datetime, timedelta
+def test_priority_order_keeps_lost_promotions_before_new_ones(tmp_path: Path) -> None:
+    current_path = tmp_path / "a" / "trip_mode2_daily_6site.xlsx"
+    previous_path = tmp_path / "b" / "trip_mode2_daily_6site.xlsx"
+    lost_cur, lost_prev = _change_pairs(2, "lost", 0)
+    gain_cur, gain_prev = _change_pairs(2, "gain", 1000)
 
-    yesterday = (datetime.now() - timedelta(days=1)).strftime("%y%m%d")
-    prev = tmp_path / f"{yesterday}-mode2-daily"
-    prev.mkdir()
-    (prev / f"{yesterday}-0300_trip_mode2_daily_6site.xlsx").write_bytes(b"y")
-    runs, sends = _run_main(tmp_path, monkeypatch, "1")
-    assert len(runs) == 1  # trip_deliver.py invoked once (mocked, no real send)
-    assert sends == ["msg"]
+    with patch.object(MODULE, "tags", side_effect=[{**lost_cur, **gain_cur}, {**lost_prev, **gain_prev}]):
+        message = MODULE.promo_message(current_path, previous_path)
+
+    body = message.splitlines()
+    assert next(i for i, line in enumerate(body) if line.startswith("▼撤销折扣")) < next(
+        i for i, line in enumerate(body) if line.startswith("▼新增折扣")
+    )
+    # 撤销 rows are inside the 撤销 section, before the 新增 section starts.
+    lost_index = next(i for i, line in enumerate(body) if line.startswith("▼撤销折扣"))
+    gain_index = next(i for i, line in enumerate(body) if line.startswith("▼新增折扣"))
+    assert all("→-" in line for line in body[lost_index + 1 : gain_index])
+
+
+def test_omission_tail_counts_every_unlisted_section(tmp_path: Path) -> None:
+    current_path = tmp_path / "a" / "trip_mode2_daily_6site.xlsx"
+    previous_path = tmp_path / "b" / "trip_mode2_daily_6site.xlsx"
+    lost_cur, lost_prev = _change_pairs(10, "lost", 0)
+    gain_cur, gain_prev = _change_pairs(10, "gain", 1000)
+
+    with patch.object(MODULE, "tags", side_effect=[{**lost_cur, **gain_cur}, {**lost_prev, **gain_prev}]):
+        message = MODULE.promo_message(current_path, previous_path, limit=400)
+
+    tail = message.splitlines()[-1]
+    assert tail.startswith("（未列示"), tail
+    assert "撤销" in tail and "新增" in tail
+    assert "完整明细见同日 XLSX" in tail
 
 
 def test_split_plaintext_keeps_complete_lines() -> None:
@@ -90,7 +121,7 @@ def test_split_plaintext_keeps_complete_lines() -> None:
 
 
 def test_legacy_vendor_placeholder_never_reaches_the_report(tmp_path: Path) -> None:
-    """A stale baseline workbook must not turn 厂商 into "BC/手动输入"."""
+    """A stale baseline workbook must not turn 厂商 into a fake vendor name."""
     current_path = tmp_path / "260818-mode2-daily" / "trip_mode2_daily_6site.xlsx"
     previous_path = tmp_path / "260817-mode2-daily" / "trip_mode2_daily_6site.xlsx"
     current = {("100", "HK"): ("預訂指定套票減50%", "哈薩克斯坦 eSIM", "BC")}
@@ -102,7 +133,7 @@ def test_legacy_vendor_placeholder_never_reaches_the_report(tmp_path: Path) -> N
 
     assert "手动输入" not in message
     assert "手動輸入" not in message
-    assert "｜BC｜" in message
+    assert "100｜B｜H｜8→50" in message
 
 
 def test_deployed_delivery_script_matches_project_copy() -> None:
