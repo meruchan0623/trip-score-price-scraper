@@ -9,9 +9,13 @@ the joined canonical column names.
 
 Existing named vendors are preserved. Blank or legacy "手动输入" values are only
 replaced by a resolved vendor; when nothing can be resolved the cell is left
-untouched and counted as `unmatched`, and a systematic extraction failure exits
-non-zero so a run can never silently deliver a workbook whose 厂商 column is
-entirely "手动输入".
+untouched and counted as `unmatched`.
+
+The daily Mode2 collector passes `--require-attribution`, which turns a
+systematic extraction failure into a non-zero exit so a run can never silently
+deliver a workbook whose 厂商 column is entirely "手动输入". Ad-hoc and manual
+scrapes keep the default (fill-only) behaviour because their products need not
+appear in the daily target at all.
 """
 from __future__ import annotations
 
@@ -209,6 +213,11 @@ def main() -> int:
     parser.add_argument("workbook", nargs="+", type=Path)
     parser.add_argument("--target-table", type=Path, default=DEFAULT_TARGET)
     parser.add_argument("--manual-attribution", type=Path, default=DEFAULT_MANUAL_ATTRIBUTION)
+    parser.add_argument(
+        "--require-attribution",
+        action="store_true",
+        help="Fail the run when vendor attribution cannot resolve any row (daily Mode2 collector).",
+    )
     args = parser.parse_args()
     if not args.target_table.exists():
         raise SystemExit(f"target table missing: {args.target_table}")
@@ -227,13 +236,14 @@ def main() -> int:
     unmatched = sum(int(result["unmatched"]) for result in results)
     missing_columns = sum(int(result["missing_columns"]) for result in results)
     if filled == 0 and unmatched > 0 and missing_columns == 0:
-        print(
-            "FATAL: vendor attribution filled 0 rows while "
-            f"{unmatched} rows stayed unresolved; refusing to deliver a workbook whose "
-            "厂商 column would still read 手动输入",
-            file=sys.stderr,
+        message = (
+            "vendor attribution filled 0 rows while "
+            f"{unmatched} rows stayed unresolved; the 厂商 column would still read 手动输入"
         )
-        return EXIT_NO_MATCHES
+        if args.require_attribution:
+            print(f"FATAL: {message}", file=sys.stderr)
+            return EXIT_NO_MATCHES
+        print(f"WARNING: {message} (fill-only mode: workbook left unchanged)", file=sys.stderr)
     payload = {
         "canonical_matches": len(unique),
         "canonical_conflicts": len(conflicts),

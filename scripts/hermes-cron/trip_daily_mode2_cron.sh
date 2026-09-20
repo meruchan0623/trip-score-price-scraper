@@ -278,7 +278,7 @@ print('merged ok')
 if [ ! -f "$MERGED_XLSX" ] || [ ! -s "$MERGED_XLSX" ]; then
     fatal "merged xlsx missing or empty: $MERGED_XLSX" 1
 fi
-if ! "$PYTHON" "$VENDOR_STABILIZER" "$MERGED_XLSX" >&2; then
+if ! "$PYTHON" "$VENDOR_STABILIZER" "$MERGED_XLSX" --require-attribution >&2; then
     fatal "厂商归属整理失败，厂商列仍为「手动输入」，已阻止投递"
 fi
 
