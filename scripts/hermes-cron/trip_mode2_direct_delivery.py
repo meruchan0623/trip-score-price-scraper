@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -146,50 +147,142 @@ def _report_date(path: Path) -> str:
         return datetime.now().strftime("%Y-%m-%d")
 
 
-def promo_message(today: Path, previous: Path | None) -> str:
-    """List products/sites whose actual discount percentage set changed."""
+SITE_CODES = (("HK", "H"), ("TW", "T"), ("JP", "J"), ("TH", "A"), ("VN", "V"), ("RU", "R"))
+SITE_CODE = dict(SITE_CODES)
+SITE_ORDER = {code: index for index, (_site, code) in enumerate(SITE_CODES)}
+VENDOR_CODE = {"BC": "B", "TGT": "G", "FR": "F", "JY": "Y", "TSIM 網址": "S", "其他": "O", "BC/TGT": "BG"}
+# One Telegram text message is capped at 4096 characters; stay below it so a
+# daily report is never split into a flood of messages.
+SINGLE_MESSAGE_LIMIT = 3750
+# Room kept for the closing "未列示 …" line so the final message never exceeds
+# the budget because of its own tail.
+TAIL_RESERVE = 80
+LEGEND = (
+    "缩写：站点 " + " ".join(f"{code}={site}" for site, code in SITE_CODES) +
+    "｜厂商 " + " ".join(f"{code}={name}" for name, code in VENDOR_CODE.items()) +
+    "｜折扣 5+50=5%&50%，- 表示无折扣"
+)
+
+
+def _discount_code(values: tuple[int, ...]) -> str:
+    return "+".join(str(value) for value in values) if values else "-"
+
+
+def _site_code(site: str) -> str:
+    return SITE_CODE.get(site.upper(), "?")
+
+
+def _vendor_code(name: str) -> str:
+    return VENDOR_CODE.get(name.strip(), "?")
+
+
+def _transition_lines(current, previous, today, limit: int) -> str:
+    """Render one compact single-message report, ordered by business priority.
+
+    Every line is `产品ID｜厂商｜站点｜旧折扣→新折扣`. Sections are emitted in
+    priority order (撤销 → 力度变化 → 新增) and the renderer stops as soon as the
+    next line would exceed the message budget, so the most actionable rows are
+    always the ones that survive. Raw localized promotion labels stay in the
+    companion workbook; this message never repeats them.
+    """
     from collections import defaultdict
 
-    current = tags(today)
-    yesterday = tags(previous) if previous else {}
     changes: dict[str, dict[tuple[tuple[int, ...], tuple[int, ...]], set[str]]] = defaultdict(
         lambda: defaultdict(set)
     )
-
-    for key in sorted(set(current) | set(yesterday)):
+    for key in sorted(set(current) | set(previous)):
         pid, site = key
-        now = current.get(key, ("", "", ""))
-        old = yesterday.get(key, ("", "", ""))
-        now_label = now[0] if now else ""
-        old_label = old[0] if old else ""
-        now_sig, old_sig = discount_signature(now_label), discount_signature(old_label)
+        now_label = current.get(key, ("", "", ""))[0]
+        old_label = previous.get(key, ("", "", ""))[0]
+        now_sig = discount_signature(now_label)
+        old_sig = discount_signature(old_label)
         if now_sig != old_sig:
             changes[pid][(old_sig, now_sig)].add(site)
 
-    lines = [
-        f"📊 携程 Mode2 六站促销标签变化｜{_report_date(today)}",
-        f"变化产品：{len(changes)} 个",
-    ]
-    if not changes:
-        lines.append("无实际促销折扣变化（仅文案或语言变化不计）。")
-        return "\n".join(lines)
-
-    lines.append("")
-    order = {site: i for i, site in enumerate(("HK", "TW", "JP", "TH", "VN", "RU"))}
-    for pid in sorted(changes, key=lambda value: (not value.isdigit(), int(value) if value.isdigit() else value)):
-        name = _product_name(pid, current, yesterday)
-        vendor = _product_vendor(pid, current, yesterday)
-        transitions = sorted(changes[pid].items(), key=lambda item: (item[0], sorted(item[1])))
-        for index, ((old_sig, now_sig), sites) in enumerate(transitions):
-            site_text = "/".join(sorted(sites, key=lambda site: order.get(site, 99)))
-            product_text = f"{pid}｜{name}｜{vendor}" if index == 0 else f"{pid}｜{name}｜{vendor}（续）"
-            old_labels = [yesterday.get((pid, site), ("", "", ""))[0] for site in sites]
-            new_labels = [current.get((pid, site), ("", "", ""))[0] for site in sites]
-            lines.append(
-                f"• {product_text}｜{site_text}｜{discount_text(old_sig)} → {discount_text(now_sig)}"
-                f"｜标签：{_promo_label_text(old_labels)} → {_promo_label_text(new_labels)}"
+    rows = []
+    changed_pairs: set[tuple[str, str]] = set()
+    for pid, transitions in changes.items():
+        vendor = _vendor_code(_product_vendor(pid, current, previous))
+        for (old_sig, now_sig), sites in transitions.items():
+            changed_pairs.update((pid, site) for site in sites)
+            codes = sorted(_site_code(site) for site in sites)
+            site_text = "".join(sorted(codes, key=lambda code: SITE_ORDER.get(code, 99)))
+            rows.append(
+                {
+                    "pid": pid,
+                    "vendor": vendor,
+                    "sites": site_text,
+                    "site_count": len(sites),
+                    "transition": f"{_discount_code(old_sig)}→{_discount_code(now_sig)}",
+                    "kind": "lost" if not now_sig else ("gain" if not old_sig else "shift"),
+                }
             )
+
+    by_kind = defaultdict(list)
+    for row in rows:
+        by_kind[row["kind"]].append(row)
+    for group in by_kind.values():
+        # Widest reach first, then product ID for stable, reproducible output.
+        group.sort(key=lambda row: (-row["site_count"], not row["pid"].isdigit(), int(row["pid"]) if row["pid"].isdigit() else row["pid"]))
+
+    # Site counts are changed (product, site) pairs, so a product changing on
+    # three sites is counted once per site, not once per product.
+    site_counts = Counter(site for _pid, site in changed_pairs)
+    vendor_counts = Counter(_vendor_code(_product_vendor(pid, current, previous)) for pid in changes)
+
+    header = [
+        f"📊 携程 Mode2 六站促销标签变化｜{_report_date(today)}",
+        f"变化 {len(changes)} 产品／{len(rows)} 处：撤销 {len(by_kind['lost'])}｜力度变化 {len(by_kind['shift'])}｜新增 {len(by_kind['gain'])}",
+        "站点 " + " ".join(
+            f"{_site_code(site)}{site_counts.get(site, 0)}"
+            for site in sorted(site_counts, key=lambda s: SITE_ORDER.get(_site_code(s), 99))
+        ),
+        "厂商 " + " ".join(
+            f"{code}{vendor_counts[code]}" for code in VENDOR_CODE.values() if vendor_counts.get(code)
+        ),
+        LEGEND,
+        "",
+    ]
+    if not rows:
+        return "\n".join(header[:3]) + "\n无实际促销折扣变化（仅文案或语言变化不计）。"
+
+    sections = [
+        ("▼撤销折扣", "lost", "撤销"),
+        ("▼力度变化", "shift", "力度"),
+        ("▼新增折扣", "gain", "新增"),
+    ]
+    lines = list(header)
+    omitted = {}
+    budget_stop = False
+    row_budget = max(limit - TAIL_RESERVE, len("\n".join(header)))
+    for title, kind, label in sections:
+        group = by_kind.get(kind) or []
+        if not group:
+            omitted[label] = 0
+            continue
+        lines.append(f"{title} {len(group)}")
+        shown = 0
+        for row in group:
+            line = f"{row['pid']}｜{row['vendor']}｜{row['sites']}｜{row['transition']}"
+            if budget_stop or sum(len(item) + 1 for item in lines) + len(line) + 1 > row_budget:
+                budget_stop = True
+                break
+            lines.append(line)
+            shown += 1
+        omitted[label] = len(group) - shown
+
+    hidden = sum(omitted.values())
+    if hidden:
+        detail = "｜".join(f"{label} {count}" for label, count in omitted.items() if count)
+        lines.append(f"（未列示 {hidden} 处：{detail}；完整明细见同日 XLSX 的「总促销标签」标红行）")
     return "\n".join(lines)
+
+
+def promo_message(today: Path, previous: Path | None, limit: int = SINGLE_MESSAGE_LIMIT) -> str:
+    """Build the compact single-message promotion-change report."""
+    current = tags(today)
+    yesterday = tags(previous) if previous else {}
+    return _transition_lines(current, yesterday, today, limit)
 
 
 def main() -> int:
@@ -241,10 +334,14 @@ def main() -> int:
         baseline = xlsx_in(ROOT / f"{yesterday}-mode2-daily")
         if baseline:
             message = promo_message(output, baseline)
-            chunks = split_plaintext(message)
-            for index, chunk in enumerate(chunks, start=1):
-                prefix = f"（{index}/{len(chunks)}）\n" if len(chunks) > 1 else ""
-                send(prefix + chunk)
+            if len(message) <= 4000:
+                send(message)
+                chunks = [message]
+            else:
+                # Safety valve only: the renderer is budgeted for one message.
+                chunks = split_plaintext(message)
+                for index, chunk in enumerate(chunks, start=1):
+                    send(f"（{index}/{len(chunks)}）\n{chunk}")
             promo_done.write_text(json.dumps({
                 "reported_at": datetime.now().isoformat(),
                 "target": TARGET,
