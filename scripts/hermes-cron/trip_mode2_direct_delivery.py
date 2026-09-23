@@ -90,7 +90,9 @@ def discount_signature(label: str) -> tuple[int, ...]:
     import re
     # Trip's total-promo text is localized, but percentage discounts are stable.
     # Do not treat title/product-info wording changes as a promotion change.
-    return tuple(sorted({int(value) for value in re.findall(r"(?<!\d)(\d{1,2})\s*%", label)}))
+    # Up to three digits: a 100%-off label must not be silently dropped by a
+    # two-digit-only pattern (it would look identical to "no promotion").
+    return tuple(sorted({int(value) for value in re.findall(r"(?<![\d.])(\d{1,3})\s*%", label)}))
 
 
 def discount_text(values: tuple[int, ...]) -> str:
@@ -147,20 +149,30 @@ def _report_date(path: Path) -> str:
         return datetime.now().strftime("%Y-%m-%d")
 
 
-SITE_CODES = (("HK", "H"), ("TW", "T"), ("JP", "J"), ("TH", "A"), ("VN", "V"), ("RU", "R"))
-SITE_CODE = dict(SITE_CODES)
-SITE_ORDER = {code: index for index, (_site, code) in enumerate(SITE_CODES)}
-VENDOR_CODE = {"BC": "B", "TGT": "G", "FR": "F", "JY": "Y", "TSIM 網址": "S", "其他": "O", "BC/TGT": "BG"}
-# One Telegram text message is capped at 4096 characters; stay below it so a
-# daily report is never split into a flood of messages.
-SINGLE_MESSAGE_LIMIT = 3750
-# Room kept for the closing "未列示 …" line so the final message never exceeds
-# the budget because of its own tail.
-TAIL_RESERVE = 80
-LEGEND = (
-    "缩写：站点 " + " ".join(f"{code}={site}" for site, code in SITE_CODES) +
-    "｜厂商 " + " ".join(f"{code}={name}" for name, code in VENDOR_CODE.items()) +
-    "｜折扣 5+50=5%&50%，- 表示无折扣"
+SITES = ("HK", "TW", "JP", "TH", "VN", "RU")
+SITE_ORDER = {site: index for index, site in enumerate(SITES)}
+# One Telegram text message is capped at 4096 characters; keep a safety margin
+# so a daily report never exceeds two messages and never gets clipped.
+MESSAGE_LIMIT = 3750
+SINGLE_MESSAGE_LIMIT = MESSAGE_LIMIT  # backwards-compatible alias
+MAX_MESSAGES = 2
+# Room kept for the "（1/2）" page prefix added when two messages are sent.
+PAGE_PREFIX_RESERVE = 8
+# Room kept on every page for a worst-case omission tail: without it a page can
+# be filled edge to edge and the closing "（未列示 …）" line would have nowhere
+# to go, so the reader would never learn that rows were left out.
+OMISSION_TAIL_RESERVE = 90
+VENDOR_PREFIX = "▪ "
+ROW_FORMAT = (
+    "行格式：▪ 厂商名 下每行 站点/站点｜旧折扣→新折扣｜产品ID,…"
+    "（站点 HK/TW/JP/TH/VN/RU；折扣码 5+50 表示 5% 与 50% 两项折扣，- 表示无折扣；"
+    "同厂商/同站点/同折扣变化合并为一行）"
+)
+XLSX_HINT = "完整明细见同日 XLSX 的「总促销标签」标红行"
+SECTIONS = (
+    ("▼撤销折扣", "lost", "撤销"),
+    ("▼力度变化", "shift", "力度"),
+    ("▼新增折扣", "gain", "新增"),
 )
 
 
@@ -168,22 +180,21 @@ def _discount_code(values: tuple[int, ...]) -> str:
     return "+".join(str(value) for value in values) if values else "-"
 
 
-def _site_code(site: str) -> str:
-    return SITE_CODE.get(site.upper(), "?")
+def _site_text(sites) -> str:
+    """Render a site set as slash-separated two-letter codes, e.g. `HK/VN/RU`."""
+    return "/".join(sorted((site.upper() for site in sites), key=lambda s: SITE_ORDER.get(s, 99)))
 
 
-def _vendor_code(name: str) -> str:
-    return VENDOR_CODE.get(name.strip(), "?")
+def _pid_sort_key(pid: str):
+    return (not pid.isdigit(), int(pid) if pid.isdigit() else pid)
 
 
-def _transition_lines(current, previous, today, limit: int) -> str:
-    """Render one compact single-message report, ordered by business priority.
+def _change_groups(current, previous):
+    """Collapse discount-signature changes into compact groups.
 
-    Every line is `产品ID｜厂商｜站点｜旧折扣→新折扣`. Sections are emitted in
-    priority order (撤销 → 力度变化 → 新增) and the renderer stops as soon as the
-    next line would exceed the message budget, so the most actionable rows are
-    always the ones that survive. Raw localized promotion labels stay in the
-    companion workbook; this message never repeats them.
+    Returns (changes, rows, groups, changed_pairs): `changes` maps product →
+    transitions, `rows` counts (product, transition) pairs per kind, `groups`
+    maps kind → group dicts keyed by (vendor name, site set, old→new).
     """
     from collections import defaultdict
 
@@ -192,97 +203,168 @@ def _transition_lines(current, previous, today, limit: int) -> str:
     )
     for key in sorted(set(current) | set(previous)):
         pid, site = key
-        now_label = current.get(key, ("", "", ""))[0]
-        old_label = previous.get(key, ("", "", ""))[0]
-        now_sig = discount_signature(now_label)
-        old_sig = discount_signature(old_label)
+        now_sig = discount_signature(current.get(key, ("", "", ""))[0])
+        old_sig = discount_signature(previous.get(key, ("", "", ""))[0])
         if now_sig != old_sig:
             changes[pid][(old_sig, now_sig)].add(site)
 
-    rows = []
+    grouped: dict[str, dict[tuple[str, str, str], list[str]]] = defaultdict(lambda: defaultdict(list))
+    rows: Counter = Counter()
     changed_pairs: set[tuple[str, str]] = set()
     for pid, transitions in changes.items():
-        vendor = _vendor_code(_product_vendor(pid, current, previous))
+        vendor = _product_vendor(pid, current, previous)
         for (old_sig, now_sig), sites in transitions.items():
             changed_pairs.update((pid, site) for site in sites)
-            codes = sorted(_site_code(site) for site in sites)
-            site_text = "".join(sorted(codes, key=lambda code: SITE_ORDER.get(code, 99)))
-            rows.append(
+            kind = "lost" if not now_sig else ("gain" if not old_sig else "shift")
+            transition = f"{_discount_code(old_sig)}→{_discount_code(now_sig)}"
+            grouped[kind][(vendor, _site_text(sites), transition)].append(pid)
+            rows[kind] += 1
+
+    groups: dict[str, list[dict]] = {}
+    for kind, members in grouped.items():
+        items = []
+        for (vendor, sites, transition), pids in members.items():
+            pids = sorted(pids, key=_pid_sort_key)
+            items.append(
                 {
-                    "pid": pid,
+                    "kind": kind,
                     "vendor": vendor,
-                    "sites": site_text,
-                    "site_count": len(sites),
-                    "transition": f"{_discount_code(old_sig)}→{_discount_code(now_sig)}",
-                    "kind": "lost" if not now_sig else ("gain" if not old_sig else "shift"),
+                    "sites": sites,
+                    "transition": transition,
+                    "pids": pids,
+                    "line": f"{sites}｜{transition}｜{','.join(pids)}",
                 }
             )
+        # Vendors stay together under one heading; inside a vendor the widest
+        # reach comes first, then the biggest group, then a stable text order.
+        items.sort(
+            key=lambda g: (g["vendor"], -g["sites"].count("/"), -len(g["pids"]), g["sites"], g["transition"])
+        )
+        groups[kind] = items
+    return changes, rows, groups, changed_pairs
 
-    by_kind = defaultdict(list)
-    for row in rows:
-        by_kind[row["kind"]].append(row)
-    for group in by_kind.values():
-        # Widest reach first, then product ID for stable, reproducible output.
-        group.sort(key=lambda row: (-row["site_count"], not row["pid"].isdigit(), int(row["pid"]) if row["pid"].isdigit() else row["pid"]))
 
+def _omission_tail(omitted: dict[str, list[dict]]) -> str:
+    group_count = sum(len(items) for items in omitted.values())
+    pids = {pid for items in omitted.values() for group in items for pid in group["pids"]}
+    detail = "；".join(f"{label} {len(items)} 组" for label, items in omitted.items() if items)
+    return f"（未列示 {group_count} 组／{len(pids)} 个产品ID：{detail}；{XLSX_HINT}）"
+
+
+def _transition_messages(current, previous, today, limit: int) -> list[str]:
+    """Render at most two compact messages, ordered by business priority.
+
+    Under each section every vendor gets one `▪ <exact vendor name>` heading
+    followed by rows `站点/站点｜旧折扣→新折扣｜产品ID,…`; products sharing
+    vendor, site set and discount transition are merged into one row so a day
+    with hundreds of changes still fits. Sections are emitted in priority
+    order (撤销 → 力度变化 → 新增), messages split only at whole-group
+    boundaries, and a second message carries its own continuation header and
+    row-format line (section and vendor headings are repeated there). If even
+    two messages cannot hold every group, the second message closes with the
+    exact omitted group / product-ID counts; a third message is never
+    produced. Raw localized promotion labels stay in the workbook.
+    """
+    changes, rows, groups, changed_pairs = _change_groups(current, previous)
+    title = f"📊 携程 Mode2 六站促销标签变化｜{_report_date(today)}"
     # Site counts are changed (product, site) pairs, so a product changing on
     # three sites is counted once per site, not once per product.
     site_counts = Counter(site for _pid, site in changed_pairs)
-    vendor_counts = Counter(_vendor_code(_product_vendor(pid, current, previous)) for pid in changes)
-
-    header = [
-        f"📊 携程 Mode2 六站促销标签变化｜{_report_date(today)}",
-        f"变化 {len(changes)} 产品／{len(rows)} 处：撤销 {len(by_kind['lost'])}｜力度变化 {len(by_kind['shift'])}｜新增 {len(by_kind['gain'])}",
-        "站点 " + " ".join(
-            f"{_site_code(site)}{site_counts.get(site, 0)}"
-            for site in sorted(site_counts, key=lambda s: SITE_ORDER.get(_site_code(s), 99))
+    vendor_counts = Counter(_product_vendor(pid, current, previous) for pid in changes)
+    tallies = [
+        f"变化 {len(changes)} 产品／{sum(rows.values())} 处：撤销 {rows['lost']}｜力度变化 {rows['shift']}｜新增 {rows['gain']}",
+        "站点 " + "｜".join(
+            f"{site} {site_counts[site]}" for site in sorted(site_counts, key=lambda s: SITE_ORDER.get(s, 99))
         ),
-        "厂商 " + " ".join(
-            f"{code}{vendor_counts[code]}" for code in VENDOR_CODE.values() if vendor_counts.get(code)
-        ),
-        LEGEND,
-        "",
+        "厂商 " + "｜".join(f"{name} {count}" for name, count in sorted(vendor_counts.items())),
     ]
-    if not rows:
-        return "\n".join(header[:3]) + "\n无实际促销折扣变化（仅文案或语言变化不计）。"
+    header = [title, *tallies, ROW_FORMAT, ""]
+    if not changes:
+        return ["\n".join([title, *tallies]) + "\n无实际促销折扣变化（仅文案或语言变化不计）。\n"]
 
-    sections = [
-        ("▼撤销折扣", "lost", "撤销"),
-        ("▼力度变化", "shift", "力度"),
-        ("▼新增折扣", "gain", "新增"),
-    ]
-    lines = list(header)
-    omitted = {}
-    budget_stop = False
-    row_budget = max(limit - TAIL_RESERVE, len("\n".join(header)))
-    for title, kind, label in sections:
-        group = by_kind.get(kind) or []
-        if not group:
-            omitted[label] = 0
+    # A second message repeats the whole header (title marked 续) plus the same
+    # row-format line, so a page read on its own still explains its own rows.
+    continuation = [f"{title}（续）", *tallies, ROW_FORMAT, ""]
+    budget = limit - PAGE_PREFIX_RESERVE - OMISSION_TAIL_RESERVE
+    labels = {kind: label for _title, kind, label in SECTIONS}
+
+    # Each page is a list of (text, group_or_None) so overflow handling can pop
+    # whole groups, never partial lines.
+    pages: list[list[tuple[str, dict | None]]] = [[(line, None) for line in header]]
+
+    def size(page) -> int:
+        # Including the trailing newline every rendered message ends with.
+        return sum(len(text) + 1 for text, _group in page)
+
+    def fits(page, *texts) -> bool:
+        return size(page) + sum(len(text) + 1 for text in texts) <= budget
+
+    def place(page, texts, group) -> None:
+        page.extend((text, group if text is group["line"] else None) for text in texts)
+
+    omitted: dict[str, list[dict]] = {label: [] for _title, _kind, label in SECTIONS}
+    overflow = False
+    for section_title, kind, label in SECTIONS:
+        items = groups.get(kind) or []
+        if not items:
             continue
-        lines.append(f"{title} {len(group)}")
-        shown = 0
-        for row in group:
-            line = f"{row['pid']}｜{row['vendor']}｜{row['sites']}｜{row['transition']}"
-            if budget_stop or sum(len(item) + 1 for item in lines) + len(line) + 1 > row_budget:
-                budget_stop = True
-                break
-            lines.append(line)
-            shown += 1
-        omitted[label] = len(group) - shown
+        heading: str | None = f"{section_title} {rows[kind]} 处／{len(items)} 组"
+        vendor: str | None = None
+        for group in items:
+            if overflow:
+                # Once a group no longer fits, everything after it in priority
+                # order is omitted too, so the shown prefix is always the most
+                # actionable part of the day.
+                omitted[label].append(group)
+                continue
+            page = pages[-1]
+            vendor_line = f"{VENDOR_PREFIX}{group['vendor']}"
+            texts = (
+                ([heading] if heading else [])
+                + ([vendor_line] if group["vendor"] != vendor else [])
+                + [group["line"]]
+            )
+            if fits(page, *texts):
+                place(page, texts, group)
+                heading, vendor = None, group["vendor"]
+                continue
+            if len(pages) < MAX_MESSAGES:
+                page = [(line, None) for line in continuation]
+                pages.append(page)
+                # A new message repeats the section and vendor headings so
+                # every row stays readable on its own.
+                texts = [heading if heading else f"{section_title}（续）", vendor_line, group["line"]]
+                if fits(page, *texts):
+                    place(page, texts, group)
+                    heading, vendor = None, group["vendor"]
+                    continue
+            overflow = True
+            omitted[label].append(group)
 
-    hidden = sum(omitted.values())
-    if hidden:
-        detail = "｜".join(f"{label} {count}" for label, count in omitted.items() if count)
-        lines.append(f"（未列示 {hidden} 处：{detail}；完整明细见同日 XLSX 的「总促销标签」标红行）")
-    return "\n".join(lines)
+    if any(omitted.values()):
+        # The tail must sit on the last message; drop trailing whole groups
+        # until it fits, counting each of them as omitted too.
+        last = pages[-1]
+        while not fits(last, _omission_tail(omitted)):
+            _text, group = last.pop()
+            if group is not None:
+                omitted[labels[group["kind"]]].insert(0, group)
+        # Never leave a section or vendor heading dangling above the tail.
+        while last and last[-1][1] is None and last[-1][0].startswith(("▼", VENDOR_PREFIX)):
+            last.pop()
+        last.append((_omission_tail(omitted), None))
+
+    messages = ["\n".join(text for text, _group in page) + "\n" for page in pages]
+    if len(messages) > 1:
+        messages = [f"（{index}/{len(messages)}）\n{text}" for index, text in enumerate(messages, start=1)]
+    return messages
 
 
-def promo_message(today: Path, previous: Path | None, limit: int = SINGLE_MESSAGE_LIMIT) -> str:
-    """Build the compact single-message promotion-change report."""
+def promo_messages(today: Path, previous: Path | None, limit: int = MESSAGE_LIMIT) -> list[str]:
+    """Build the compact promotion-change report as one or two messages."""
     current = tags(today)
     yesterday = tags(previous) if previous else {}
-    return _transition_lines(current, yesterday, today, limit)
+    return _transition_messages(current, yesterday, today, limit)
 
 
 def main() -> int:
@@ -333,20 +415,17 @@ def main() -> int:
     if force or not promo_done.exists():
         baseline = xlsx_in(ROOT / f"{yesterday}-mode2-daily")
         if baseline:
-            message = promo_message(output, baseline)
-            if len(message) <= 4000:
-                send(message)
-                chunks = [message]
-            else:
-                # Safety valve only: the renderer is budgeted for one message.
-                chunks = split_plaintext(message)
-                for index, chunk in enumerate(chunks, start=1):
-                    send(f"（{index}/{len(chunks)}）\n{chunk}")
+            # The renderer already bounds the report to at most two whole-group
+            # pages (prefixed "（1/2）"/"（2/2）"); never re-split it with
+            # split_plaintext.
+            messages = promo_messages(output, baseline)
+            for text in messages:
+                send(text)
             promo_done.write_text(json.dumps({
                 "reported_at": datetime.now().isoformat(),
                 "target": TARGET,
-                "product_count": message.count("\n• "),
-                "chunks": len(chunks),
+                "messages": len(messages),
+                "chunks": len(messages),
             }))
     return 0
 

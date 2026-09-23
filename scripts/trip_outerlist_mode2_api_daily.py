@@ -7,10 +7,14 @@ import concurrent.futures as futures
 import json
 import math
 import os
+import random
 import re
+import shutil
 import signal
 import subprocess
+import threading
 import time
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -102,7 +106,7 @@ def nonnegative_float(value):
 def build_parser():
     parser = argparse.ArgumentParser()
     parser.set_defaults(mode2_workers_explicit=False)
-    parser.add_argument('--workers', type=positive_int, default=45)
+    parser.add_argument('--workers', type=positive_int, default=5)
     parser.add_argument('--sites', default='hk')
     parser.add_argument('--output-root', default=str(DEFAULT_ROOT))
     parser.add_argument('--baseline-workbook', help='指定兼容的 HK/六站 XLSX 作为本次销量和评分变化基线')
@@ -148,6 +152,14 @@ SAFE_RESULT_ERRORS = frozenset({
     'Mode2 recovery output missing',
     'Mode2 recovery workbook invalid',
     'Mode2 recovery incomplete; failed API rows remain',
+    # Risk-block handling is reported as fixed codes so the diagnostics survive
+    # the credential allowlist without carrying any free-form text.
+    'risk_circuit_opened',
+    'risk_cooldown_retry_applied',
+    'risk_block_persists_after_cooldown',
+    'mode2_recovery_skipped_risk_block',
+    'browser_recovery_applied',
+    'browser_recovery_failed',
 })
 SAFE_EXCEPTION_TYPE = re.compile(r'^exception_type=[A-Za-z_][A-Za-z0-9_]*$')
 
@@ -322,8 +334,290 @@ def brief_info(add_infos):
     return ' '.join(result)
 
 
+API_REQUEST_INTERVAL_PER_WORKER_SEC = 0.25
+API_PACING_JITTER_SEC = 0.1
+API_RISK_BACKOFF_JITTER_SEC = 0.25
+API_RISK_BACKOFF_MAX_SEC = 30
+# Risk circuit breaker: when the endpoint is being blocked wholesale (HTTP 430 /
+# WhaleGuard), continuing to retry every product burns the whole run budget and
+# the run ends as an opaque cron timeout instead of a reported failure. Stop
+# issuing requests once the block is clearly systemic, then re-probe once after a
+# cool-down, because these windows are usually short-lived.
+RISK_CIRCUIT_MIN_CONSECUTIVE = 12
+RISK_CIRCUIT_MIN_SAMPLES = 30
+RISK_CIRCUIT_RATIO = 0.6
+API_RETRY_COOLDOWN_SEC = 120
+API_RETRY_INTERVAL_PER_WORKER_SEC = 1.2
+RISK_NOTE_MARKERS = ('430', 'whaleguard', 'risk challenge')
+FRONTEND_USER_AGENT = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+                       'AppleWebKit/537.36 (KHTML, like Gecko) '
+                       'Chrome/140.0.0.0 Safari/537.36')
+
+
+class ApiRequestPacer:
+    """Serialize request starts at a rate that scales down as workers increase."""
+
+    def __init__(self, workers):
+        self.interval = API_REQUEST_INTERVAL_PER_WORKER_SEC * workers
+        self.next_request_at = 0.0
+        self.lock = threading.Lock()
+
+    def wait(self):
+        with self.lock:
+            now = time.monotonic()
+            delay = max(0.0, self.next_request_at - now)
+            if delay:
+                time.sleep(delay)
+                now += delay
+            self.next_request_at = now + self.interval + random.uniform(0, API_PACING_JITTER_SEC)
+
+
+def is_risk_block(exc):
+    if isinstance(exc, urllib.error.HTTPError) and exc.code == 430:
+        return True
+    if isinstance(exc, urllib.error.HTTPError):
+        try:
+            return 'whaleguard' in exc.read().decode('utf-8', errors='ignore').lower()
+        except Exception:
+            pass
+    return 'whaleguard' in text(exc).lower()
+
+
+def note_is_risk_block(note):
+    lowered = text(note).lower()
+    return any(marker in lowered for marker in RISK_NOTE_MARKERS)
+
+
+def failure_row(site, locale, currency, product_id, vendor, note):
+    """Build the same failure shape `fetch` returns, without any request."""
+    return {
+        '厂商': vendor,
+        '商品ID': product_id,
+        'URL': f'https://{site}.trip.com/things-to-do/detail/{product_id}/?curr={currency}&locale={locale}',
+        '抓取备注': note,
+    }
+
+
+class RiskCircuitBreaker:
+    """Open the circuit when the API is being risk-blocked wholesale.
+
+    A blocked window (HTTP 430 / WhaleGuard) is systemic, not per-product:
+    retrying every remaining product multiplies the same rejection and turns the
+    run into an opaque timeout. Once the circuit opens, callers stop issuing
+    requests and the run re-probes once after a cool-down.
+    """
+
+    def __init__(self, min_consecutive=RISK_CIRCUIT_MIN_CONSECUTIVE,
+                 min_samples=RISK_CIRCUIT_MIN_SAMPLES, ratio=RISK_CIRCUIT_RATIO):
+        self.min_consecutive = min_consecutive
+        self.min_samples = min_samples
+        self.ratio = ratio
+        self.lock = threading.Lock()
+        self.samples = 0
+        self.risk_blocks = 0
+        self.consecutive = 0
+        self.opened = False
+
+    def record(self, blocked):
+        with self.lock:
+            if self.opened:
+                return
+            self.samples += 1
+            if blocked:
+                self.risk_blocks += 1
+                self.consecutive += 1
+            else:
+                self.consecutive = 0
+            if self.consecutive >= self.min_consecutive or (
+                self.samples >= self.min_samples and self.risk_blocks / self.samples >= self.ratio
+            ):
+                self.opened = True
+
+    def reset(self):
+        with self.lock:
+            self.samples = 0
+            self.risk_blocks = 0
+            self.consecutive = 0
+            self.opened = False
+
+    def summary(self):
+        with self.lock:
+            return f'samples={self.samples} risk_blocks={self.risk_blocks} opened={self.opened}'
+
+
+BROWSER_RECOVERY_INTERVAL_MS = 700
+BROWSER_RECOVERY_TIMEOUT_SEC = 1500
+# The blocked endpoint answers HTTP 200 for an in-page same-origin fetch from a
+# logged-in browser session while the plain HTTP client gets HTTP 430, so blocked
+# rows are recovered through the browser session before giving up on the day.
+BROWSER_RECOVERY_JS = r"""
+const fs = await import("node:fs");
+// Values are injected into the script text: ego-browser's nodejs runner does not
+// forward the parent process env, so process.env lookups come back undefined.
+const idsPath = __IDS_PATH__;
+const outPath = __OUT_PATH__;
+const site = __SITE__;
+const locale = __LOCALE__;
+const currency = __CURRENCY__;
+const intervalMs = __INTERVAL_MS__;
+const ids = JSON.parse(fs.readFileSync(idsPath, "utf8"));
+const task = await taskSpace("Trip HK sales volume browser recovery");
+const page = task.page("p1");
+await page.goto(`https://${site}.trip.com/things-to-do/detail/${ids[0]}/`);
+await page.waitForLoadState();
+fs.writeFileSync(outPath, "");
+let ok = 0;
+let failed = 0;
+for (const id of ids) {
+  const payload = {
+    clientInfo: { currency, locale, pageId: "10650010429", channelId: 120, platformId: 26, oriSyscode: "09", syscode: "09" },
+    enviroment: "PROD",
+    searchParams: [{ id, idType: 1 }],
+    needBasicInfo: true, needCommentInfo: true, needSalesVolume: true, needAddInfos: true,
+    needResourceInfos: false, needPackageInfos: false, needMediaInfo: false, needVendorInfo: false, needTagInfos: false,
+  };
+  let record;
+  try {
+    const res = await page.fetch("/restapi/soa2/21052/getProductInfo", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+      timeout: 25000,
+    });
+    if (res.status === 200 && res.body) {
+      record = { id, data: JSON.parse(res.body) };
+      ok += 1;
+    } else {
+      record = { id, error: `status ${res.status}` };
+      failed += 1;
+    }
+  } catch (error) {
+    record = { id, error: String((error && error.message) || error) };
+    failed += 1;
+  }
+  fs.appendFileSync(outPath, JSON.stringify(record) + "\n");
+  await page.waitForTimeout(intervalMs);
+}
+await task.finish({ keep: [] });
+console.log(JSON.stringify({ ok, failed, out: outPath }));
+"""
+
+
+EGO_BROWSER_FALLBACK = Path.home() / '.local' / 'bin' / 'ego-browser'
+
+
+def ego_browser_binary():
+    found = shutil.which('ego-browser')
+    if found:
+        return found
+    if EGO_BROWSER_FALLBACK.exists():
+        return str(EGO_BROWSER_FALLBACK)
+    return ''
+
+
+def browser_recovery_runner(command, env, timeout):
+    result = subprocess.run(command, capture_output=True, text=True, timeout=timeout, env=env)
+    return result.returncode, result.stdout, result.stderr
+
+
+def run_browser_recovery(site, locale, currency, product_ids, workdir, runner=None):
+    """Fetch blocked product ids through the logged-in ego-browser session."""
+    ids_path = workdir / 'browser_recovery_ids.json'
+    out_path = workdir / 'browser_recovery_out.jsonl'
+    ids_path.write_text(json.dumps(list(product_ids)), encoding='utf-8')
+    if out_path.exists():
+        out_path.unlink()
+    binary = ego_browser_binary()
+    if not binary:
+        return {}, 'ego-browser unavailable'
+    env = dict(os.environ)
+    env['PATH'] = str(Path.home() / '.local' / 'bin') + os.pathsep + env.get('PATH', '')
+    env.update({
+        'TRIP_RECOVERY_IDS': str(ids_path),
+        'TRIP_RECOVERY_OUT': str(out_path),
+        'TRIP_RECOVERY_SITE': site,
+        'TRIP_RECOVERY_LOCALE': locale,
+        'TRIP_RECOVERY_CURRENCY': currency,
+        'TRIP_RECOVERY_INTERVAL_MS': str(BROWSER_RECOVERY_INTERVAL_MS),
+    })
+    runner = runner or browser_recovery_runner
+    try:
+        script = (
+            BROWSER_RECOVERY_JS
+            .replace('__IDS_PATH__', json.dumps(str(ids_path)))
+            .replace('__OUT_PATH__', json.dumps(str(out_path)))
+            .replace('__SITE__', json.dumps(site))
+            .replace('__LOCALE__', json.dumps(locale))
+            .replace('__CURRENCY__', json.dumps(currency))
+            .replace('__INTERVAL_MS__', str(BROWSER_RECOVERY_INTERVAL_MS))
+        )
+        code, stdout, stderr = runner([binary, 'nodejs', '-e', script], env, BROWSER_RECOVERY_TIMEOUT_SEC)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return {}, f'{type(exc).__name__}'
+    if not out_path.exists():
+        return {}, f'ego-browser exit {code}: {(stderr or stdout).strip()[-200:]}'
+    responses = {}
+    for line in out_path.read_text(encoding='utf-8').splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        product_id = text(record.get('id')).strip()
+        if product_id and isinstance(record.get('data'), dict):
+            responses[product_id] = record['data']
+    return responses, ''
+
+
+def browser_recovery_replacements(rows, site, locale, currency, workdir, runner=None):
+    """Rebuild parsed rows for blocked products via the browser-session fetch."""
+    items = {}
+    for row in rows:
+        product_id = text(row.get('商品ID')).strip()
+        if product_id:
+            items[product_id] = {'id': product_id, 'vendor': text(row.get('厂商')) or '未标注'}
+    if not items:
+        return {}, ''
+    responses, problem = run_browser_recovery(site, locale, currency, list(items), workdir, runner=runner)
+    replacements = {}
+    for product_id, data in responses.items():
+        try:
+            replacements[product_id] = row_from_api_response(data, product_id, items[product_id], site, currency, locale)
+        except Exception:
+            continue
+    return replacements, problem
+
+
+def row_from_api_response(data, product_id, item, site, currency, locale):
+    """Map one getProductInfo response body to a workbook row.
+
+    Shared by the HTTP client and the browser-session recovery path so both
+    validate the same way and never drift.
+    """
+    if data.get('ResponseStatus', {}).get('Ack') != 'Success':
+        errors = data.get('ResponseStatus', {}).get('Errors') or [{}]
+        raise RuntimeError(errors[0].get('Message', 'API failed'))
+    product = (data.get('productInfos') or [{}])[0]
+    if text(product.get('productId')) != product_id:
+        raise RuntimeError('returned product ID mismatch')
+    sales = product.get('salesVolume') or {}
+    comment = product.get('commentInfo') or {}
+    basic = product.get('basicInfo') or {}
+    # Total score is sourced from the public response commentInfo.commentScore, never the page DOM.
+    return {
+        '厂商': item['vendor'], '商品ID': product_id,
+        'URL': f'https://{site}.trip.com/things-to-do/detail/{product_id}/?curr={currency}&locale={locale}',
+        '商品名称': text(basic.get('productName')), '商品资讯': brief_info(product.get('addInfos')),
+        '月销量': text(sales.get('monthlySales')), '年销量': text(sales.get('yearlySales')), '总销量': text(sales.get('twoYearSales')),
+        '评价数': text(comment.get('commentCount')), '总分': text(comment.get('commentScore')),
+    }
+
+
 def fetch(site, locale, currency, item, api_retries=0, api_retry_interval_sec=0):
     product_id = item['id']
+    language = locale.split('-', 1)[0]
     payload = {
         'clientInfo': {'currency': currency, 'locale': locale, 'pageId': '10650010429', 'channelId': 120, 'platformId': 26, 'oriSyscode': '09', 'syscode': '09'},
         'enviroment': 'PROD',
@@ -335,7 +629,17 @@ def fetch(site, locale, currency, item, api_retries=0, api_retry_interval_sec=0)
     request = urllib.request.Request(
         f'https://{site}.trip.com/restapi/soa2/21052/getProductInfo',
         data=json.dumps(payload, separators=(',', ':')).encode(), method='POST',
-        headers={'Content-Type': 'application/json', 'Accept': 'application/json', 'Accept-Language': locale, 'User-Agent': 'Mozilla/5.0'},
+        headers={
+            'Content-Type': 'application/json',
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': f'{locale},{language};q=0.9,en;q=0.8',
+            'User-Agent': FRONTEND_USER_AGENT,
+            'Origin': f'https://{site}.trip.com',
+            'Referer': f'https://{site}.trip.com/things-to-do/detail/{product_id}/',
+            'sec-fetch-site': 'same-origin',
+            'sec-fetch-mode': 'cors',
+            'sec-fetch-dest': 'empty',
+        },
     )
     error = ''
     total_attempts = 3 + api_retries
@@ -343,27 +647,14 @@ def fetch(site, locale, currency, item, api_retries=0, api_retry_interval_sec=0)
         try:
             with urllib.request.urlopen(request, timeout=35) as response:
                 data = json.load(response)
-            if data.get('ResponseStatus', {}).get('Ack') != 'Success':
-                errors = data.get('ResponseStatus', {}).get('Errors') or [{}]
-                raise RuntimeError(errors[0].get('Message', 'API failed'))
-            product = (data.get('productInfos') or [{}])[0]
-            if text(product.get('productId')) != product_id:
-                raise RuntimeError('returned product ID mismatch')
-            sales = product.get('salesVolume') or {}
-            comment = product.get('commentInfo') or {}
-            basic = product.get('basicInfo') or {}
-            # Total score is sourced from the public response commentInfo.commentScore, never the page DOM.
-            return {
-                '厂商': item['vendor'], '商品ID': product_id,
-                'URL': f'https://{site}.trip.com/things-to-do/detail/{product_id}/?curr={currency}&locale={locale}',
-                '商品名称': text(basic.get('productName')), '商品资讯': brief_info(product.get('addInfos')),
-                '月销量': text(sales.get('monthlySales')), '年销量': text(sales.get('yearlySales')), '总销量': text(sales.get('twoYearSales')),
-                '评价数': text(comment.get('commentCount')), '总分': text(comment.get('commentScore')),
-            }
+            return row_from_api_response(data, product_id, item, site, currency, locale)
         except Exception as exc:
             error = f'{type(exc).__name__}: {exc}'
             if attempt < total_attempts - 1:
                 delay = api_retry_interval_sec or (1.5 * (attempt + 1))
+                if is_risk_block(exc):
+                    delay = min(API_RISK_BACKOFF_MAX_SEC, delay * (2 ** attempt))
+                    delay += random.uniform(0, API_RISK_BACKOFF_JITTER_SEC)
                 time.sleep(delay)
     return {'厂商': item['vendor'], '商品ID': product_id, 'URL': f'https://{site}.trip.com/things-to-do/detail/{product_id}/?curr={currency}&locale={locale}', '抓取备注': '接口请求失败：' + error}
 
@@ -425,14 +716,23 @@ def successful_collection_run(path):
 
 def previous_metrics(root, target_day):
     wanted = target_day - timedelta(days=1)
-    runs = [path for path in root.iterdir() if path.is_dir() and run_day(path) == wanted and successful_collection_run(path)]
-    if not runs:
-        return {}, None
-    run = max(runs, key=lambda path: (path / '.collection_done').stat().st_mtime)
-    books = sorted(run.glob('*_Trip_DailySalesVolume_FromOuterlist.xlsx'))
-    if not books:
-        return {}, None
-    return metrics_from_book(books[0]), run
+    candidates = []
+    for path in root.iterdir():
+        if not (path.is_dir() and run_day(path) == wanted and successful_collection_run(path)):
+            continue
+        books = sorted(path.glob('*_Trip_DailySalesVolume_FromOuterlist.xlsx'))
+        if books:
+            candidates.append((path, books))
+    for run, books in sorted(candidates, key=lambda item: (item[0] / '.collection_done').stat().st_mtime,
+                             reverse=True):
+        for book in books:
+            try:
+                metrics = metrics_from_book(book)
+            except (OSError, ValueError, openpyxl.utils.exceptions.InvalidFileException):
+                continue
+            if metrics:
+                return metrics, run
+    return {}, None
 
 
 def format_score_delta(current, previous):
@@ -519,6 +819,7 @@ MODE2_FIELDS = {
 MODE2_BUILD_TIMEOUT_SEC = 120
 MODE2_WORKER_TIMEOUT_SEC = 45 * 60
 MODE2_TERMINATE_GRACE_SEC = 5
+MODE2_BATCH_SIZE = 20
 
 
 def read_mode2_rows(path):
@@ -609,63 +910,67 @@ def run_mode2_recovery(run, failed_ids, workers):
 
     command_count = min(workers, len(failed_ids))
     chunks = [failed_ids[index::command_count] for index in range(command_count)]
-    jobs = []
+    worker_chunks = []
     for index, chunk in enumerate(chunks, start=1):
         worker_dir = work / ('worker-' + str(index))
         worker_dir.mkdir(parents=True, exist_ok=True)
-        urls_file = worker_dir / 'urls.txt'
-        urls_file.write_text(
-            ''.join('https://hk.trip.com/things-to-do/detail/' + product_id + '/\n' for product_id in chunk),
-            encoding='utf-8',
-        )
-        output = worker_dir / 'mode2.xlsx'
-        command = [
-            str(binary),
-            '-run-mode', 'mode2',
-            '-delay-profile', 'normal',
-            '-urls-file', str(urls_file),
-            '-output', str(output),
-            '-workers', '1',
-            '-no-headless',
-        ]
-        jobs.append((chunk, output, command))
+        worker_chunks.append((worker_dir, chunk))
+
+    def recover_worker(job):
+        worker_dir, worker_ids = job
+        worker_recovered, worker_errors = {}, []
+        for batch_index, batch in enumerate(
+                (worker_ids[offset:offset + MODE2_BATCH_SIZE]
+                 for offset in range(0, len(worker_ids), MODE2_BATCH_SIZE)), start=1):
+            output = worker_dir / f'mode2-batch-{batch_index}.xlsx'
+            urls_file = output.with_suffix('.urls.txt')
+            urls_file.write_text(
+                ''.join('https://hk.trip.com/things-to-do/detail/' + product_id + '/\n' for product_id in batch),
+                encoding='utf-8',
+            )
+            command = [
+                str(binary), '-run-mode', 'mode2', '-delay-profile', 'normal',
+                '-urls-file', str(urls_file), '-output', str(output), '-workers', '1', '-no-headless',
+            ]
+            return_code = _run_mode2_command(command, MODE2_WORKER_TIMEOUT_SEC)
+            if not output.is_file():
+                if return_code != 0:
+                    worker_errors.append('Mode2 recovery worker failed')
+                worker_errors.append('Mode2 recovery output missing')
+                continue
+            try:
+                mode2_rows = read_mode2_rows(output)
+            except Exception:
+                worker_errors.append('Mode2 recovery workbook invalid')
+                continue
+            for product_id in batch:
+                row = mode2_rows.get(product_id)
+                if (row is not None and not text(row.get('抓取备注')).strip()
+                        and has_mode2_recovery_payload(row)):
+                    worker_recovered[product_id] = row
+            if return_code != 0 and any(product_id not in worker_recovered for product_id in batch):
+                worker_errors.append('Mode2 recovery worker failed')
+        return worker_recovered, worker_errors
 
     with futures.ThreadPoolExecutor(max_workers=command_count) as pool:
-        return_codes = list(pool.map(
-            lambda job: _run_mode2_command(job[2], MODE2_WORKER_TIMEOUT_SEC),
-            jobs,
-        ))
+        worker_results = list(pool.map(recover_worker, worker_chunks))
 
     recovered = {}
     errors = []
-    for (chunk, output, _command), return_code in zip(jobs, return_codes):
-        if return_code != 0:
-            errors.append('Mode2 recovery worker failed')
-            continue
-        if not output.is_file():
-            errors.append('Mode2 recovery output missing')
-            continue
-        try:
-            rows = read_mode2_rows(output)
-        except Exception:
-            errors.append('Mode2 recovery workbook invalid')
-            continue
-        for product_id in chunk:
-            row = rows.get(product_id)
-            if (row is not None
-                    and not text(row.get('抓取备注')).strip()
-                    and has_mode2_recovery_payload(row)):
-                recovered[product_id] = row
+    for worker_recovered, worker_errors in worker_results:
+        recovered.update(worker_recovered)
+        errors.extend(worker_errors)
     return recovered, list(dict.fromkeys(errors))
 
 
 def has_mode2_recovery_payload(row):
     """Require scraped Mode2 data beyond echoed identifiers and status."""
-    return any(
+    has_payload = any(
         text(row.get(source)).strip()
         for source in MODE2_FIELDS
         if source not in {'商品ID', 'URL'}
     )
+    return has_payload and all(text(row.get(field)).strip() for field in ('月销量', '年销量', '总销量'))
 
 
 def merge_mode2_rows(rows, recovered):
@@ -746,22 +1051,107 @@ def main(argv=None):
         by_site = {site.upper(): [] for site, _, _ in selected}
         tasks = [(site, locale, currency, item) for site, locale, currency in selected for item in items]
 
-        def run_task(task):
+        breaker = RiskCircuitBreaker()
+        pacer = ApiRequestPacer(config.workers)
+
+        def run_task(task, active_pacer=pacer, active_breaker=breaker):
             site, locale, currency, item = task
+            if active_breaker.opened:
+                # Systemic rejection: skip the request instead of replaying it.
+                return site.upper(), failure_row(
+                    site, locale, currency, item['id'], item['vendor'],
+                    '接口请求失败：风控拦截（HTTP 430），已熔断跳过',
+                )
+            active_pacer.wait()
             row = fetch(
                 site, locale, currency, item,
                 api_retries=config.api_retries,
                 api_retry_interval_sec=config.api_retry_interval_sec,
             )
+            active_breaker.record(note_is_risk_block(row.get('抓取备注')))
             return site.upper(), row
 
-        with futures.ThreadPoolExecutor(max_workers=config.workers) as pool:
-            for site, row in pool.map(run_task, tasks):
-                by_site[site].append(row)
-                if not text(row.get('抓取备注')).strip():
-                    api_success_count += 1
+        def run_tasks(tasks_to_run, active_pacer, active_breaker):
+            if not tasks_to_run:
+                return []
+            with futures.ThreadPoolExecutor(max_workers=config.workers) as pool:
+                return list(pool.map(
+                    lambda target: run_task(target, active_pacer, active_breaker), tasks_to_run,
+                ))
+
+        for site, row in run_tasks(tasks, pacer, breaker):
+            by_site[site].append(row)
+            if not text(row.get('抓取备注')).strip():
+                api_success_count += 1
+
+        if breaker.opened:
+            result_errors.append('risk_circuit_opened')
 
         failures = failed_rows(by_site)
+        if failures and breaker.opened:
+            # One bounded re-probe: these blocks are usually short-lived, so a
+            # single slower round after a cool-down is worth it, but the run must
+            # never spend its whole budget replaying one rejection.
+            time.sleep(API_RETRY_COOLDOWN_SEC)
+            breaker.reset()
+            retry_pacer = ApiRequestPacer(config.workers)
+            retry_pacer.interval = API_RETRY_INTERVAL_PER_WORKER_SEC * max(1, config.workers)
+            failed_keys = {
+                (site, text(row.get('商品ID')).strip())
+                for site, rows in by_site.items()
+                for row in rows if text(row.get('抓取备注')).strip()
+            }
+            retry_tasks = [task for task in tasks if (task[0].upper(), task[3]['id']) in failed_keys]
+            replacements = {
+                (site, text(row.get('商品ID')).strip()): row
+                for site, row in run_tasks(retry_tasks, retry_pacer, breaker)
+            }
+            recovered_now = 0
+            for site, rows in by_site.items():
+                for index, row in enumerate(rows):
+                    replacement = replacements.get((site, text(row.get('商品ID')).strip()))
+                    if replacement is not None and not text(replacement.get('抓取备注')).strip():
+                        rows[index] = replacement
+                        recovered_now += 1
+            api_success_count += recovered_now
+            result_errors.append('risk_cooldown_retry_applied')
+            if breaker.opened:
+                result_errors.append('risk_block_persists_after_cooldown')
+            failures = failed_rows(by_site)
+
+        risk_failed_rows = [
+            row for rows in by_site.values() for row in rows
+            if note_is_risk_block(row.get('抓取备注'))
+        ]
+        if risk_failed_rows:
+            # The HTTP client is shield-blocked while an in-page same-origin
+            # fetch from the logged-in browser session answers HTTP 200.
+            recovered_browser = 0
+            recovery_problem = ''
+            for site, locale, currency in selected:
+                blocked = [
+                    row for row in by_site.get(site.upper(), [])
+                    if note_is_risk_block(row.get('抓取备注'))
+                ]
+                if not blocked:
+                    continue
+                replacements, problem = browser_recovery_replacements(blocked, site, locale, currency, run)
+                if problem:
+                    recovery_problem = problem
+                    continue
+                site_rows = by_site.get(site.upper(), [])
+                for index, row in enumerate(site_rows):
+                    replacement = replacements.get(text(row.get('商品ID')).strip())
+                    if replacement is not None and not text(replacement.get('抓取备注')).strip():
+                        site_rows[index] = replacement
+                        recovered_browser += 1
+            api_success_count += recovered_browser
+            if recovery_problem and not recovered_browser:
+                result_errors.append('browser_recovery_failed')
+            else:
+                result_errors.append('browser_recovery_applied')
+            failures = failed_rows(by_site)
+
         if failures and config.mode2_fallback != 'off':
             hk_rows = by_site.get('HK', [])
             failed_hk_ids = [
@@ -769,7 +1159,16 @@ def main(argv=None):
                 for row in hk_rows
                 if text(row.get('抓取备注')).strip()
             ]
-            if failed_hk_ids:
+            risk_blocked_hk = [
+                row for row in hk_rows
+                if text(row.get('抓取备注')).strip() and note_is_risk_block(row.get('抓取备注'))
+            ]
+            if failed_hk_ids and len(risk_blocked_hk) == len(failed_hk_ids):
+                # The browser Mode2 export carries rating fields but no sales
+                # volume, so it cannot satisfy this sales report; waiting on it
+                # only burns the run budget. Fail closed and say why.
+                result_errors.append('mode2_recovery_skipped_risk_block')
+            elif failed_hk_ids:
                 phase = 'mode2_recovery'
                 mode2_attempted = True
                 recovered, recovery_errors = run_mode2_recovery(
@@ -846,7 +1245,11 @@ def main(argv=None):
         raise
 
     if failures:
-        raise SystemExit('❌ Trip HK 商品销量接口抓取部分失败：' + str(len(failures)) + '\nMEDIA:' + str(output))
+        reason = '接口被盾拦截（HTTP 430）' if 'risk_circuit_opened' in result_errors else '接口返回异常'
+        raise SystemExit(
+            '❌ Trip HK 商品销量接口抓取部分失败：' + str(len(failures))
+            + f'（原因：{reason}）\nMEDIA:' + str(output)
+        )
     print(
         f'✅ Trip HK 商品销量与评分接口抓取完成｜{day.strftime("%Y年%m月%d日")}\n'
         f'Outerlist表：{len(persisted_outerlist)} 个去重商品｜HK接口记录：{len(items)}\n'
