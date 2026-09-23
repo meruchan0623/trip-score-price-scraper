@@ -2,8 +2,114 @@ package tripcdp
 
 import (
 	"os"
+	"strings"
 	"testing"
+
+	"github.com/go-rod/rod/lib/proto"
 )
+
+// Regression: the September 2026 headed HK runs had visible SKU controls but
+// batch_response_count=0. The promotion request is made during initial page
+// hydration, before SKU traversal installs its former hook, so it must be part
+// of the script registered with EvalOnNewDocument.
+func TestPromotionContentCaptureIncludesBatchPromotionBeforeNavigation(t *testing.T) {
+	for _, want := range []string{
+		"__tripCdpBatchPromotionResponses",
+		"/restapi/soa2/31644/batchSearchBookingSalesPromotion",
+	} {
+		if !strings.Contains(promotionContentCaptureJS, want) {
+			t.Fatalf("pre-navigation capture script missing %q", want)
+		}
+	}
+}
+
+// The headed 46011732 canary proved that the page-world fetch/XHR hook can be
+// empty even while the visible SKU UI is populated. Keep a CDP-session
+// diagnostic available so a worker/renamed endpoint cannot silently look like
+// a missing price response again.
+func TestNavigationMonitorRecordsBoundedSanitizedTripAPIResponses(t *testing.T) {
+	monitor := &navigationMonitor{}
+	monitor.recordAPIResponse("https://hk.trip.com/restapi/soa2/99999/newPriceEndpoint?token=secret", 200, proto.NetworkResourceTypeFetch)
+	monitor.recordAPIResponse("https://example.test/restapi/soa2/99999/nope", 200, proto.NetworkResourceTypeFetch)
+	got := monitor.apiSnapshot()
+	if len(got) != 1 {
+		t.Fatalf("observations = %#v, want one Trip API response", got)
+	}
+	if got[0].URL != "https://hk.trip.com/restapi/soa2/99999/newPriceEndpoint" || got[0].Status != 200 || got[0].Type != string(proto.NetworkResourceTypeFetch) {
+		t.Fatalf("observation = %#v", got[0])
+	}
+	for i := 0; i < maxObservedTripAPIResponses+3; i++ {
+		monitor.recordAPIResponse("https://hk.trip.com/restapi/soa2/1/a", 204, proto.NetworkResourceTypeXHR)
+	}
+	if got = monitor.apiSnapshot(); len(got) != maxObservedTripAPIResponses {
+		t.Fatalf("bounded observations = %d, want %d", len(got), maxObservedTripAPIResponses)
+	}
+}
+
+func TestProductPackageDiagnosticsRetainsBrowserWideEvidenceAfterMonitorCloses(t *testing.T) {
+	previous := productPackageDiagnostics{ObservedAPIResponses: []networkResponseObservation{{URL: "https://hk.trip.com/restapi/soa2/14580/getProductPriceCalendar", Status: 200, Type: "Fetch"}}}
+	latest := productPackageDiagnostics{NextDataPresent: true}
+	merged := mergeProductPackageDiagnostics(previous, latest)
+	if len(merged.ObservedAPIResponses) != 1 || merged.ObservedAPIResponses[0].Status != 200 {
+		t.Fatalf("browser-wide evidence was lost: %#v", merged)
+	}
+}
+
+func TestCapturedAPIResponsesMergeTrustedCDPBodiesWhenPageCaptureIsEmpty(t *testing.T) {
+	cdp := &navigationMonitor{}
+	cdp.recordCapturedAPIResponse("https://hk.trip.com/restapi/soa2/21052/getProductInfo?token=secret", 200, `{"productInfos":[{"basicInfo":{"packages":[{"packageId":11,"resourceIds":[101]}]}}]}`)
+	cdp.recordCapturedAPIResponse("https://hk.trip.com/restapi/soa2/14580/getProductPriceCalendar", 200, `{"data":{"packageInfos":[{"packageId":11,"resourceInfos":[{"resourceId":101}],"priceInfo":{"originalPrice":10,"price":8}}]}}`)
+
+	responses := mergeCapturedAPIResponses(nil, cdp.capturedAPISnapshot())
+	rows, coverage := parseCapturedAPISKUPrices(responses, "HKD", true)
+	if !coverage.usable() || len(rows) != 1 || rows[0]["real_price"] != "8" {
+		t.Fatalf("CDP body merge produced rows=%#v coverage=%#v", rows, coverage)
+	}
+	for _, response := range responses {
+		if strings.Contains(response.URL, "?") || strings.Contains(response.Text, "secret") {
+			t.Fatalf("captured response was not sanitized: %#v", response)
+		}
+	}
+}
+
+func TestNavigationMonitorReportsBoundedSanitizationRejectionWithoutBody(t *testing.T) {
+	monitor := &navigationMonitor{}
+	monitor.recordCapturedAPIResponse("https://hk.trip.com/restapi/soa2/21052/getProductInfo", 200, "not-json")
+	for i := 0; i < maxMonitorDiagnosticErrors+2; i++ {
+		monitor.recordCapturedAPIResponse("https://hk.trip.com/restapi/soa2/14580/getProductPriceCalendar", 200, "")
+	}
+	diagnostics := monitor.diagnosticsSnapshot()
+	if diagnostics.SanitizeRejectCount != maxMonitorDiagnosticErrors+3 {
+		t.Fatalf("sanitize rejection count = %d", diagnostics.SanitizeRejectCount)
+	}
+	if len(diagnostics.SanitizeRejects) != maxMonitorDiagnosticErrors || diagnostics.SanitizeRejects[0] != "invalid_json" {
+		t.Fatalf("bounded rejection reasons = %#v", diagnostics.SanitizeRejects)
+	}
+}
+
+func TestCapturedAPISchemaFingerprintsContainOnlyBoundedStructure(t *testing.T) {
+	fingerprints := capturedAPISchemaFingerprints([]capturedAPIResponse{{
+		URL:    "https://hk.trip.com/restapi/soa2/14580/getProductPriceCalendar?token=secret",
+		Status: 200,
+		Text:   `{"data":{"packageInfos":[{"packageId":11,"resourceInfos":[{"resourceId":101}],"priceInfo":{"price":8}}]}}`,
+	}})
+	if len(fingerprints) != 1 || fingerprints[0].EndpointPath != "/restapi/soa2/14580/getProductPriceCalendar" || fingerprints[0].BodyBytes == 0 {
+		t.Fatalf("fingerprints = %#v", fingerprints)
+	}
+	for _, path := range fingerprints[0].KeyPaths {
+		if strings.Contains(path.Path, "11") || strings.Contains(path.Path, "101") || strings.Contains(path.Path, "8") {
+			t.Fatalf("schema fingerprint leaked scalar content: %#v", path)
+		}
+	}
+}
+
+func TestProductPackageDiagnosticsRetainsMonitorCounters(t *testing.T) {
+	previous := productPackageDiagnostics{TrustedResponseCount: 2, TrustedFinishedCount: 2, GetBodyErrorCount: 2, GetBodyErrors: []string{"No resource with given identifier found"}}
+	merged := mergeProductPackageDiagnostics(previous, productPackageDiagnostics{NextDataPresent: true})
+	if merged.TrustedResponseCount != 2 || merged.GetBodyErrorCount != 2 || len(merged.GetBodyErrors) != 1 {
+		t.Fatalf("monitor diagnostics were lost: %#v", merged)
+	}
+}
 
 func TestParseCapturedAPISKUPricesJoinsTreeAndCurrentPrices(t *testing.T) {
 	responses := []capturedAPIResponse{
@@ -56,14 +162,14 @@ func TestParseCapturedAPISKUPricesJoinsTreeAndCurrentPrices(t *testing.T) {
 	}
 }
 
-func TestParseCapturedAPISKUPricesReportsTreeBoundaryWithoutInventingRows(t *testing.T) {
+func TestParseCapturedAPISKUPricesUsesCalendarAvailabilityBoundary(t *testing.T) {
 	responses := []capturedAPIResponse{
 		{URL: "/restapi/soa2/21052/getProductInfo", Status: 200, Text: `{"productInfos":[{"basicInfo":{"packages":[{"packageId":11,"salesProperties":[{"saleProperty":{"id":208,"name":"Days"},"salePropertyValues":[{"id":1,"name":"1 day"}]}],"resourceIds":[101]},{"packageId":12,"salesProperties":[{"saleProperty":{"id":208,"name":"Days"},"salePropertyValues":[{"id":2,"name":"2 days"}]}],"resourceIds":[102]}]}}]}`},
 		{URL: "/restapi/soa2/14580/getProductPriceCalendar", Status: 200, Text: `{"data":{"packageInfos":[{"packageId":11,"salesProperties":[{"salesProperty":{"salesPropertyId":208,"salesPropertyName":"Days"},"salesPropertyValues":[{"salesPropertyId":1,"salesPropertyName":"1 day"}]}],"resourceInfos":[{"resourceId":101,"stockStatus":1}],"priceInfo":{"originalPrice":10,"price":8}}]}}`},
 	}
 
 	rows, coverage := parseCapturedAPISKUPrices(responses, "SGD", true)
-	if len(rows) != 1 || coverage.TreeCount != 2 || coverage.PricedCount != 1 || coverage.MissingPriceCount != 1 || coverage.Complete {
+	if len(rows) != 1 || coverage.TreeCount != 1 || coverage.PricedCount != 1 || coverage.MissingPriceCount != 0 || !coverage.Complete {
 		t.Fatalf("rows=%d coverage=%+v", len(rows), coverage)
 	}
 	if rows[0]["combination"] != "1 day" {
@@ -71,6 +177,21 @@ func TestParseCapturedAPISKUPricesReportsTreeBoundaryWithoutInventingRows(t *tes
 	}
 	if got := capturedAPISKULeafCount(responses); got != 2 {
 		t.Fatalf("captured API SKU leaf count = %d, want 2", got)
+	}
+	if coverage.ProductInfoLeafCount != 2 || coverage.CalendarLeafCount != 1 || coverage.ExactKeyOverlapCount != 1 || coverage.PricedCalendarCount != 1 || coverage.ZeroOriginalOrRealCount != 0 || coverage.CurrencyMismatchCount != 0 {
+		t.Fatalf("aggregate diagnostics = %+v", coverage)
+	}
+}
+
+func TestParseCapturedAPISKUPricesFailsClosedForUnpricedCalendarLeaf(t *testing.T) {
+	responses := []capturedAPIResponse{
+		{URL: "/restapi/soa2/21052/getProductInfo", Status: 200, Text: `{"productInfos":[{"basicInfo":{"packages":[{"packageId":11,"resourceIds":[101]}]}}]}`},
+		{URL: "/restapi/soa2/14580/getProductPriceCalendar", Status: 200, Text: `{"data":{"packageInfos":[{"packageId":11,"resourceInfos":[{"resourceId":101}],"priceInfo":{"originalPrice":10,"price":8}},{"packageId":12,"resourceInfos":[{"resourceId":102}],"priceInfo":{"originalPrice":0,"price":0}}]}}`},
+	}
+
+	rows, coverage := parseCapturedAPISKUPrices(responses, "HKD", true)
+	if len(rows) != 1 || coverage.TreeCount != 2 || coverage.PricedCount != 1 || coverage.MissingPriceCount != 1 || coverage.Complete || coverage.usable() || coverage.ZeroOriginalOrRealCount != 1 {
+		t.Fatalf("rows=%d coverage=%+v", len(rows), coverage)
 	}
 }
 
@@ -145,7 +266,7 @@ func TestParseCapturedAPISKUPricesRejectsFailedOrUntrustedPrices(t *testing.T) {
 	}
 
 	rows, coverage := parseCapturedAPISKUPrices(responses, "HKD", true)
-	if len(rows) != 0 || coverage.TreeCount != 1 || coverage.PricedCount != 0 || coverage.Complete {
+	if len(rows) != 0 || coverage.TreeCount != 0 || coverage.PricedCount != 0 || coverage.Complete {
 		t.Fatalf("rows=%d coverage=%+v", len(rows), coverage)
 	}
 }

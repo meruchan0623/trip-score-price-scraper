@@ -28,10 +28,16 @@ func (s *tripScraper) waitCapturedAPISKUPrices(ctx context.Context, maxWait time
 const priceSourceProductPriceCalendar = "getProductPriceCalendar"
 
 type apiSKUPriceCoverage struct {
-	TreeCount         int
-	PricedCount       int
-	MissingPriceCount int
-	Complete          bool
+	TreeCount               int
+	PricedCount             int
+	MissingPriceCount       int
+	ProductInfoLeafCount    int
+	CalendarLeafCount       int
+	ExactKeyOverlapCount    int
+	PricedCalendarCount     int
+	ZeroOriginalOrRealCount int
+	CurrencyMismatchCount   int
+	Complete                bool
 }
 
 func (c apiSKUPriceCoverage) usable() bool {
@@ -105,7 +111,8 @@ func capturedResponseSKUTree(response capturedAPIResponse) []apiSKUTreeLeaf {
 }
 
 func parseCapturedAPISKUPrices(responses []capturedAPIResponse, expectedCurrency string, extractRealPrice bool) ([]map[string]string, apiSKUPriceCoverage) {
-	tree := map[apiSKUKey]apiSKUTreeLeaf{}
+	productInfo := map[apiSKUKey]apiSKUTreeLeaf{}
+	calendar := map[apiSKUKey]apiSKUPrice{}
 	prices := map[apiSKUKey]apiSKUPrice{}
 	currency := strings.ToUpper(strings.TrimSpace(expectedCurrency))
 	if currency == "" {
@@ -118,37 +125,32 @@ func parseCapturedAPISKUPrices(responses []capturedAPIResponse, expectedCurrency
 		switch {
 		case strings.Contains(response.URL, "/restapi/soa2/21052/getProductInfo"):
 			for _, leaf := range parseAPISKUTree(response.Text) {
-				if leaf.PackageID > 0 {
-					tree[apiSKUKey{PackageID: leaf.PackageID, ResourceID: leaf.ResourceID}] = leaf
+				if leaf.PackageID > 0 && leaf.ResourceID > 0 {
+					productInfo[apiSKUKey{PackageID: leaf.PackageID, ResourceID: leaf.ResourceID}] = leaf
 				}
 			}
 		case strings.Contains(response.URL, "/restapi/soa2/14580/getProductPriceCalendar"):
 			for _, price := range parseAPIPriceCalendar(response.Text) {
+				if price.PackageID <= 0 || price.ResourceID <= 0 {
+					continue
+				}
+				key := apiSKUKey{PackageID: price.PackageID, ResourceID: price.ResourceID}
+				calendar[key] = price
 				if price.Currency != "" && !strings.EqualFold(price.Currency, currency) {
 					continue
 				}
 				if price.PackageID > 0 && price.ResourceID > 0 && price.OriginalPrice > 0 && price.Price > 0 {
-					prices[apiSKUKey{PackageID: price.PackageID, ResourceID: price.ResourceID}] = price
+					prices[key] = price
 				}
 			}
 		}
 	}
 
-	// Only use the calendar as the SKU authority when product info supplied no tree.
-	// Otherwise preserve its independent boundary, including mismatched resource IDs.
-	if len(tree) == 0 {
-		for _, response := range responses {
-			if response.Status < 200 || response.Status >= 300 {
-				continue
-			}
-			for _, leaf := range capturedResponseSKUTree(response) {
-				tree[apiSKUKey{PackageID: leaf.PackageID, ResourceID: leaf.ResourceID}] = leaf
-			}
-		}
-	}
-
-	keys := make([]apiSKUKey, 0, len(tree))
-	for key := range tree {
+	// The current price calendar declares the currently saleable package/resource
+	// boundary. Product info may include unavailable packages, so use it only to
+	// enrich matching calendar leaves with property names.
+	keys := make([]apiSKUKey, 0, len(calendar))
+	for key := range calendar {
 		keys = append(keys, key)
 	}
 	sort.Slice(keys, func(i, j int) bool {
@@ -161,13 +163,16 @@ func parseCapturedAPISKUPrices(responses []capturedAPIResponse, expectedCurrency
 	rows := make([]map[string]string, 0, len(prices))
 	pricedTreeLeaves := 0
 	for _, key := range keys {
-		leaf := tree[key]
+		leaf, hasProductInfo := productInfo[key]
 		price, ok := prices[key]
 		if !ok {
 			continue
 		}
 		pricedTreeLeaves++
-		properties := leaf.Properties
+		properties := price.Properties
+		if hasProductInfo && len(leaf.Properties) > 0 {
+			properties = leaf.Properties
+		}
 		if len(properties) == 0 {
 			properties = price.Properties
 		}
@@ -201,10 +206,31 @@ func parseCapturedAPISKUPrices(responses []capturedAPIResponse, expectedCurrency
 			"raw_captured_price": formatPriceNumber(price.OriginalPrice),
 		})
 	}
+	overlap := 0
+	for key := range calendar {
+		if _, ok := productInfo[key]; ok {
+			overlap++
+		}
+	}
+	zeroPrice, currencyMismatch := 0, 0
+	for _, price := range calendar {
+		if price.OriginalPrice <= 0 || price.Price <= 0 {
+			zeroPrice++
+		}
+		if price.Currency != "" && !strings.EqualFold(price.Currency, currency) {
+			currencyMismatch++
+		}
+	}
 	coverage := apiSKUPriceCoverage{
-		TreeCount:         len(tree),
-		PricedCount:       pricedTreeLeaves,
-		MissingPriceCount: max(0, len(tree)-pricedTreeLeaves),
+		TreeCount:               len(calendar),
+		PricedCount:             pricedTreeLeaves,
+		MissingPriceCount:       max(0, len(calendar)-pricedTreeLeaves),
+		ProductInfoLeafCount:    len(productInfo),
+		CalendarLeafCount:       len(calendar),
+		ExactKeyOverlapCount:    overlap,
+		PricedCalendarCount:     len(prices),
+		ZeroOriginalOrRealCount: zeroPrice,
+		CurrencyMismatchCount:   currencyMismatch,
 	}
 	coverage.Complete = coverage.TreeCount > 0 && coverage.MissingPriceCount == 0
 	return rows, coverage

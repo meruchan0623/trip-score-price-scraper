@@ -3,6 +3,7 @@ package tripcdp
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -44,6 +45,7 @@ type tripScraper struct {
 	currentQualityFailure      *priceQualityTracker
 	currentQualityRetryAttempt int
 	currentTarget              navigationTarget
+	navigationMonitor          *navigationMonitor
 }
 
 type skuLayerInfo struct {
@@ -109,15 +111,54 @@ type batchPromotionPriceBundle struct {
 }
 
 type productPackageDiagnostics struct {
-	NextDataPresent    bool `json:"next_data_present"`
-	PackageCount       int  `json:"package_count"`
-	ResourceCount      int  `json:"resource_count"`
-	BatchResponseCount int  `json:"batch_response_count"`
-	LastResponseStatus int  `json:"last_response_status"`
+	NextDataPresent      bool                           `json:"next_data_present"`
+	PackageCount         int                            `json:"package_count"`
+	ResourceCount        int                            `json:"resource_count"`
+	BatchResponseCount   int                            `json:"batch_response_count"`
+	LastResponseStatus   int                            `json:"last_response_status"`
+	ObservedAPIResponses []networkResponseObservation   `json:"observed_api_responses,omitempty"`
+	TrustedResponseCount int                            `json:"trusted_response_received_count"`
+	TrustedFinishedCount int                            `json:"trusted_loading_finished_count"`
+	GetBodySuccessCount  int                            `json:"get_response_body_success_count"`
+	GetBodyErrorCount    int                            `json:"get_response_body_error_count"`
+	SanitizeRejectCount  int                            `json:"sanitized_body_rejection_count"`
+	GetBodyErrors        []string                       `json:"get_response_body_errors,omitempty"`
+	SanitizeRejects      []string                       `json:"sanitized_body_rejections,omitempty"`
+	SchemaFingerprints   []capturedAPISchemaFingerprint `json:"captured_api_schema_fingerprints,omitempty"`
+}
+
+// capturedAPISchemaFingerprint is deliberately structural: it records no JSON
+// scalar values or body content, only the bounded shape of trusted responses.
+// It is emitted solely to diagnose parser/schema drift.
+type capturedAPISchemaFingerprint struct {
+	EndpointPath string                     `json:"endpoint_path"`
+	BodyBytes    int                        `json:"body_bytes"`
+	KeyPaths     []capturedAPISchemaKeyPath `json:"key_paths"`
+}
+
+type capturedAPISchemaKeyPath struct {
+	Path  string `json:"path"`
+	Type  string `json:"type"`
+	Count int    `json:"count"`
 }
 
 func (d productPackageDiagnostics) ready() bool {
 	return d.NextDataPresent && d.PackageCount > 0 && d.ResourceCount > 0
+}
+
+func mergeProductPackageDiagnostics(previous, latest productPackageDiagnostics) productPackageDiagnostics {
+	if len(latest.ObservedAPIResponses) == 0 {
+		latest.ObservedAPIResponses = previous.ObservedAPIResponses
+	}
+	if latest.TrustedResponseCount == 0 && latest.TrustedFinishedCount == 0 && latest.GetBodySuccessCount == 0 && latest.GetBodyErrorCount == 0 && latest.SanitizeRejectCount == 0 {
+		latest.TrustedResponseCount, latest.TrustedFinishedCount = previous.TrustedResponseCount, previous.TrustedFinishedCount
+		latest.GetBodySuccessCount, latest.GetBodyErrorCount, latest.SanitizeRejectCount = previous.GetBodySuccessCount, previous.GetBodyErrorCount, previous.SanitizeRejectCount
+		latest.GetBodyErrors, latest.SanitizeRejects = previous.GetBodyErrors, previous.SanitizeRejects
+	}
+	if len(latest.SchemaFingerprints) == 0 {
+		latest.SchemaFingerprints = previous.SchemaFingerprints
+	}
+	return latest
 }
 
 type baseRatingBundle struct {
@@ -134,9 +175,10 @@ type baseRatingBundle struct {
 }
 
 type capturedAPIResponse struct {
-	URL    string `json:"url"`
-	Status int    `json:"status"`
-	Text   string `json:"text"`
+	URL       string `json:"url"`
+	Status    int    `json:"status"`
+	Text      string `json:"text"`
+	SessionID proto.TargetSessionID
 }
 
 type capturedAPIFields struct {
@@ -209,12 +251,280 @@ const readMarketObservationJS = `() => {
 }`
 
 type navigationMonitor struct {
-	mu             sync.Mutex
-	mainStatus     int
-	mainURL        string
-	mainStatusText string
-	stop           func()
-	cancel         context.CancelFunc
+	mu                   sync.Mutex
+	mainStatus           int
+	mainURL              string
+	mainStatusText       string
+	apiResponses         []networkResponseObservation
+	capturedAPIResponses []capturedAPIResponse
+	pendingCapturedAPI   map[proto.NetworkRequestID]capturedAPIResponse
+	closing              bool
+	stopDone             chan struct{}
+	cancel               context.CancelFunc
+	bodyCaptureWG        sync.WaitGroup
+	trustedResponseCount int
+	trustedFinishedCount int
+	getBodySuccessCount  int
+	getBodyErrorCount    int
+	sanitizeRejectCount  int
+	getBodyErrors        []string
+	sanitizeRejects      []string
+}
+
+// networkResponseObservation deliberately excludes query strings and bodies.
+// It is a bounded diagnostic for identifying which API runtime/session produced
+// the product data; it must never be used as a price source.
+type networkResponseObservation struct {
+	URL    string `json:"url"`
+	Status int    `json:"status"`
+	Type   string `json:"type"`
+}
+
+const maxObservedTripAPIResponses = 80
+const maxCapturedTrustedAPIResponses = 8
+const maxCapturedTrustedAPIResponseBytes = 8 * 1024 * 1024
+
+func trustedCapturedAPIURL(raw string) string {
+	apiURL := observedTripAPIURL(raw)
+	if strings.Contains(apiURL, "/restapi/soa2/21052/getProductInfo") ||
+		strings.Contains(apiURL, "/restapi/soa2/14580/getProductPriceCalendar") {
+		return apiURL
+	}
+	return ""
+}
+
+// sanitizeCapturedAPIResponseBody keeps trusted API data in-memory for parsing,
+// but rejects oversized/non-JSON bodies and removes common credential fields.
+func sanitizeCapturedAPIResponseBody(body string) (string, string) {
+	if len(body) == 0 {
+		return "", "empty_body"
+	}
+	if len(body) > maxCapturedTrustedAPIResponseBytes {
+		return "", "body_exceeds_8MiB"
+	}
+	if !json.Valid([]byte(body)) {
+		return "", "invalid_json"
+	}
+	var value any
+	if json.Unmarshal([]byte(body), &value) != nil {
+		return "", "json_unmarshal_error"
+	}
+	var scrub func(any)
+	scrub = func(v any) {
+		switch typed := v.(type) {
+		case map[string]any:
+			for key, child := range typed {
+				switch strings.ToLower(key) {
+				case "token", "access_token", "authorization", "cookie", "password", "signature", "secret":
+					delete(typed, key)
+				default:
+					scrub(child)
+				}
+			}
+		case []any:
+			for _, child := range typed {
+				scrub(child)
+			}
+		}
+	}
+	scrub(value)
+	sanitized, err := json.Marshal(value)
+	if err != nil {
+		return "", "json_marshal_error"
+	}
+	if len(sanitized) > maxCapturedTrustedAPIResponseBytes {
+		return "", "sanitized_body_exceeds_8MiB"
+	}
+	return string(sanitized), ""
+}
+
+const maxMonitorDiagnosticErrors = 4
+
+func appendMonitorDiagnosticError(errors []string, value string) []string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(errors) >= maxMonitorDiagnosticErrors {
+		return errors
+	}
+	if len(value) > 180 {
+		value = value[:180]
+	}
+	return append(errors, value)
+}
+
+func (m *navigationMonitor) recordCapturedAPIResponse(raw string, status int, body string) {
+	if m == nil || status < 200 || status >= 300 {
+		return
+	}
+	apiURL := trustedCapturedAPIURL(raw)
+	sanitized, rejectReason := sanitizeCapturedAPIResponseBody(body)
+	body = sanitized
+	if apiURL == "" || body == "" {
+		if apiURL != "" && rejectReason != "" {
+			m.mu.Lock()
+			m.sanitizeRejectCount++
+			m.sanitizeRejects = appendMonitorDiagnosticError(m.sanitizeRejects, rejectReason)
+			m.mu.Unlock()
+		}
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.capturedAPIResponses = append(m.capturedAPIResponses, capturedAPIResponse{URL: apiURL, Status: status, Text: body})
+	if len(m.capturedAPIResponses) > maxCapturedTrustedAPIResponses {
+		m.capturedAPIResponses = m.capturedAPIResponses[len(m.capturedAPIResponses)-maxCapturedTrustedAPIResponses:]
+	}
+}
+
+func (m *navigationMonitor) diagnosticsSnapshot() productPackageDiagnostics {
+	if m == nil {
+		return productPackageDiagnostics{}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return productPackageDiagnostics{
+		TrustedResponseCount: m.trustedResponseCount, TrustedFinishedCount: m.trustedFinishedCount,
+		GetBodySuccessCount: m.getBodySuccessCount, GetBodyErrorCount: m.getBodyErrorCount, SanitizeRejectCount: m.sanitizeRejectCount,
+		GetBodyErrors: append([]string(nil), m.getBodyErrors...), SanitizeRejects: append([]string(nil), m.sanitizeRejects...),
+	}
+}
+
+func (m *navigationMonitor) capturedAPISnapshot() []capturedAPIResponse {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]capturedAPIResponse(nil), m.capturedAPIResponses...)
+}
+
+const maxCapturedAPISchemaPaths = 80
+const maxCapturedAPISchemaDepth = 8
+
+func capturedAPISchemaFingerprints(responses []capturedAPIResponse) []capturedAPISchemaFingerprint {
+	fingerprints := make([]capturedAPISchemaFingerprint, 0, len(responses))
+	for _, response := range responses {
+		endpoint := trustedCapturedAPIURL(response.URL)
+		if endpoint == "" || response.Status < 200 || response.Status >= 300 || strings.TrimSpace(response.Text) == "" {
+			continue
+		}
+		var value any
+		if json.Unmarshal([]byte(response.Text), &value) != nil {
+			continue
+		}
+		fingerprint := capturedAPISchemaFingerprint{EndpointPath: endpointPath(endpoint), BodyBytes: len(response.Text)}
+		collectCapturedAPISchemaPaths(&fingerprint.KeyPaths, "", value, 0)
+		fingerprints = append(fingerprints, fingerprint)
+	}
+	return fingerprints
+}
+
+func endpointPath(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return parsed.Path
+}
+
+func collectCapturedAPISchemaPaths(out *[]capturedAPISchemaKeyPath, path string, value any, depth int) {
+	if len(*out) >= maxCapturedAPISchemaPaths || depth > maxCapturedAPISchemaDepth {
+		return
+	}
+	switch typed := value.(type) {
+	case map[string]any:
+		if path != "" {
+			*out = append(*out, capturedAPISchemaKeyPath{Path: path, Type: "object", Count: len(typed)})
+		}
+		keys := make([]string, 0, len(typed))
+		for key := range typed {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			childPath := "/" + key
+			if path != "" {
+				childPath = path + "/" + key
+			}
+			collectCapturedAPISchemaPaths(out, childPath, typed[key], depth+1)
+		}
+	case []any:
+		if path != "" {
+			*out = append(*out, capturedAPISchemaKeyPath{Path: path, Type: "array", Count: len(typed)})
+		}
+		if len(typed) > 0 {
+			collectCapturedAPISchemaPaths(out, path+"[]", typed[0], depth+1)
+		}
+	default:
+		if path != "" {
+			*out = append(*out, capturedAPISchemaKeyPath{Path: path, Type: jsonSchemaType(value), Count: 1})
+		}
+	}
+}
+
+func jsonSchemaType(value any) string {
+	switch value.(type) {
+	case string:
+		return "string"
+	case float64:
+		return "number"
+	case bool:
+		return "boolean"
+	case nil:
+		return "null"
+	default:
+		return "unknown"
+	}
+}
+
+func mergeCapturedAPIResponses(pageWorld, cdp []capturedAPIResponse) []capturedAPIResponse {
+	merged := make([]capturedAPIResponse, 0, len(pageWorld)+len(cdp))
+	seen := map[string]struct{}{}
+	for _, response := range append(append([]capturedAPIResponse(nil), pageWorld...), cdp...) {
+		if trustedCapturedAPIURL(response.URL) == "" || response.Status < 200 || response.Status >= 300 || strings.TrimSpace(response.Text) == "" {
+			continue
+		}
+		key := trustedCapturedAPIURL(response.URL) + "\x00" + response.Text
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		response.URL = trustedCapturedAPIURL(response.URL)
+		merged = append(merged, response)
+	}
+	return merged
+}
+
+func observedTripAPIURL(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil || !strings.HasSuffix(strings.ToLower(parsed.Hostname()), "trip.com") || !strings.HasPrefix(parsed.Path, "/restapi/") {
+		return ""
+	}
+	return parsed.Scheme + "://" + parsed.Host + parsed.Path
+}
+
+func (m *navigationMonitor) recordAPIResponse(raw string, status int, resourceType proto.NetworkResourceType) {
+	if m == nil {
+		return
+	}
+	apiURL := observedTripAPIURL(raw)
+	if apiURL == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.apiResponses = append(m.apiResponses, networkResponseObservation{URL: apiURL, Status: status, Type: string(resourceType)})
+	if len(m.apiResponses) > maxObservedTripAPIResponses {
+		m.apiResponses = m.apiResponses[len(m.apiResponses)-maxObservedTripAPIResponses:]
+	}
+}
+
+func (m *navigationMonitor) apiSnapshot() []networkResponseObservation {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]networkResponseObservation(nil), m.apiResponses...)
 }
 
 const currentPriceBundleJS = `(displaySelectors, includeReal, currency, pricePrefixes) => {
@@ -326,6 +636,8 @@ const productSalesVolumeJS = `(expectedProductID) => {
 
 const promotionContentCaptureJS = `(() => {
 	window.__tripCdpProductPromotionResponses = [];
+	window.__tripCdpBatchPromotionResponses = [];
+	window.__tripCdpBatchPromotionHooked = true;
 	const keep = (url) => {
 		const value = String(url || '');
 		return value.includes('/restapi/soa2/21052/getProductInfo') ||
@@ -333,10 +645,18 @@ const promotionContentCaptureJS = `(() => {
 			value.includes('/restapi/soa2/18084/commonQueryCommentSummary') ||
 			value.includes('/restapi/soa2/20047/listComments');
 	};
+	const keepBatchPromotion = (url) => String(url || '').includes('/restapi/soa2/31644/batchSearchBookingSalesPromotion');
 	const push = (url, status, text) => {
 		try {
-			window.__tripCdpProductPromotionResponses.push({url: String(url || ''), status: Number(status || 0), text: String(text || '')});
-			window.__tripCdpProductPromotionResponses = window.__tripCdpProductPromotionResponses.slice(-10);
+			const response = {url: String(url || ''), status: Number(status || 0), text: String(text || '')};
+			if (keep(url)) {
+				window.__tripCdpProductPromotionResponses.push(response);
+				window.__tripCdpProductPromotionResponses = window.__tripCdpProductPromotionResponses.slice(-10);
+			}
+			if (keepBatchPromotion(url)) {
+				window.__tripCdpBatchPromotionResponses.push(response);
+				window.__tripCdpBatchPromotionResponses = window.__tripCdpBatchPromotionResponses.slice(-80);
+			}
 		} catch (e) {}
 	};
 	const originalFetch = window.fetch;
@@ -344,7 +664,7 @@ const promotionContentCaptureJS = `(() => {
 		window.fetch = async function(input, init) {
 			const response = await originalFetch.apply(this, arguments);
 			const url = typeof input === 'string' ? input : (input && input.url) || response.url;
-			if (keep(url)) response.clone().text().then((text) => push(url, response.status, text)).catch(() => {});
+			if (keep(url) || keepBatchPromotion(url)) response.clone().text().then((text) => push(url, response.status, text)).catch(() => {});
 			return response;
 		};
 	}
@@ -359,7 +679,7 @@ const promotionContentCaptureJS = `(() => {
 		OriginalXHR.prototype.send = function() {
 			this.addEventListener('load', function() {
 				const url = this.__tripCdpProductPromotionURL || '';
-				if (keep(url)) push(url, this.status, this.responseText || '');
+				if (keep(url) || keepBatchPromotion(url)) push(url, this.status, this.responseText || '');
 			});
 			return originalSend.apply(this, arguments);
 		};
@@ -838,7 +1158,13 @@ func (s *tripScraper) scrapeOneAttempt(ctx context.Context, item ScrapeItem, tar
 	}
 	monitor := s.startNavigationMonitor(ctx)
 	if monitor != nil {
-		defer monitor.close()
+		s.navigationMonitor = monitor
+		defer func() {
+			monitor.close()
+			if s.navigationMonitor == monitor {
+				s.navigationMonitor = nil
+			}
+		}()
 	}
 	navCtx := ctx
 	var navCancel context.CancelFunc
@@ -1225,28 +1551,30 @@ func (s *tripScraper) emitURLQualityFailed(item ScrapeItem, quality *priceQualit
 	}
 	diagnosticPath := s.writePriceQualityDiagnostic(item, quality)
 	s.emit(Event{
-		"event":                "url_quality_failed",
-		"stage":                "sku",
-		"vendor":               item.Vendor,
-		"url":                  item.URL,
-		"product_id":           productID(item.URL),
-		"reason":               quality.failReason,
-		"failure_class":        failureClass,
-		"trusted_rows":         quality.trustedRows,
-		"untrusted_rows":       quality.untrustedRows,
-		"resource_miss_rows":   quality.resourceMissRows,
-		"total_rows":           quality.totalRows,
-		"resource_miss_rate":   quality.resourceMissRate(),
-		"top_fallback_prices":  quality.topFallbackPrices(3),
-		"selected_texts":       quality.selectedTexts(5),
-		"retry_attempt":        quality.retryAttempt,
-		"recovered":            quality.recovered,
-		"next_data_present":    quality.diagnostics.NextDataPresent,
-		"package_count":        quality.diagnostics.PackageCount,
-		"resource_count":       quality.diagnostics.ResourceCount,
-		"batch_response_count": quality.diagnostics.BatchResponseCount,
-		"last_response_status": quality.diagnostics.LastResponseStatus,
-		"diagnostic_path":      diagnosticPath,
+		"event":                            "url_quality_failed",
+		"stage":                            "sku",
+		"vendor":                           item.Vendor,
+		"url":                              item.URL,
+		"product_id":                       productID(item.URL),
+		"reason":                           quality.failReason,
+		"failure_class":                    failureClass,
+		"trusted_rows":                     quality.trustedRows,
+		"untrusted_rows":                   quality.untrustedRows,
+		"resource_miss_rows":               quality.resourceMissRows,
+		"total_rows":                       quality.totalRows,
+		"resource_miss_rate":               quality.resourceMissRate(),
+		"top_fallback_prices":              quality.topFallbackPrices(3),
+		"selected_texts":                   quality.selectedTexts(5),
+		"retry_attempt":                    quality.retryAttempt,
+		"recovered":                        quality.recovered,
+		"next_data_present":                quality.diagnostics.NextDataPresent,
+		"package_count":                    quality.diagnostics.PackageCount,
+		"resource_count":                   quality.diagnostics.ResourceCount,
+		"batch_response_count":             quality.diagnostics.BatchResponseCount,
+		"last_response_status":             quality.diagnostics.LastResponseStatus,
+		"observed_api_responses":           quality.diagnostics.ObservedAPIResponses,
+		"captured_api_schema_fingerprints": quality.diagnostics.SchemaFingerprints,
+		"diagnostic_path":                  diagnosticPath,
 	})
 }
 
@@ -1256,23 +1584,24 @@ func (s *tripScraper) emitPriceQualityRecovered(item ScrapeItem, quality *priceQ
 	}
 	s.refreshPriceQualityDiagnostics(quality)
 	s.emit(mergeEvent(Event{
-		"event":                "price_quality_recovered",
-		"stage":                "sku",
-		"message":              "price quality recovered after retry",
-		"vendor":               item.Vendor,
-		"url":                  item.URL,
-		"product_id":           productID(item.URL),
-		"reason":               quality.failReason,
-		"retry_attempt":        retryAttempt,
-		"trusted_rows":         trustedRows,
-		"untrusted_rows":       untrustedRows,
-		"top_fallback_prices":  quality.topFallbackPrices(3),
-		"selected_texts":       quality.selectedTexts(5),
-		"next_data_present":    quality.diagnostics.NextDataPresent,
-		"package_count":        quality.diagnostics.PackageCount,
-		"resource_count":       quality.diagnostics.ResourceCount,
-		"batch_response_count": quality.diagnostics.BatchResponseCount,
-		"last_response_status": quality.diagnostics.LastResponseStatus,
+		"event":                  "price_quality_recovered",
+		"stage":                  "sku",
+		"message":                "price quality recovered after retry",
+		"vendor":                 item.Vendor,
+		"url":                    item.URL,
+		"product_id":             productID(item.URL),
+		"reason":                 quality.failReason,
+		"retry_attempt":          retryAttempt,
+		"trusted_rows":           trustedRows,
+		"untrusted_rows":         untrustedRows,
+		"top_fallback_prices":    quality.topFallbackPrices(3),
+		"selected_texts":         quality.selectedTexts(5),
+		"next_data_present":      quality.diagnostics.NextDataPresent,
+		"package_count":          quality.diagnostics.PackageCount,
+		"resource_count":         quality.diagnostics.ResourceCount,
+		"batch_response_count":   quality.diagnostics.BatchResponseCount,
+		"last_response_status":   quality.diagnostics.LastResponseStatus,
+		"observed_api_responses": quality.diagnostics.ObservedAPIResponses,
 	}, base))
 }
 
@@ -1281,8 +1610,8 @@ func (s *tripScraper) refreshPriceQualityDiagnostics(quality *priceQualityTracke
 		return
 	}
 	latest := s.productPackageDiagnostics()
-	if latest.NextDataPresent || latest.PackageCount > 0 || latest.ResourceCount > 0 || latest.BatchResponseCount > 0 || latest.LastResponseStatus > 0 {
-		quality.diagnostics = latest
+	if latest.NextDataPresent || latest.PackageCount > 0 || latest.ResourceCount > 0 || latest.BatchResponseCount > 0 || latest.LastResponseStatus > 0 || len(latest.ObservedAPIResponses) > 0 || latest.TrustedResponseCount > 0 || latest.TrustedFinishedCount > 0 || latest.GetBodySuccessCount > 0 || latest.GetBodyErrorCount > 0 || latest.SanitizeRejectCount > 0 {
+		quality.diagnostics = mergeProductPackageDiagnostics(quality.diagnostics, latest)
 	}
 }
 
@@ -1302,26 +1631,35 @@ func (s *tripScraper) writePriceQualityDiagnostic(item ScrapeItem, quality *pric
 		return ""
 	}
 	payload := map[string]any{
-		"event":                "price_quality_failure",
-		"vendor":               item.Vendor,
-		"url":                  item.URL,
-		"product_id":           productID(item.URL),
-		"reason":               quality.failReason,
-		"trusted_rows":         quality.trustedRows,
-		"untrusted_rows":       quality.untrustedRows,
-		"resource_miss_rows":   quality.resourceMissRows,
-		"total_rows":           quality.totalRows,
-		"resource_miss_rate":   quality.resourceMissRate(),
-		"top_fallback_prices":  quality.topFallbackPrices(5),
-		"selected_texts":       quality.selectedTexts(5),
-		"retry_attempt":        quality.retryAttempt,
-		"recovered":            quality.recovered,
-		"next_data_present":    quality.diagnostics.NextDataPresent,
-		"package_count":        quality.diagnostics.PackageCount,
-		"resource_count":       quality.diagnostics.ResourceCount,
-		"batch_response_count": quality.diagnostics.BatchResponseCount,
-		"last_response_status": quality.diagnostics.LastResponseStatus,
-		"examples":             quality.examples,
+		"event":                            "price_quality_failure",
+		"vendor":                           item.Vendor,
+		"url":                              item.URL,
+		"product_id":                       productID(item.URL),
+		"reason":                           quality.failReason,
+		"trusted_rows":                     quality.trustedRows,
+		"untrusted_rows":                   quality.untrustedRows,
+		"resource_miss_rows":               quality.resourceMissRows,
+		"total_rows":                       quality.totalRows,
+		"resource_miss_rate":               quality.resourceMissRate(),
+		"top_fallback_prices":              quality.topFallbackPrices(5),
+		"selected_texts":                   quality.selectedTexts(5),
+		"retry_attempt":                    quality.retryAttempt,
+		"recovered":                        quality.recovered,
+		"next_data_present":                quality.diagnostics.NextDataPresent,
+		"package_count":                    quality.diagnostics.PackageCount,
+		"resource_count":                   quality.diagnostics.ResourceCount,
+		"batch_response_count":             quality.diagnostics.BatchResponseCount,
+		"last_response_status":             quality.diagnostics.LastResponseStatus,
+		"observed_api_responses":           quality.diagnostics.ObservedAPIResponses,
+		"trusted_response_received_count":  quality.diagnostics.TrustedResponseCount,
+		"trusted_loading_finished_count":   quality.diagnostics.TrustedFinishedCount,
+		"get_response_body_success_count":  quality.diagnostics.GetBodySuccessCount,
+		"get_response_body_error_count":    quality.diagnostics.GetBodyErrorCount,
+		"sanitized_body_rejection_count":   quality.diagnostics.SanitizeRejectCount,
+		"get_response_body_errors":         quality.diagnostics.GetBodyErrors,
+		"sanitized_body_rejections":        quality.diagnostics.SanitizeRejects,
+		"captured_api_schema_fingerprints": quality.diagnostics.SchemaFingerprints,
+		"examples":                         quality.examples,
 	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
@@ -1389,9 +1727,13 @@ func (s *tripScraper) capturedAPIResponses() []capturedAPIResponse {
 	if s == nil || s.page == nil {
 		return nil
 	}
-	var responses []capturedAPIResponse
-	_ = s.evalJSON(&responses, `() => (window.__tripCdpProductPromotionResponses || []).slice()`)
-	return responses
+	var pageWorld []capturedAPIResponse
+	_ = s.evalJSON(&pageWorld, `() => (window.__tripCdpProductPromotionResponses || []).slice()`)
+	var cdp []capturedAPIResponse
+	if s.navigationMonitor != nil {
+		cdp = s.navigationMonitor.capturedAPISnapshot()
+	}
+	return mergeCapturedAPIResponses(pageWorld, cdp)
 }
 
 func parseCapturedAPIFields(responses []capturedAPIResponse) capturedAPIFields {
@@ -1565,27 +1907,40 @@ func (s *tripScraper) extractAllSKUPrices(ctx context.Context) ([]map[string]str
 			}
 		}
 		s.emit(Event{
-			"event":               "sku_api_batch_used",
-			"stage":               "sku",
-			"message":             "using captured product price calendar batch",
-			"price_source":        priceSourceProductPriceCalendar,
-			"tree_count":          coverage.TreeCount,
-			"priced_count":        coverage.PricedCount,
-			"missing_price_count": coverage.MissingPriceCount,
-			"coverage_rate":       float64(coverage.PricedCount) / float64(coverage.TreeCount),
-			"wait_ms":             waitMS,
+			"event":                             "sku_api_batch_used",
+			"stage":                             "sku",
+			"message":                           "using captured product price calendar batch",
+			"price_source":                      priceSourceProductPriceCalendar,
+			"tree_count":                        coverage.TreeCount,
+			"priced_count":                      coverage.PricedCount,
+			"missing_price_count":               coverage.MissingPriceCount,
+			"product_info_leaf_count":           coverage.ProductInfoLeafCount,
+			"calendar_leaf_count":               coverage.CalendarLeafCount,
+			"exact_key_overlap_count":           coverage.ExactKeyOverlapCount,
+			"priced_calendar_count":             coverage.PricedCalendarCount,
+			"zero_original_or_real_price_count": coverage.ZeroOriginalOrRealCount,
+			"currency_mismatch_count":           coverage.CurrencyMismatchCount,
+			"coverage_rate":                     float64(coverage.PricedCount) / float64(coverage.TreeCount),
+			"wait_ms":                           waitMS,
 		})
 		return rows, nil
 	} else if coverage.TreeCount > 0 || coverage.PricedCount > 0 {
 		s.emit(Event{
-			"event":               "sku_api_batch_fallback",
-			"stage":               "sku",
-			"message":             "captured API batch coverage is below the trusted threshold; using browser traversal",
-			"tree_count":          coverage.TreeCount,
-			"priced_count":        coverage.PricedCount,
-			"missing_price_count": coverage.MissingPriceCount,
-			"wait_ms":             waitMS,
+			"event":                             "sku_api_batch_fallback",
+			"stage":                             "sku",
+			"message":                           "captured API calendar coverage is incomplete; failing closed",
+			"tree_count":                        coverage.TreeCount,
+			"priced_count":                      coverage.PricedCount,
+			"missing_price_count":               coverage.MissingPriceCount,
+			"product_info_leaf_count":           coverage.ProductInfoLeafCount,
+			"calendar_leaf_count":               coverage.CalendarLeafCount,
+			"exact_key_overlap_count":           coverage.ExactKeyOverlapCount,
+			"priced_calendar_count":             coverage.PricedCalendarCount,
+			"zero_original_or_real_price_count": coverage.ZeroOriginalOrRealCount,
+			"currency_mismatch_count":           coverage.CurrencyMismatchCount,
+			"wait_ms":                           waitMS,
 		})
+		return nil, &priceQualityTracker{failed: true, failReason: "api_calendar_incomplete"}
 	}
 	count, waitMS := s.waitSKULayerCount(ctx, skuLayerWaitMax)
 	if count == 0 {
@@ -1603,7 +1958,7 @@ func (s *tripScraper) extractAllSKUPrices(ctx context.Context) ([]map[string]str
 			s.emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("product package data ready after wait_ms=%d", packageWaitMS), "package_count": packageDiagnostics.PackageCount, "resource_count": packageDiagnostics.ResourceCount, "batch_response_count": packageDiagnostics.BatchResponseCount})
 		}
 	} else {
-		s.emit(Event{"event": "product_package_not_ready", "stage": "sku", "message": "product package/resource data not ready before SKU traversal", "wait_ms": packageWaitMS, "next_data_present": packageDiagnostics.NextDataPresent, "package_count": packageDiagnostics.PackageCount, "resource_count": packageDiagnostics.ResourceCount, "batch_response_count": packageDiagnostics.BatchResponseCount, "last_response_status": packageDiagnostics.LastResponseStatus})
+		s.emit(Event{"event": "product_package_not_ready", "stage": "sku", "message": "product package/resource data not ready before SKU traversal", "wait_ms": packageWaitMS, "next_data_present": packageDiagnostics.NextDataPresent, "package_count": packageDiagnostics.PackageCount, "resource_count": packageDiagnostics.ResourceCount, "batch_response_count": packageDiagnostics.BatchResponseCount, "last_response_status": packageDiagnostics.LastResponseStatus, "observed_api_responses": packageDiagnostics.ObservedAPIResponses})
 	}
 	s.emit(Event{"event": "log", "stage": "sku", "message": fmt.Sprintf("found %d SKU layers", count)})
 	layers := make([]skuLayerInfo, 0, count)
@@ -1736,6 +2091,18 @@ func (s *tripScraper) productPackageDiagnostics() productPackageDiagnostics {
 		}
 		return out;
 	}`)
+	if s.navigationMonitor != nil {
+		diagnostics.ObservedAPIResponses = s.navigationMonitor.apiSnapshot()
+		monitorDiagnostics := s.navigationMonitor.diagnosticsSnapshot()
+		diagnostics.TrustedResponseCount = monitorDiagnostics.TrustedResponseCount
+		diagnostics.TrustedFinishedCount = monitorDiagnostics.TrustedFinishedCount
+		diagnostics.GetBodySuccessCount = monitorDiagnostics.GetBodySuccessCount
+		diagnostics.GetBodyErrorCount = monitorDiagnostics.GetBodyErrorCount
+		diagnostics.SanitizeRejectCount = monitorDiagnostics.SanitizeRejectCount
+		diagnostics.GetBodyErrors = monitorDiagnostics.GetBodyErrors
+		diagnostics.SanitizeRejects = monitorDiagnostics.SanitizeRejects
+		diagnostics.SchemaFingerprints = capturedAPISchemaFingerprints(s.navigationMonitor.capturedAPISnapshot())
+	}
 	return diagnostics
 }
 
@@ -1975,8 +2342,8 @@ func (s *tripScraper) currentCombinationPrice(ctx context.Context, selected []sk
 
 func (s *tripScraper) enableBatchPromotionCapture() {
 	_ = s.evalJSON(&struct{}{}, `() => {
-		window.__tripCdpBatchPromotionResponses = [];
 		if (window.__tripCdpBatchPromotionHooked) return {};
+		window.__tripCdpBatchPromotionResponses = window.__tripCdpBatchPromotionResponses || [];
 		window.__tripCdpBatchPromotionHooked = true;
 		const keep = (url) => String(url || '').includes('/restapi/soa2/31644/batchSearchBookingSalesPromotion');
 		const push = (kind, url, status, text) => {
@@ -2635,9 +3002,23 @@ func (s *tripScraper) startNavigationMonitor(ctx context.Context) *navigationMon
 	}
 	_ = proto.NetworkEnable{}.Call(s.page)
 	eventCtx, cancel := context.WithCancel(ctx)
-	monitor := &navigationMonitor{cancel: cancel}
-	wait := s.page.Context(eventCtx).EachEvent(func(e *proto.NetworkResponseReceived) {
-		if e == nil || e.Response == nil || e.Type != proto.NetworkResourceTypeDocument {
+	monitor := &navigationMonitor{cancel: cancel, pendingCapturedAPI: map[proto.NetworkRequestID]capturedAPIResponse{}}
+	// Listen at the browser level. Page.EachEvent filters by its current target
+	// session, which the headed canary showed can miss the document/runtime that
+	// delivers Trip's API responses. Network remains enabled only on the page;
+	// the browser-wide subscription merely receives those enabled events.
+	wait := s.browser.Context(eventCtx).EachEvent(func(e *proto.NetworkResponseReceived, sessionID proto.TargetSessionID) {
+		if e == nil || e.Response == nil {
+			return
+		}
+		monitor.recordAPIResponse(e.Response.URL, e.Response.Status, e.Type)
+		if apiURL := trustedCapturedAPIURL(e.Response.URL); apiURL != "" && e.Response.Status >= 200 && e.Response.Status < 300 {
+			monitor.mu.Lock()
+			monitor.trustedResponseCount++
+			monitor.pendingCapturedAPI[e.RequestID] = capturedAPIResponse{URL: apiURL, Status: e.Response.Status, SessionID: sessionID}
+			monitor.mu.Unlock()
+		}
+		if e.Type != proto.NetworkResourceTypeDocument {
 			return
 		}
 		monitor.mu.Lock()
@@ -2645,9 +3026,82 @@ func (s *tripScraper) startNavigationMonitor(ctx context.Context) *navigationMon
 		monitor.mainURL = e.Response.URL
 		monitor.mainStatusText = e.Response.StatusText
 		monitor.mu.Unlock()
+	}, func(e *proto.NetworkLoadingFinished, sessionID proto.TargetSessionID) {
+		if e == nil {
+			return
+		}
+		monitor.mu.Lock()
+		response, ok := monitor.pendingCapturedAPI[e.RequestID]
+		delete(monitor.pendingCapturedAPI, e.RequestID)
+		monitor.mu.Unlock()
+		if !ok {
+			return
+		}
+		if response.SessionID != sessionID {
+			monitor.mu.Lock()
+			monitor.getBodyErrorCount++
+			monitor.getBodyErrors = appendMonitorDiagnosticError(monitor.getBodyErrors, "loading_finished_session_mismatch")
+			monitor.mu.Unlock()
+			return
+		}
+		// EachEvent owns CDP response dispatch. A synchronous Call here would wait
+		// for a response that this callback prevents it from dispatching.
+		monitor.mu.Lock()
+		monitor.trustedFinishedCount++
+		if monitor.closing {
+			monitor.mu.Unlock()
+			return
+		}
+		monitor.bodyCaptureWG.Add(1)
+		monitor.mu.Unlock()
+		go func(requestID proto.NetworkRequestID, response capturedAPIResponse) {
+			defer monitor.bodyCaptureWG.Done()
+			// The request has finished, so CDP permits a body read. This remains
+			// restricted to the two parser-recognized endpoint paths above; eviction
+			// and cross-target failures are nonfatal.
+			// Browser-wide events include the target session. Request IDs are scoped
+			// to that session, so use its bound caller rather than s.page (which may
+			// be a different target, e.g. when the API came from a worker).
+			// PageFromSession already carries the browser context and session ID.
+			// Do not call Page.Context here: Rod low-level PageFromSession pages do
+			// not initialize helpersLock, so cloning one via Context panics.
+			caller := s.browser.PageFromSession(response.SessionID)
+			body, err := (&proto.NetworkGetResponseBody{RequestID: requestID}).Call(caller)
+			if err != nil || body == nil {
+				monitor.mu.Lock()
+				monitor.getBodyErrorCount++
+				if err != nil {
+					monitor.getBodyErrors = appendMonitorDiagnosticError(monitor.getBodyErrors, err.Error())
+				} else {
+					monitor.getBodyErrors = appendMonitorDiagnosticError(monitor.getBodyErrors, "nil_response_body")
+				}
+				monitor.mu.Unlock()
+				return
+			}
+			monitor.mu.Lock()
+			monitor.getBodySuccessCount++
+			monitor.mu.Unlock()
+			text := body.Body
+			if body.Base64Encoded {
+				decoded, err := base64.StdEncoding.DecodeString(text)
+				if err != nil {
+					return
+				}
+				text = string(decoded)
+			}
+			monitor.recordCapturedAPIResponse(response.URL, response.Status, text)
+		}(e.RequestID, response)
 	})
-	monitor.stop = wait
+	// Rod's EachEvent wait function may be called exactly once and panics with
+	// "can't use wait function twice" on any later call. Keep a single owner
+	// goroutine and signal completion through a channel instead of calling the
+	// wait function again from close(). The double call crashed whole worker
+	// processes whenever an attempt's context had already been cancelled before
+	// the deferred close() ran (e.g. a slow product hitting the navigation
+	// timeout), losing every URL that worker had already collected.
+	monitor.stopDone = make(chan struct{})
 	go func() {
+		defer close(monitor.stopDone)
 		wait()
 	}()
 	return monitor
@@ -2666,9 +3120,18 @@ func (m *navigationMonitor) close() {
 	if m == nil {
 		return
 	}
+	m.mu.Lock()
+	m.closing = true
+	m.mu.Unlock()
 	if m.cancel != nil {
 		m.cancel()
 	}
+	if m.stopDone != nil {
+		// Wait for the single EachEvent owner goroutine to finish instead of
+		// invoking the rod wait function a second time.
+		<-m.stopDone
+	}
+	m.bodyCaptureWG.Wait()
 }
 
 func (s *tripScraper) waitProductPageReady(ctx context.Context, maxWait time.Duration) (pageSnapshot, int) {
