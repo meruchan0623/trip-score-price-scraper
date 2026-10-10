@@ -48,3 +48,13 @@ venv/
 env/
 .env/
 .python-version
+
+# Private deployment configuration and sessions
+.env
+.env.*
+!.env.example
+.codex-handoff/
+*session*.json
+*cookie*.json
+*.provenance.json
+manual_vendor_attribution_latest.json

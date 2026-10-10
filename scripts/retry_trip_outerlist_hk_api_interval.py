@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Retry only failed rows in a daily HK Outerlist workbook at a controlled API interval."""
 from __future__ import annotations
+import os
 import argparse, importlib.util, json, sys, time
 from datetime import datetime
 from pathlib import Path
 import openpyxl
-COLLECTOR=Path('/Users/example/Develop/trip-score-price-scraper/scripts/trip_outerlist_mode2_api_daily.py')
+COLLECTOR=Path(os.environ.get("TRIP_PROJECT_ROOT", str(Path(__file__).resolve().parents[1]))) / 'scripts/trip_outerlist_mode2_api_daily.py'
 def load_collector():
  spec=importlib.util.spec_from_file_location('daily_collector',COLLECTOR); module=importlib.util.module_from_spec(spec); assert spec and spec.loader; spec.loader.exec_module(module); return module
 def value_rows(ws,headers):

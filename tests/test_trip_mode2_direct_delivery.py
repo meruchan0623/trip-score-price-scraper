@@ -14,6 +14,7 @@ SPEC = importlib.util.spec_from_file_location("trip_mode2_direct_delivery", SCRI
 assert SPEC and SPEC.loader
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
+MODULE.TARGET = "telegram:offline_test_chat"
 
 
 def test_promo_message_is_one_compact_message_without_raw_labels(tmp_path: Path) -> None:
@@ -333,3 +334,9 @@ def test_deployed_delivery_script_matches_project_copy() -> None:
         "deployed ~/.hermes/scripts/trip_mode2_direct_delivery.py is out of sync with "
         "scripts/hermes-cron/trip_mode2_direct_delivery.py; copy the project file over it"
     )
+
+
+def test_missing_target_fails_before_delivery(monkeypatch):
+    monkeypatch.setattr(MODULE, "TARGET", "")
+    with pytest.raises(SystemExit, match="TRIP_DELIVERY_TARGET"):
+        MODULE.main()

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Recover failed HK daily rows through the headed Go Mode2 CLI, then merge them."""
 from __future__ import annotations
+import os
 import argparse,importlib.util,json,math,subprocess,sys
 from datetime import datetime
 from pathlib import Path
 import openpyxl
-ROOT=Path('/Users/example/Develop/trip-score-price-scraper')
+ROOT=Path(os.environ.get("TRIP_PROJECT_ROOT", str(Path(__file__).resolve().parents[1])))
 COLLECTOR=ROOT/'scripts/trip_outerlist_mode2_api_daily.py'
 def load_collector():
  spec=importlib.util.spec_from_file_location('daily_collector',COLLECTOR); m=importlib.util.module_from_spec(spec); assert spec and spec.loader; spec.loader.exec_module(m); return m

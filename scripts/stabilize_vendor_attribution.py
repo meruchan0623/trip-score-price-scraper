@@ -18,6 +18,7 @@ scrapes keep the default (fill-only) behaviour because their products need not
 appear in the daily target at all.
 """
 from __future__ import annotations
+import os
 
 import argparse
 import json
@@ -39,9 +40,7 @@ from daily_mode2_urls import (  # noqa: E402
 )
 
 DEFAULT_TARGET = REPO_ROOT / "docs" / "日常抓取目标.xlsx"
-DEFAULT_MANUAL_ATTRIBUTION = Path(
-    "/Users/example/Documents/trip-operations/vendor-attribution/manual_vendor_attribution_latest.json"
-)
+DEFAULT_MANUAL_ATTRIBUTION = Path(os.environ.get("TRIP_OPERATIONS_ROOT", str(Path.home() / "Documents" / "trip-operations"))) / 'vendor-attribution/manual_vendor_attribution_latest.json'
 DETAIL_ID_RE = re.compile(r"/detail/(\d+)", re.I)
 LEGACY_UNSTABLE_VALUES = {"", "手动输入", "手動輸入"}
 CANONICAL_VENDOR_ORDER = tuple(VENDOR_COLS)

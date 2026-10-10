@@ -14,19 +14,23 @@
 
 set -euo pipefail
 
-PROJECT_ROOT="/Users/example/Develop/trip-score-price-scraper"
-PYTHON="/usr/local/bin/python3"
+PROJECT_ROOT="${TRIP_PROJECT_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}"
+RUN_DIR_BASE="${TRIP_DATA_ROOT:-$HOME/Documents/trip-sku-price-scrape}"
+HERMES_ROOT="${TRIP_HERMES_HOME:-$HOME/.hermes}"
+: "${TRIP_GOOGLE_SPREADSHEET_ID:?Set TRIP_GOOGLE_SPREADSHEET_ID}"
+: "${TRIP_DELIVERY_TARGET:?Set TRIP_DELIVERY_TARGET}"
+PYTHON="${TRIP_PYTHON:-python3}"
 VENDOR_STABILIZER="$PROJECT_ROOT/scripts/stabilize_vendor_attribution.py"
 BINARY="$PROJECT_ROOT/trip-score-price-scraper"
 DAILY_XLSX="$PROJECT_ROOT/docs/日常抓取目标.xlsx"
 TARGET_SYNC="$PROJECT_ROOT/scripts/daily_mode2_google_target_sync.py"
 # The product CLI must use the explicitly refreshed Trip customer session.
 # Never silently fall back to an old worker profile or anonymous state.
-SESSION_FILE="${TRIP_CLI_SESSION_FILE:-/Users/example/Documents/trip-sku-price-scrape/trip.com-cli-session.json}"
+SESSION_FILE="${TRIP_CLI_SESSION_FILE:-$RUN_DIR_BASE/trip.com-cli-session.json}"
 URL_FILE=""
 TARGET_ENV=""
 LOCK_DIR="/tmp/trip_mode2_daily.lock"
-RUN_DIR_BASE="/Users/example/Documents/trip-sku-price-scrape"
+
 RUN_NAME="$(date +%y%m%d)-mode2-daily"
 RUN_TIMESTAMP="$(date +%y%m%d-%H%M)"
 RUN_DIR="$RUN_DIR_BASE/$RUN_NAME"
@@ -37,7 +41,7 @@ NOTIFY_MARKER="$RUN_DIR/.failure_notified"
 # Failure notices must be short and in Chinese (group convention) and must never
 # fire for a successful run. MODE2_NOTIFY_DISABLED=1 suppresses the outbound
 # message for tests while still recording the reason.
-NOTIFY_TARGET="${MODE2_NOTIFY_TARGET:-telegram:YOUR_CHAT_ID}"
+NOTIFY_TARGET="${MODE2_NOTIFY_TARGET:-$TRIP_DELIVERY_TARGET}"
 mkdir -p "$RUN_DIR"
 
 notify_failure() {
@@ -312,9 +316,9 @@ with open('$DONE_MARKER', 'w') as f:
 # On a forced rerun the fresh XLSX must be delivered (and the promo-change
 # report regenerated) despite existing .delivery_done/.promo_change_reported.
 if [ "$MODE2_FORCE_RERUN" = "1" ]; then
-    MODE2_FORCE_DELIVERY=1 "$PYTHON" /Users/example/.hermes/scripts/trip_mode2_direct_delivery.py >&2
+    MODE2_FORCE_DELIVERY=1 "$PYTHON" "$PROJECT_ROOT/scripts/hermes-cron/trip_mode2_direct_delivery.py" >&2
 else
-    "$PYTHON" /Users/example/.hermes/scripts/trip_mode2_direct_delivery.py >&2
+    "$PYTHON" "$PROJECT_ROOT/scripts/hermes-cron/trip_mode2_direct_delivery.py" >&2
 fi
 printf '{"run_dir":"%s","output_path":"%s","processed_count":%s,"delivery":"direct"}\n' \
   "$RUN_DIR" "$MERGED_XLSX" "$TOTAL_PROCESSED"

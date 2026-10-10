@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Retry only failed Trip star-distribution records serially after rate-limit cooling."""
 from __future__ import annotations
+import os
 import importlib.util, json, time
 from pathlib import Path
 
-ROOT=Path('/Users/example/Documents/trip-sku-price-scrape/260831-rating-audit')
-SRC=Path('/Users/example/Develop/trip-score-price-scraper/scripts/collect_trip_rating_audit.py')
+ROOT=Path(os.environ.get("TRIP_DATA_ROOT", str(Path.home() / "Documents" / "trip-sku-price-scrape"))) / '260831-rating-audit'
+SRC=Path(os.environ.get("TRIP_PROJECT_ROOT", str(Path(__file__).resolve().parents[1]))) / 'scripts/collect_trip_rating_audit.py'
 spec=importlib.util.spec_from_file_location('collector',SRC)
 if spec is None or spec.loader is None:
     raise RuntimeError(f'cannot load collector: {SRC}')

@@ -40,8 +40,8 @@ if str(REPO_ROOT) not in sys.path:
 from daily_mode2_urls import VENDOR_COLS, extract_product_ids, resolve_vendor_columns  # noqa: E402
 
 # ---- 集中配置：目标 Google Sheet（公开，无需登录/OAuth） ----
-SPREADSHEET_ID = "YOUR_GOOGLE_SPREADSHEET_ID"
-SHEET_GID = "0"
+SPREADSHEET_ID = os.environ.get("TRIP_GOOGLE_SPREADSHEET_ID", "").strip()
+SHEET_GID = os.environ.get("TRIP_GOOGLE_SHEET_GID", "0")
 SHEET_NAME = "Sheet1"
 ACCEPTED_SHEET_NAMES = ("Sheet1", "工作表1")
 EXPORT_URL = (
@@ -65,6 +65,8 @@ class TargetSyncError(RuntimeError):
 
 
 def export_url(spreadsheet_id: str = SPREADSHEET_ID, gid: str = SHEET_GID) -> str:
+    if not spreadsheet_id or spreadsheet_id == "YOUR_GOOGLE_SPREADSHEET_ID":
+        raise TargetSyncError("Set TRIP_GOOGLE_SPREADSHEET_ID before syncing")
     return EXPORT_URL.format(spreadsheet_id=spreadsheet_id, gid=gid)
 
 

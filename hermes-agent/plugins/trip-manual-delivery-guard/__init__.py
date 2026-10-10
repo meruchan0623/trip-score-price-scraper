@@ -14,7 +14,7 @@ from typing import NamedTuple
 DEFAULT_OUTPUT_ROOT = Path(
     os.environ.get(
         "TRIP_MANUAL_OUTPUT_ROOT",
-        "/Users/example/Documents/trip-sku-price-scrape",
+        str(Path.home() / "Documents" / "trip-sku-price-scrape"),
     )
 )
 NATIVE_WORKBOOK_PATTERN = "trip_scoreandprice_results_*.xlsx"

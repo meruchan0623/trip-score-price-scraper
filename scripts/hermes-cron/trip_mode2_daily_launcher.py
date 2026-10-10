@@ -23,8 +23,8 @@ import sys
 import time
 from pathlib import Path
 
-DEFAULT_COLLECTOR = Path('/Users/example/.hermes/scripts/trip_daily_mode2_cron.sh')
-DEFAULT_ROOT = Path('/Users/example/Documents/trip-sku-price-scrape')
+DEFAULT_COLLECTOR = Path(os.environ.get("TRIP_HERMES_HOME", str(Path.home() / ".hermes"))) / 'scripts/trip_daily_mode2_cron.sh'
+DEFAULT_ROOT = Path(os.environ.get("TRIP_DATA_ROOT", str(Path.home() / "Documents" / "trip-sku-price-scrape")))
 RUN_DIR_SUFFIX = '-mode2-daily'
 DONE_MARKER = '.collection_done'
 STATE_FILE = 'launcher_state.json'

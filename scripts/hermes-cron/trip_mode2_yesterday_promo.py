@@ -10,13 +10,14 @@ previous-day `总促销标签` string is copied by (sheet, 商品ID); anything m
 yields an empty cell. Re-running never adds a second baseline column.
 """
 from __future__ import annotations
+import os
 
 import argparse
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
-ROOT = Path("/Users/example/Documents/trip-sku-price-scrape")
+ROOT = Path(os.environ.get("TRIP_DATA_ROOT", str(Path.home() / "Documents" / "trip-sku-price-scrape")))
 SITES = ("TW", "HK", "RU", "JP", "VN", "TH")
 PID_HEADER = "商品ID"
 PROMO_HEADER = "总促销标签"

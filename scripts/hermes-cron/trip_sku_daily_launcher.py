@@ -15,19 +15,19 @@ import sys
 import time
 from pathlib import Path
 
-SYSTEM_PYTHON = '/usr/local/bin/python3'
+SYSTEM_PYTHON = os.environ.get("TRIP_PYTHON", sys.executable)
 if Path(SYSTEM_PYTHON).exists() and Path(sys.executable).resolve() != Path(SYSTEM_PYTHON).resolve():
     os.execv(SYSTEM_PYTHON, [SYSTEM_PYTHON, __file__, *sys.argv[1:]])
 
 from openpyxl import load_workbook
 
-ROOT = Path('/Users/example/Documents/trip-sku-price-scrape')
+ROOT = Path(os.environ.get("TRIP_DATA_ROOT", str(Path.home() / "Documents" / "trip-sku-price-scrape")))
 CONFIG_INPUT = ROOT / 'config' / '非TSIM厂商价格抓取输入.xlsx'
-REPO = Path('/Users/example/Develop/trip-score-price-scraper')
+REPO = Path(os.environ.get("TRIP_PROJECT_ROOT", str(Path(__file__).resolve().parents[2])))
 BINARY = Path('/tmp/trip-score-cdp')
 FINALIZER = REPO / 'scripts' / 'hermes-cron' / 'trip_sku_trend_finalize.py'
 VENDOR_STABILIZER = REPO / 'scripts' / 'stabilize_vendor_attribution.py'
-FINAL_DELIVERY = Path('/Users/example/.hermes/scripts/trip_sku_non_tsim_final_delivery.py')
+FINAL_DELIVERY = Path(os.environ.get("TRIP_HERMES_HOME", str(Path.home() / ".hermes"))) / 'scripts/trip_sku_non_tsim_final_delivery.py'
 DEFAULT_COMPARE_VENDOR = 'TSIM 網址'
 DEFAULT_DELAY_PROFILE = 'normal'
 DEFAULT_TIMEOUT_SECONDS = 1800
@@ -208,7 +208,7 @@ run=Path({str(run_dir)!r})
 state=json.loads((run/'input_summary.json').read_text())
 state.update({{'status':'running','start_time':time.time(),'pid':int((run/'runner.pid').read_text().strip()),'log_path':{str(log_path)!r}}})
 (run/'current_state.json').write_text(json.dumps(state,ensure_ascii=False,indent=2),encoding='utf-8')
-Path('/Users/example/Documents/trip-sku-price-scrape/current_state.json').write_text(json.dumps(state,ensure_ascii=False,indent=2),encoding='utf-8')
+Path({str(ROOT / "current_state.json")!r}).write_text(json.dumps(state,ensure_ascii=False,indent=2),encoding='utf-8')
 PY
 set +e
 {str(BINARY)!r} --run-mode mode1 --workers {workers} --delay-profile {DEFAULT_DELAY_PROFILE} --deadline 0530 --url-total-timeout 300 --navigation-timeout 120 --worker-stall-timeout 600 --max-quality-retries 2 --max-browser-restarts-per-vendor 2 --vendor-api-block-ratio 0.70 --vendor-api-block-min-attempts 10 --global-api-block-ratio 0.60 --global-api-block-min-processed 50 --fast-url-threshold 30 --risk-to-safe-threshold 10 --checkpoint-every-urls 10 --timeout {DEFAULT_TIMEOUT_SECONDS} --excel-input "$INPUT" --log-level verbose --log-file {str(jsonl_log_path)!r} --compare-vendor {DEFAULT_COMPARE_VENDOR!r} --output-dir "$RUN_DIR" > "$LOG" 2>&1
@@ -224,7 +224,7 @@ state=json.loads((run/'current_state.json').read_text())
 code=int((run/'exit_code.txt').read_text().strip())
 state.update({{'status':'scraped' if code == 0 else 'failed','exit_code':code,'scrape_end_time':time.time()}})
 (run/'current_state.json').write_text(json.dumps(state,ensure_ascii=False,indent=2),encoding='utf-8')
-Path('/Users/example/Documents/trip-sku-price-scrape/current_state.json').write_text(json.dumps(state,ensure_ascii=False,indent=2),encoding='utf-8')
+Path({str(ROOT / "current_state.json")!r}).write_text(json.dumps(state,ensure_ascii=False,indent=2),encoding='utf-8')
 PY
 if [ "$code" -ne 0 ]; then
   exit "$code"
@@ -241,7 +241,7 @@ run=Path({str(run_dir)!r})
 state=json.loads((run/'current_state.json').read_text())
 state.update({{'status':'finalized','end_time':time.time()}})
 (run/'current_state.json').write_text(json.dumps(state,ensure_ascii=False,indent=2),encoding='utf-8')
-Path('/Users/example/Documents/trip-sku-price-scrape/current_state.json').write_text(json.dumps(state,ensure_ascii=False,indent=2),encoding='utf-8')
+Path({str(ROOT / "current_state.json")!r}).write_text(json.dumps(state,ensure_ascii=False,indent=2),encoding='utf-8')
 PY
 /usr/bin/env python3 {str(FINAL_DELIVERY)!r} "$RUN_DIR" > "$RUN_DIR/final_delivery_output.json" 2> "$RUN_DIR/final_delivery_error.log" || true
 exit $code

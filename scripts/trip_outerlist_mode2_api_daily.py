@@ -25,9 +25,9 @@ import openpyxl
 from openpyxl.styles import Alignment, Font
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-OUTER_ROOT = Path('/Users/example/Documents/tripcom-outerlist-scraping')
-ATTR = Path('/Users/example/Documents/trip-operations/vendor-attribution/manual_vendor_attribution_latest.json')
-DEFAULT_ROOT = Path('/Users/example/Documents/trip-sku-price-scrape')
+OUTER_ROOT = Path(os.environ.get("TRIP_OUTERLIST_ROOT", str(Path.home() / "Documents" / "tripcom-outerlist-scraping")))
+ATTR = Path(os.environ.get("TRIP_OPERATIONS_ROOT", str(Path.home() / "Documents" / "trip-operations"))) / 'vendor-attribution/manual_vendor_attribution_latest.json'
+DEFAULT_ROOT = Path(os.environ.get("TRIP_DATA_ROOT", str(Path.home() / "Documents" / "trip-sku-price-scrape")))
 SITES = [('tw', 'zh-TW', 'TWD'), ('hk', 'zh-HK', 'HKD'), ('ru', 'ru-RU', 'RUB'), ('jp', 'ja-JP', 'JPY'), ('vn', 'vi-VN', 'VND'), ('th', 'th-TH', 'THB')]
 OUTER_HEADERS = ['厂商', '商品ID', 'URL', '商品名称', 'Outerlist总分', 'Outerlist评价数', 'Outerlist价格', 'Outerlist标签']
 HEADERS = ['厂商', '商品ID', 'URL', '商品名称', '商品资讯', '总促销标签', '销量增量', '月销量', '年销量', '总销量', '评价数', '总分', '评分变化', '好评率', '客户服务', '方便程度', '讯号状态', '中差评价数', '抓取备注']

@@ -147,8 +147,8 @@ def test_env_overrides_apply(tmp_path, monkeypatch):
 
 
 def test_default_paths_point_at_external_collector():
-    assert str(MODULE.DEFAULT_COLLECTOR) == "/Users/example/.hermes/scripts/trip_daily_mode2_cron.sh"
-    assert str(MODULE.DEFAULT_ROOT) == "/Users/example/Documents/trip-sku-price-scrape"
+    assert str(MODULE.DEFAULT_COLLECTOR) == str(Path(os.environ.get("TRIP_HERMES_HOME", str(Path.home() / ".hermes"))) / "scripts/trip_daily_mode2_cron.sh")
+    assert str(MODULE.DEFAULT_ROOT) == str(Path(os.environ.get("TRIP_DATA_ROOT", str(Path.home() / "Documents" / "trip-sku-price-scrape"))))
 
 
 def test_deployed_collector_matches_project_copy() -> None:

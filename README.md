@@ -1,3 +1,27 @@
+## 自定义配置（公开版）
+
+本仓库不包含实际业务表格、Telegram 群组、本机用户目录或内部 Cron 交接记录。部署前复制 `.env.example` 为本地 `.env`，填写配置后运行 `set -a; source .env; set +a`；Cron 必须显式加载同一配置。`.env` 已忽略，禁止提交真实值。
+
+| 变量 | 配置说明 |
+|---|---|
+| `TRIP_GOOGLE_SPREADSHEET_ID` | 同步目标表时必填；Google 表格 URL 中 `/d/` 后的 ID。导出方式要求表格可匿名读取，请使用专用无隐私目标表。 |
+| `TRIP_GOOGLE_SHEET_GID` | 工作表 gid，默认 `0`。表头和工作表名称仍需符合下文输入格式。 |
+| `TRIP_DELIVERY_TARGET` | 自动投递时必填，如 `telegram:YOUR_CHAT_ID`；在 Hermes 私有配置中另行配置 Bot 凭据。 |
+| `MODE2_NOTIFY_TARGET` | 可选失败通知目标，默认使用投递目标。 |
+| `TRIP_PROJECT_ROOT` | 可选项目绝对路径，默认从脚本位置推导。 |
+| `TRIP_DATA_ROOT` | 可选结果目录，默认当前用户的 `Documents/trip-sku-price-scrape`。 |
+| `TRIP_HERMES_HOME` | 可选 Hermes 目录，默认当前用户的 `.hermes`。 |
+| `TRIP_OPERATIONS_ROOT` | 可选归属参考目录，默认 `Documents/trip-operations`；提供自己的 `vendor-attribution/manual_vendor_attribution_latest.json`。 |
+| `TRIP_OUTERLIST_ROOT` | 可选 outerlist 数据目录，默认 `Documents/tripcom-outerlist-scraping`。 |
+| `TRIP_CLI_SESSION_FILE` | 可选私有 Trip 会话文件路径，默认结果目录下 `trip.com-cli-session.json`。 |
+| `TRIP_PYTHON` | Mode2 shell 使用的 Python，默认 `python3`；安装 `openpyxl`。 |
+| `TRIP_MODE2_COLLECTOR` / `TRIP_MODE2_ROOT` | launcher 已有的可选 collector / 结果目录覆盖。 |
+| `TRIP_MANUAL_OUTPUT_ROOT` | 手动交付 guard 已有的可选结果目录覆盖。 |
+
+缺少目标表 ID 或投递目标时对应操作直接失败，不回退到旧业务配置。普通 Go 抓取无需 Google/Telegram 配置。文档中的 `/Users/example`、`YOUR_*` 均为示例；历史运维计划仅供参考，需替换为自己的配置。部分评级审计工具仍使用示例数据日期，请按自身输入调整。SKU Cron 的 `trip_sku_non_tsim_final_delivery.py` 是部署端外部脚本，需在自己的 Hermes scripts 中提供，不包含任何实际群组配置。
+
+公开前已移除内部交接文档，并重写远端各分支历史中的实际表格标识、群组标识和用户目录；旧克隆应重新克隆，避免重新推回旧历史。
+
 # Trip.com SKU / 价格抓取工具
 
 本项目使用 Go + Chrome DevTools Protocol (CDP) 抓取 Trip.com Things-to-Do 商品的 SKU 价格。下面的「给 Agent 的当前抓取契约」是执行抓取、排障和验收时的唯一准则；网页与接口为实时外部状态，旧的录制结果不能代替本次运行证据。

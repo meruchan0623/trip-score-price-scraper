@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Deliver a completed Mode2 collection once; no agent/model inference involved."""
 from __future__ import annotations
+import os
 
 import json
 import subprocess
@@ -9,16 +10,18 @@ from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
 
-ROOT = Path("/Users/example/Documents/trip-sku-price-scrape")
-PROJECT = Path("/Users/example/Develop/trip-score-price-scraper")
+ROOT = Path(os.environ.get("TRIP_DATA_ROOT", str(Path.home() / "Documents" / "trip-sku-price-scrape")))
+PROJECT = Path(os.environ.get("TRIP_PROJECT_ROOT", str(Path(__file__).resolve().parents[2])))
 DELIVER = PROJECT / "trip_deliver.py"
-TARGET = "telegram:YOUR_CHAT_ID"
+TARGET = os.environ.get("TRIP_DELIVERY_TARGET", "").strip()
 SITES = {"TW", "HK", "RU", "JP", "VN", "TH"}
 # The Go CLI defaults 厂商 to this when nothing real was attributed.
 LEGACY_VENDOR_PLACEHOLDERS = {"手动输入", "手動輸入"}
 
 
 def send(text: str) -> None:
+    if not TARGET:
+        raise RuntimeError("Set TRIP_DELIVERY_TARGET before delivery")
     result = subprocess.run(["hermes", "send", "--to", TARGET, text], capture_output=True, text=True)
     if result.returncode:
         raise RuntimeError(result.stderr.strip() or "hermes send failed")
@@ -369,6 +372,9 @@ def promo_messages(today: Path, previous: Path | None, limit: int = MESSAGE_LIMI
 
 def main() -> int:
     import os
+
+    if not TARGET:
+        raise SystemExit("Set TRIP_DELIVERY_TARGET before delivery")
 
     # Manual-only override (set by trip_daily_mode2_cron.sh under MODE2_FORCE_RERUN=1):
     # re-deliver the latest XLSX and regenerate the promo report even though the

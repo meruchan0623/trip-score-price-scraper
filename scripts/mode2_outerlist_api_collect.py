@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """One-off browserless Mode2 collector from the public Trip product-info API."""
 from __future__ import annotations
+import os
 import concurrent.futures as futures
 import json, re, sys, time, urllib.request
 from datetime import datetime
@@ -8,9 +9,9 @@ from pathlib import Path
 import openpyxl
 from openpyxl.styles import Font, Alignment
 
-OUTER = Path('/Users/example/Documents/tripcom-outerlist-scraping/260829-0930/items.jsonl')
-ATTR = Path('/Users/example/Documents/trip-operations/vendor-attribution/manual_vendor_attribution_latest.json')
-ROOT = Path('/Users/example/Documents/trip-sku-price-scrape')
+OUTER = Path(os.environ.get("TRIP_OUTERLIST_ROOT", str(Path.home() / "Documents" / "tripcom-outerlist-scraping"))) / '260829-0930/items.jsonl'
+ATTR = Path(os.environ.get("TRIP_OPERATIONS_ROOT", str(Path.home() / "Documents" / "trip-operations"))) / 'vendor-attribution/manual_vendor_attribution_latest.json'
+ROOT = Path(os.environ.get("TRIP_DATA_ROOT", str(Path.home() / "Documents" / "trip-sku-price-scrape")))
 SITES = [('tw','zh-TW','TWD'), ('hk','zh-HK','HKD'), ('ru','ru-RU','RUB'), ('jp','ja-JP','JPY'), ('vn','vi-VN','VND'), ('th','th-TH','THB')]
 HEADERS = ['厂商','商品ID','URL','商品名称','商品资讯','总促销标签','月销量','年销量','总销量','评价数','评分','好评率','客户服务','方便程度','讯号状态','中差评价数','抓取备注']
 SPACE = re.compile(r'\s+')

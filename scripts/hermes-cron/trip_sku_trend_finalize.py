@@ -20,7 +20,7 @@ if Path(SYSTEM_PYTHON).exists() and Path(sys.executable).resolve() != Path(SYSTE
 
 from openpyxl import Workbook, load_workbook
 
-ROOT = Path('/Users/example/Documents/trip-sku-price-scrape')
+ROOT = Path(os.environ.get("TRIP_DATA_ROOT", str(Path.home() / "Documents" / "trip-sku-price-scrape")))
 DEFAULT_VENDORS = ['TSIM 網址', 'BC', 'TGT', 'FR', 'JY', '其他']
 TREND_COLUMNS = [
     '对比基准日期', '对比基准目录', '趋势匹配状态',

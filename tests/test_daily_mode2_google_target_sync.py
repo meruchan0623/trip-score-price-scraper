@@ -1,3 +1,6 @@
+import os
+os.environ.setdefault("TRIP_GOOGLE_SPREADSHEET_ID", "offline_test_sheet")
+
 import io
 import json
 
@@ -222,3 +225,8 @@ def test_cli_end_to_end_offline(mirror, tmp_path, monkeypatch, capsys):
     assert len(urls.read_text().splitlines()) == 4
     assert (run_dir / "target" / mirror.name).exists()
     assert extract_product_ids(mirror) == [10001, 10002, 10003, 10004]
+
+
+def test_missing_sheet_id_rejected():
+    with pytest.raises(sync.TargetSyncError, match="TRIP_GOOGLE_SPREADSHEET_ID"):
+        sync.export_url("")

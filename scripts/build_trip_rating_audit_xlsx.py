@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import os
 from pathlib import Path
 import json
 from decimal import Decimal, ROUND_HALF_UP
@@ -6,11 +7,11 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
-root=Path('/Users/example/Documents/trip-sku-price-scrape/260831-rating-audit')
+root=Path(os.environ.get("TRIP_DATA_ROOT", str(Path.home() / "Documents" / "trip-sku-price-scrape"))) / '260831-rating-audit'
 out=root/'Trip产品评分_20260831_部分完成.xlsx'
 all_rows=json.loads((root/'all_product_scores.json').read_text())
 main_rows=json.loads((root/'main_product_stars.json').read_text())
-mode2=Path('/Users/example/Documents/trip-sku-price-scrape/260831-mode2-daily/trip_mode2_daily_6site.xlsx')
+mode2=Path(os.environ.get("TRIP_DATA_ROOT", str(Path.home() / "Documents" / "trip-sku-price-scrape"))) / '260831-mode2-daily/trip_mode2_daily_6site.xlsx'
 wbm=load_workbook(mode2,read_only=True,data_only=True);ws=wbm['HK']; it=ws.iter_rows(values_only=True);h=list(next(it)); pid_i=h.index('商品ID'); name_i=h.index('商品名称');url_i=h.index('URL')
 name_map={str(r[pid_i]):{'product_name':str(r[name_i] or ''),'url':str(r[url_i] or '')} for r in it if r[pid_i]};wbm.close()
 for r in main_rows:
