@@ -57,6 +57,29 @@ class TripManualDeliveryGuardTests(unittest.TestCase):
         os.utime(workbook, (modified_at, modified_at))
         return workbook
 
+    def make_semantic_workbook(
+        self, root, product_ids, *, directory=None, age_seconds=0, batch=None
+    ):
+        output_dir = directory or root / f"manual-{'-'.join(product_ids)}"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M")
+        batch = "-".join(product_ids) if batch is None else batch
+        workbook = output_dir / (
+            f"Trip_Mode1_指定产品抓价_{batch}_{stamp}.xlsx"
+        )
+        workbook.write_bytes(b"renamed native workbook")
+        modified_at = time.time() - age_seconds
+        os.utime(workbook, (modified_at, modified_at))
+        return workbook
+
+    @staticmethod
+    def write_receipt(workbook, *, target="telegram:-5186417467"):
+        (workbook.parent / ".delivered.json").write_text(
+            '{"status":"delivered","path":"' + str(workbook) + '","target":"'
+            + target + '"}',
+            encoding="utf-8",
+        )
+
     def test_single_product_success_returns_only_native_workbook_path(self):
         with tempfile.TemporaryDirectory() as tmp:
             output_root = Path(tmp)
@@ -73,6 +96,144 @@ class TripManualDeliveryGuardTests(unittest.TestCase):
             )
 
             self.assertEqual(result, str(workbook))
+
+    def test_semantic_renamed_delivered_receipt_is_checked_before_native_glob(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workbook = self.make_semantic_workbook(root, ("92237157",))
+            self.write_receipt(workbook)
+            turn = self.plugin.ManualTurn(("92237157",), workbook.parent, time.time() - 10)
+
+            self.assertEqual(
+                self.plugin.filter_manual_response(
+                    str(workbook), turn, expected_target="telegram:-5186417467"
+                ),
+                "附件已发送。",
+            )
+
+    def test_semantic_renamed_undelivered_workbook_is_returned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workbook = self.make_semantic_workbook(root, ("92237157",))
+            turn = self.plugin.ManualTurn(("92237157",), workbook.parent, time.time() - 10)
+            self.assertEqual(self.plugin.filter_manual_response(str(workbook), turn), str(workbook))
+
+    def test_stale_semantic_workbook_and_valid_receipt_are_not_reused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workbook = self.make_semantic_workbook(root, ("92237157",), age_seconds=60)
+            self.write_receipt(workbook)
+            turn = self.plugin.ManualTurn(("92237157",), workbook.parent, time.time())
+            self.assertTrue(
+                self.plugin.filter_manual_response(str(workbook), turn).startswith("抓取失败")
+            )
+
+    def test_stale_valid_receipt_does_not_block_a_new_workbook_in_reused_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            product_ids = ("92237157",)
+            old = self.make_semantic_workbook(root, product_ids, age_seconds=60)
+            self.write_receipt(old)
+            stamp = datetime.now().strftime("%y%m%d-%H%M")
+            fresh = old.parent / f"trip_scoreandprice_results_{stamp}.xlsx"
+            fresh.write_bytes(b"new native workbook")
+            turn = self.plugin.ManualTurn(product_ids, fresh.parent, time.time() - 10)
+
+            self.assertEqual(self.plugin.filter_manual_response(str(fresh), turn), str(fresh))
+
+    def test_malformed_receipt_is_anomaly_not_stale_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workbook = self.make_semantic_workbook(root, ("92237157",))
+            (workbook.parent / ".delivered.json").write_text("[]", encoding="utf-8")
+            turn = self.plugin.ManualTurn(("92237157",), workbook.parent, time.time() - 10)
+            self.assertEqual(
+                self.plugin.filter_manual_response(str(workbook), turn),
+                "抓取结果异常：原生Excel交付回执或识别异常。",
+            )
+
+    def test_receipt_target_mismatch_does_not_suppress_when_hook_target_is_known(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workbook = self.make_semantic_workbook(root, ("92237157",))
+            self.write_receipt(workbook, target="telegram:wrong")
+            turn = self.plugin.ManualTurn(("92237157",), workbook.parent, time.time() - 10)
+            self.assertEqual(
+                self.plugin.filter_manual_response(
+                    str(workbook), turn, expected_target="telegram:-5186417467"
+                ),
+                "抓取结果异常：原生Excel交付回执或识别异常。",
+            )
+
+    def test_timestamped_rerun_requires_its_response_workbook_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = root / "manual-92237157"
+            rerun = root / "manual-92237157-rerun-260930-1522"
+            workbook = self.make_semantic_workbook(root, ("92237157",), directory=rerun)
+            turn = self.plugin.ManualTurn(("92237157",), base, time.time() - 10)
+            self.assertTrue(self.plugin.filter_manual_response("done", turn).startswith("抓取失败"))
+            self.assertEqual(self.plugin.filter_manual_response(f"MEDIA:{workbook}", turn), str(workbook))
+
+    def test_timestamped_rerun_delivered_receipt_suppresses_duplicate_delivery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = root / "manual-92237157"
+            rerun = root / "manual-92237157-rerun-260930-1522"
+            workbook = self.make_semantic_workbook(root, ("92237157",), directory=rerun)
+            self.write_receipt(workbook)
+            turn = self.plugin.ManualTurn(("92237157",), base, time.time() - 10)
+
+            self.assertEqual(
+                self.plugin.filter_manual_response(f"MEDIA:{workbook}", turn), "附件已发送。"
+            )
+
+    def test_wrong_batch_workbook_is_not_recognized_as_current_batch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            directory = root / "manual-92237157"
+            wrong = self.make_semantic_workbook(
+                root, ("109223304",), directory=directory
+            )
+            turn = self.plugin.ManualTurn(("92237157",), directory, time.time() - 10)
+            self.assertEqual(
+                self.plugin.filter_manual_response(str(wrong), turn),
+                "抓取结果异常：原生Excel交付回执或识别异常。",
+            )
+
+    def test_large_batch_requires_exact_documented_count_label(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            product_ids = tuple(str(10000000 + number) for number in range(6))
+            workbook = self.make_semantic_workbook(root, product_ids, batch="5产品批次")
+            turn = self.plugin.ManualTurn(product_ids, workbook.parent, time.time() - 10)
+            self.assertEqual(
+                self.plugin.filter_manual_response(str(workbook), turn),
+                "抓取结果异常：原生Excel交付回执或识别异常。",
+            )
+
+    def test_fresh_unsupported_xlsx_is_recognition_anomaly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            directory = root / "manual-92237157"
+            directory.mkdir()
+            workbook = directory / "unexpected.xlsx"
+            workbook.write_bytes(b"fresh unsupported workbook")
+            turn = self.plugin.ManualTurn(("92237157",), directory, time.time() - 10)
+            self.assertEqual(
+                self.plugin.filter_manual_response(str(workbook), turn),
+                "抓取结果异常：原生Excel交付回执或识别异常。",
+            )
+
+    def test_empty_workbook_is_not_discovered(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            directory = root / "manual-92237157"
+            directory.mkdir()
+            stamp = datetime.now().strftime("%y%m%d-%H%M")
+            (directory / f"trip_scoreandprice_results_{stamp}.xlsx").touch()
+            turn = self.plugin.ManualTurn(("92237157",), directory, time.time() - 10)
+            self.assertTrue(self.plugin.filter_manual_response("done", turn).startswith("抓取失败"))
 
     def test_five_product_summary_keeps_only_normalized_warning_and_workbook(self):
         product_ids = ("105592323", "91391102", "53820320", "54247970", "86626309")
@@ -175,7 +336,7 @@ class TripManualDeliveryGuardTests(unittest.TestCase):
 
             self.assertTrue(result.startswith("抓取失败：未生成原生Excel"))
 
-    def test_old_timestamp_workbook_is_not_reused_after_being_touched(self):
+    def test_old_timestamp_workbook_is_recognition_anomaly_after_being_touched(self):
         with tempfile.TemporaryDirectory() as tmp:
             output_root = Path(tmp)
             workbook = self.make_workbook(
@@ -192,9 +353,9 @@ class TripManualDeliveryGuardTests(unittest.TestCase):
 
             result = self.plugin.filter_manual_response(str(workbook), turn)
 
-            self.assertTrue(result.startswith("抓取失败：未生成原生Excel"))
+            self.assertEqual(result, "抓取结果异常：原生Excel交付回执或识别异常。")
 
-    def test_invalid_timestamp_workbook_is_ignored(self):
+    def test_invalid_timestamp_workbook_is_recognition_anomaly(self):
         with tempfile.TemporaryDirectory() as tmp:
             output_root = Path(tmp)
             output_dir = output_root / "manual-71827107"
@@ -210,7 +371,7 @@ class TripManualDeliveryGuardTests(unittest.TestCase):
 
             result = self.plugin.filter_manual_response(str(workbook), turn)
 
-            self.assertTrue(result.startswith("抓取失败：未生成原生Excel"))
+            self.assertEqual(result, "抓取结果异常：原生Excel交付回执或识别异常。")
 
     def test_id_only_followup_requires_prior_manual_scrape_intent(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -291,6 +452,23 @@ class TripManualDeliveryGuardTests(unittest.TestCase):
             )
 
             self.assertEqual(turn.product_ids, ("109223304",))
+
+    def test_quoted_reply_and_injected_context_are_not_a_new_scrape_request(self):
+        quoted = (
+            '[Replying to: "请抓取产品价格 https://tw.trip.com/things-to-do/detail/116063167?locale=zh-TW"]'
+            "\n\n先下一单，用保险箱里的信用卡支付\n\n"
+            "本轮是单个或数个指定Trip产品的价格抓取。请抓取价格 116063167"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(
+                self.plugin.detect_manual_request(quoted, [], output_root=Path(tmp))
+            )
+
+    def test_own_text_after_reply_quote_can_still_trigger(self):
+        text = '[Replying to: "好的"]\n\n请抓取产品价格116063167'
+        with tempfile.TemporaryDirectory() as tmp:
+            turn = self.plugin.detect_manual_request(text, [], output_root=Path(tmp))
+        self.assertEqual(turn.product_ids, ("116063167",))
 
     def test_registered_hooks_filter_only_matching_turn(self):
         with tempfile.TemporaryDirectory() as tmp:

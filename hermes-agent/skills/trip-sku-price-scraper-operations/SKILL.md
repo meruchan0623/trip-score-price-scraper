@@ -27,7 +27,7 @@ Do not restore or recommend the removed Python CLI, Python GUI, Selenium/undetec
 
 - Repo: `/Users/tsimclaw/Develop/trip-score-price-scraper`
 - Binary: `/tmp/trip-score-cdp`
-- **Authoritative daily scrape target table** (ID form, worksheet `Sheet1`, columns = vendors `TSIM 網址/BC/TGT/FR/JY/其他`): `/Users/tsimclaw/Develop/trip-score-price-scraper/docs/日常抓取目标.xlsx`. When building URL lists from it, follow the「URL 拼接约定」below.
+- **Authoritative daily scrape target table**: Google workbook `https://docs.google.com/spreadsheets/d/1yTsSBTwLQN_dLKq08xpD1Set0sw9WptfQcewnkaA-cc/edit`, **`Trip` tab (`gid=0`) only**. The workbook also contains a separate **`KKday` tab (`gid=1948158253`)**; never treat it as Trip input or replace the Trip mirror with its export. The local Trip mirror is `/Users/tsimclaw/Develop/trip-score-price-scraper/docs/日常抓取目标.xlsx`, in ID form with the complete vendor schema `TSIM 網址`/`TSIM`, `BC/TGT/FR/JY/其他`. Prefer the explicit Trip-only export `https://docs.google.com/spreadsheets/d/1yTsSBTwLQN_dLKq08xpD1Set0sw9WptfQcewnkaA-cc/export?format=xlsx&gid=0`; if reading a full multi-tab export, select and validate the Trip target sheet rather than rejecting the workbook for having a KKday tab or assuming its active sheet. Historical single-tab snapshots named `Sheet1`/`工作表1` remain valid only after matching the complete Trip vendor schema. For KKday fixed/default targets, use `kkday-sku-price-scraper-operations` and its `KKday` tab rules. When building Trip URL lists, follow the「URL 拼接约定」below.
 - Output root: `/Users/tsimclaw/Documents/trip-sku-price-scrape`
 - Each run must write into a timestamped run folder under the output root, named with local time `YYMMDD-HHMM`, for example:
   - `/Users/tsimclaw/Documents/trip-sku-price-scrape/260529-1841/`
@@ -49,7 +49,17 @@ When constructing scrape URLs from product IDs / a target table (`docs/日常抓
 
 ## Standard command shape
 
-Build and verify the CLI:
+For routine commands, load [`references/cli-quick-reference.md`](references/cli-quick-reference.md) first. It gives copyable mode1/mode2, vendor-compare, and delivery commands plus the audited `--help` evidence. In particular, the delivery script is only at the repository root:
+
+```bash
+python3 /Users/tsimclaw/Develop/trip-score-price-scraper/trip_deliver.py \
+  '/absolute/path/result.xlsx' \
+  --to 'telegram:<chat_id>'
+```
+
+Do not probe `scripts/trip_deliver.py` or `hermes-agent/scripts/trip_deliver.py`; those are not current files.
+
+Build the CLI only when source or dependencies have changed since its build, or the intended binary does not exist. Otherwise run the existing binary directly. Full tests belong after code changes, not before each scrape. Conditional build command:
 
 ```bash
 cd /Users/tsimclaw/Develop/trip-score-price-scraper
@@ -147,7 +157,7 @@ For this manual workflow, every supplied Trip.com URL is a product identifier on
 1. Treat the request as a direct-input Go CDP SKU-price scrape, not an Excel-vendor batch and not the Trip outerlist scraper.
 2. Resolve every requested product to its exact Trip.com detail URL. Pass one `-input` argument per product, preserving the user's order. Do not generate an input workbook or URL-list file for this workflow.
 3. Use an explicit manual output directory under `/Users/tsimclaw/Documents/trip-sku-price-scrape/`. Name it `manual-<product-id>` for one product. For several products, join all requested IDs in order with `-`, producing `manual-<id-1>-<id-2>-...`.
-4. From the repository root, build the project-local manual binary before the run:
+4. Reuse the existing project-local manual binary when source and dependencies are unchanged. Build from the repository root only when source or dependencies have changed since its build, or `./trip-score-price-scraper` does not exist:
 
 ```bash
 go build -o ./trip-score-price-scraper ./cmd/trip-score-cdp
@@ -218,13 +228,27 @@ Filename rules:
 - Rename only after structural validation. Re-run validation against the renamed path, then deliver that exact path and verify `.delivered.json` records the renamed path and intended target.
 - This rename changes only the attachment filename. Never rebuild, rewrite, add sheets, reorder columns, or otherwise alter the native workbook.
 
+**Delivery-guard lesson:** after the semantic rename, the guard treats both the
+legacy `trip_scoreandprice_results_<YYMMDD-HHMM>.xlsx` name and the renamed
+`Trip_Mode1_<purpose>_<batch>_<YYYYMMDD-HHMM>.xlsx` name as native output. For
+one to five selected products, the final batch field must be the requested
+ordered IDs joined by `-`; for more than five it must end in the documented
+`<count>产品批次` label with the exact requested count. A fresh, non-empty XLSX
+that does not meet this recognition rule is an anomaly, not a missing result.
+For the current invocation it checks a valid, contained, non-empty receipt before
+reporting a missing workbook; a structurally valid stale prior receipt in a
+reused manual folder is ignored for a new fresh workbook. Receipt paths and
+(when hook metadata supplies one) delivery targets must match exactly. It still requires both file mtime and
+filename timestamp freshness. A timestamped `manual-<ordered-ids>-rerun-*`
+sibling is eligible only when the response names that sibling's workbook.
+
 ### Re-run guard for an anomalous selected-product workbook
 
 When a previous manual workbook has repeated fixed prices, `无SKU选项` rows for a product whose visible page shows package selectors, a generic `香港好去處` title, or missing SKU identity, preserve that old run as forensic evidence and create a timestamped `manual-<ids>-rerun-YYMMDD-HHMM` output directory. Do not overwrite it. A re-run is eligible for delivery only if every requested product passes the normal manual validation above; a display-price fallback is permitted only when the product API and visible page both show no SKU packages. A generic page shell, absent requested product identity, or unavailable saved-session cookies is a hard failure, never a successful price row.
 
 ### Current SKU-price reliability rules (2026-09-18)
 
-Before a manual or production mode1 run, build the current repository binary and verify it with `go test ./...`, `python3 -m pytest -q`, and `./trip-score-price-scraper --help`. The current implementation has two fail-closed safeguards:
+Build policy for manual and production runs: rebuild only when source or dependencies have changed since the binary was built, or the intended binary does not exist. When unchanged, run the existing binary directly; do not build or run the full test suite before every scrape. Run the full verification suite (`go test ./...`, `python3 -m pytest -q`, and the rebuilt binary’s `--help`) after code changes. The current implementation has two fail-closed safeguards:
 
 1. **100% API boundary rule.** Batch API prices are trusted only when every currently saleable `(packageId, resourceId)` leaf declared by `getProductPriceCalendar.packageInfos` has a positive original/real price and no explicit currency mismatch. `getProductInfo` may include unavailable packages absent from the current price calendar; use matching product-info leaves only to enrich SKU labels, and do not count product-info-only leaves against current saleable coverage. Never treat an 80%/partial calendar response, a zero-priced calendar leaf, a page-level minimum price, or a list-page price as a complete SKU result.
 2. **Mode1 response-capture drift rule.** If visible SKU controls exist but `batch_response_count=0`, inspect browser-wide CDP network evidence for `21052/getProductInfo` and `14580/getProductPriceCalendar`. Capture response bodies using the emitting target session—not an assumed scraper-page session—and keep a bounded 8 MiB trusted-response limit because the price calendar can exceed 1 MiB. When Chrome fresh profiles hit CAPTCHA repeatedly, clear only Agent-owned orphan browser/driver processes and probe with visible Edge saved-state copying before changing parser or quality policy.
@@ -482,7 +506,7 @@ The program auto-generates the standard output filename: `trip_score_results_<YY
 **结果一定不漏发（强制投递 + 成功回执，方案 B）：** 抓取成功（exit 0）后，投递必须用项目脚本 `trip_deliver.py` 走 `hermes send` 完成，并由脚本**返回 exit 0 才算送达**；未确认送达前不得以成功结束任务。方式：
 
 ```bash
-python3 trip_deliver.py <output_path.xlsx 或 run_dir> \
+python3 /Users/tsimclaw/Develop/trip-score-price-scraper/trip_deliver.py <output_path.xlsx 或 run_dir> \
   --to telegram:<发起该指令的 chat_id> [--subject "携程抓取结果"]
 ```
 
@@ -540,23 +564,29 @@ Mode2 单 worker 多站点（`--urls-file` + `--sites`）会顺序爬大量页�
 
 如果中途被 kill（没有 `run_done` / 无 `exit 0`），检查 `output-dir` 中是否有 `_partial_*.xlsx` 或最近的 checkpoint 产物，**不是必须从零重跑所有 URL**；可用相同命令但将 `--urls-file` 替换为仅含剩余未覆盖 URL 的文件，CLI 会继续追加到同一输出。**绝不能重新写入包装脚本**，只通过 CLI 参数调整即可完成恢复。
 
-### TW/HK/RU/JP/VN/TH daily Mode2 schedule (03:00)
+### HK/RU daily Mode2 schedule (03:00)
 
-The canonical daily six-site job is Hermes cron `024fba50c324`, scheduled `0 3 * * *` (local UTC+8), `no_agent=True`, `deliver=local`, script `trip_mode2_daily_launcher.py`, working directory `/Users/tsimclaw/Develop/trip-score-price-scraper`.
+The canonical daily two-site job is Hermes cron `024fba50c324`, scheduled `0 3 * * *` (local UTC+8), `no_agent=True`, `deliver=local`, script `trip_mode2_daily_launcher.py`, working directory `/Users/tsimclaw/Develop/trip-score-price-scraper`. It uses only `hk,ru`; the generic manual CLI remains free to accept arbitrary `--sites`.
 
 - The scheduler must run the short launcher, never the long collector directly: Hermes cron has a bounded execution window while the five-worker collector may run for hours.
 - Project source: `scripts/hermes-cron/trip_mode2_daily_launcher.py`; deployed copy: `~/.hermes/scripts/trip_mode2_daily_launcher.py`. The deployed file must match the project copy. Do not use a symlink here: Hermes cron rejects scripts whose resolved path escapes `~/.hermes/scripts/`.
-- The launcher records `launcher_state.json` and `launcher_collector.log` in `/Users/tsimclaw/Documents/trip-sku-price-scrape/<YYMMDD>-mode2-daily/`, skips an existing `.collection_done`, and refuses a second live runner. The long collector remains the only owner of the five Go workers, final merge, `.collection_done`, workbook enrichment, and direct delivery.
+- The launcher records `launcher_state.json` and `launcher_collector.log` in `/Users/tsimclaw/Documents/trip-sku-price-scrape/<YYMMDD>-mode2-daily/`, refuses a second live runner, and the collector terminal-updates it to `completed`, `collection_failed`, or `delivery_failed` with a short Chinese stage reason. An existing valid HK/RU `.collection_done` means **do not re-scrape**: resume receipt-bound idempotent delivery only.
 - Keep the old direct Hermes cron paused/replaced; do not enable a second LaunchAgent or another direct collector schedule, or two independent runs can contend for the shared Mode2 lock.
-- The collector uses exactly `tw,hk,ru,jp,vn,th`, normal profile, 1–5 workers (production 5), and the explicit refreshed session. Its Google target snapshot defines expected rows (`538 × 6 = 3,228` for the current target only; always validate the frozen run-local expected count).
-- Vendor identity rule: the `厂商` column must come from the frozen canonical target's vendor columns, never from the Go CLI default. The live Google export names the TSIM column `TSIM` (legacy mirrors say `TSIM 網址`); both must resolve through the alias map in `daily_mode2_urls.py`. `scripts/stabilize_vendor_attribution.py` rewrites the merged workbook after merge: a product listed in exactly one vendor column takes that vendor, a product in several columns takes the curated reference `/Users/tsimclaw/Documents/TSim-Hermes运营自动化/vendor-attribution/manual_vendor_attribution_latest.json` when it covers the ID, otherwise the joined canonical names (`BC/TGT`); already-named values are preserved and an unresolvable ID is left untouched and counted, never invented.
+- The collector uses exactly `hk,ru`, normal profile, 1–5 workers (production 5), and the explicit refreshed session. The frozen Google target defines expected rows as unique products × 2; never reuse a historical fixed row count or the former six-site multiplier.
+- Vendor identity rule: the `厂商` column must come from the frozen canonical target's vendor columns, never from the Go CLI default. **Old failure → new rule:** do not select the first tab named `Sheet1`/`工作表1` (a renamed export such as `Trip` must remain valid when its vendor schema is unambiguous); `daily_mode2_urls.py`, target sync, and `stabilize_vendor_attribution.py` must use the same complete-schema resolver. Zero matching tabs or more than one matching tab is invalid/ambiguous and fails closed; provenance records the actual selected `worksheet_name`. The live Google export names the TSIM column `TSIM` (legacy mirrors say `TSIM 網址`); both resolve through the alias map. `scripts/stabilize_vendor_attribution.py` rewrites the merged workbook after merge: a product listed in exactly one vendor column takes that vendor, a product in several columns takes the curated reference `/Users/tsimclaw/Documents/TSim-Hermes运营自动化/vendor-attribution/manual_vendor_attribution_latest.json` when it covers the ID, otherwise the joined canonical names (`BC/TGT`); already-named values are preserved and an unresolvable ID is left untouched and counted, never invented.
 - Never ship `手动输入` / `手動輸入` as a vendor: the CLI placeholder means "nothing was attributed". Product IDs in the Google export are numbers (`85473945.0`), so any target lookup must normalize float/`.0`/URL/string forms before comparing — a lookup that silently misses leaves every row at the placeholder. The verifier in the delivery script also filters the placeholder out of the plaintext report so a stale baseline workbook cannot render `BC/手动输入`.
 - Collector copies: the production entry is `~/.hermes/scripts/trip_daily_mode2_cron.sh`; the project keeps a review copy at `scripts/hermes-cron/trip_daily_mode2_cron.sh` and a regression test asserts the two are byte-identical. Apply every collector edit to the project copy, then deploy it over the `~/.hermes/scripts/` file.
 - Vendor gate: the collector treats a stabilizer failure (target with no product IDs, or zero rows filled while rows stayed unresolved) as fatal and aborts before `.collection_done`/delivery, then sends one short Chinese failure notice instead of silently delivering an all-placeholder workbook.
-- Workbook promotion rule: insert `昨日总促销标签` immediately before `总促销标签`, fill it by `(site, 商品ID)` from the previous calendar day's finalized workbook, and color the current `总促销标签` red only when a non-empty previous label differs. Baseline absence remains blank.
+- Workbook promotion rule: select the previous natural day’s finalized two-site workbook from its contained `.collection_done` path, then two-site filenames, with historical six-site files only as legacy fallback; a six-site-only filename lookup silently loses valid two-site baselines. Insert `昨日总促销标签` immediately before `总促销标签`, fill it by `(site, 商品ID)` from the previous calendar day's finalized workbook, and color the current `总促销标签` red only when a non-empty previous label differs. Baseline absence remains blank/unknown, never zero or an added promotion.
+- Native Mode2 notes pitfall: **old assumption → new rule:** `抓取备注` is optional in a Go-native workbook and may be absent when all rows succeeded; interpret absence as an empty note. If the optional column exists and a row has a non-empty note, retain its quality quarantine. Required identity and promotion columns remain mandatory.
+- Lock/notification pitfall: **old behavior → new rule:** an EXIT trap must not `rmdir` a lock it did not create, nor mark `.failure_notified` before `hermes send` confirms success. Write an owner token in the lock and remove only that token's lock; preserve the original failing exit code; leave the marker absent on notification failure so a safe retry can notify. Collection and delivery are distinct terminal stages.
+- Mode2 repair details: label failures by the actual phase (`target_sync`, `build`, `workers`, `merge`, `enrichment`, or `delivery`), keep outbound notices concise Chinese and never include raw stderr/secrets. Clear stale failure reason/notice only after this attempt owns the lock; never modify another owner's evidence. A notice is confirmed only by `hermes send --json` with `success=true` and a non-empty `message_id`.
+- A valid Mode2 delivery receipt requires the matching source path, HK/RU scope and target, `completed_at`, a report attachment receipt, at least one message receipt, and no `.pending_delivery.json`. An incomplete receipt must wake delivery without re-crawling. `trip_mode2_direct_delivery.py` accepts explicit `--date YYMMDD` or a contained `--run-dir ... --root ...` for historical recovery; launcher overrides must be passed into the collector as validated root/date environment values.
+- Launcher race pitfall: a collector can terminal-write `launcher_state.json` before the launcher persists `running`; terminal `completed`/failure state wins and must never be overwritten. Promotion replay must use the same schema-selected target worksheet as sync (not `wb.active`); unknown numeric values sort deterministically without being converted to zero.
+- Detached status contract: cron `completed/ok` means the quick launcher started or found the collector, not that HK/RU collection finished. Launcher output/state must keep `launch_status` separate from `business_status`/`business_complete`; only source-bound collection plus delivery receipts are complete. On macOS Bash 3.2 with `set -u`, an assigned-but-empty array still makes `${ARRAY[*]}` / `${ARRAY[@]}` fail as unbound, so all-retry recovery logging/iteration must use `${ARRAY[*]-}` / `${ARRAY[@]-}`.
 - Text promotion report rule: use `trip_mode2_direct_delivery.py` (`promo_messages`) after verified collection/delivery. Report real percentage-discount signature changes as **at most two** compact Telegram plaintext messages (budget `MESSAGE_LIMIT=3750` each, hard cap 4096, `MAX_MESSAGES=2`) — never a third message, never the arbitrary `split_plaintext` chunker, never a detail attachment or separate detail file. Products are grouped by `(priority section, vendor name, site set, old discount signature, new discount signature)`. Under each section every vendor gets one heading `▪ <exact vendor name>` (the workbook/canonical attribution name, e.g. `BC`, `TGT`, `FR`, `JY`, `TSIM 網址`, `其他`, `BC/TGT` — never a one- or two-letter vendor abbreviation) followed by one row per group `站点/站点｜旧折扣→新折扣｜产品ID,产品ID,…` (e.g. `HK/VN/RU｜5+50→-｜1001,1002`); sites are always the standard two-letter codes `HK/TW/JP/TH/VN/RU` separated by `/`, never concatenated one-letter abbreviations. Full product IDs and old→new discount values are always retained. There is no abbreviation legend: names and sites are literal. Layout of message 1: header (date + `变化 N 产品／M 处：撤销/力度变化/新增`) → per-site and per-vendor tallies (`站点 HK 3｜RU 1`, `厂商 BC 2｜TSIM 網址 1`) → row-format line (`ROW_FORMAT`, explains the `▪ 厂商名` heading and `站点/站点｜旧折扣→新折扣｜产品ID` rows, discounts as `5+50`, `-` for none) → sections in priority order `▼撤销折扣 → ▼力度变化 → ▼新增折扣` (heading `▼… M 处／G 组`). Message 2, when needed, is prefixed `（2/2）` (message 1 then `（1/2）`), repeats the title as `…（续）` plus the same row-format line, continues a split section with `▼…（续）` and repeats the current `▪ 厂商名` heading. Messages split only at whole-group boundaries; a group is never cut. When every group fits in two messages, all groups are listed and no omission line appears. If an unusually large day still overflows, keep priority order, omit every group after the first one that no longer fits, and close message 2 with `（未列示 N 组／P 个产品ID：撤销 x 组｜力度 y 组｜新增 z 组；完整明细见同日 XLSX 的「总促销标签」标红行）` with exact counts. Raw localized promotion labels stay in the workbook and must never be repeated in the message; wording/language-only changes are not events. The native workbook is delivered separately by `trip_deliver.py`; `MODE2_FORCE_DELIVERY=1` regenerates and resends the report the same way.
 - Sizing rationale: the raw per-product renderer with localized labels produced 15 chunks (470 rows / 51k chars) and the single-message renderer dropped ~300 transitions; grouping by vendor/site-set/discount signature turns the same real day into ~167 groups / ~6.2k chars, which is why two bounded messages are the contract.
-- Before claiming setup or collection success, read back the cron job as `active`, verify its next execution is `03:00`, validate the deployed launcher hash, then, after a collection, require no active runner, `.collection_done`, a six-sheet workbook with per-site/total counts matching the frozen target, `.delivery_done`, and `.promo_change_reported` when a prior-day baseline exists.
+- Before claiming setup or collection success, read back the cron job as `active`, verify its next execution is `03:00`, validate the deployed launcher hash, then, after a collection, require no active runner, `.collection_done`, an exact HK/RU two-sheet workbook with per-site/total counts matching the frozen target, `.delivery_done`, and `.promo_change_reported` when a prior-day baseline exists.
 
 Full reference: `references/trip-score-cdp-input-mode.md`
 
@@ -962,57 +992,20 @@ When the reported symptom is repeated prices such as many rows at HKD22/HKD33/HK
 - `references/tsim-price-chart-generation-2026-06-10.md` — generate price-change bar charts and multi-day trajectory charts from TSIM trend XLSX files using matplotlib with Chinese font support on macOS.
 - `scripts/parse_trip_sku_run_failures.py` — parse a run folder's log for failed/risk/incomplete URLs and generate a rerun input workbook.
 
-## Daily Mode2 Multi-Site Cron Report Prompt
+## Daily HK/RU Competitor-Promotion Collection and Report
 
-This is the **fixed prompt template** that runs inside the second-stage cron job (agent mode) every day
-after the no_agent data-collection script finishes. The cron context_from chain injects the output JSON
-of the first stage, which looks like (actual data from the latest run):
+- Replace the former six-site schedule at the collection layer, not by filtering a six-site workbook after collection. The standing schedule is 03:00 Asia/Shanghai, cron `024fba50c324`, `no_agent`, calling `trip_mode2_daily_launcher.py`.
+- Keep five workers and `normal` speed. The authoritative Google target is refreshed and frozen for each run. Every worker and target-count generator must receive only `--sites hk,ru`; expected processed rows are the unique target-product count multiplied by two, never a fixed historical count.
+- Never use shared `/tmp` chunks. Same-day recovery validates and reuses the run-local frozen bytes and successful worker `run_done` evidence; it does not re-download, overwrite evidence, or re-scrape completed chunks. Success still requires strict merge, enrichment, delivery, and receipt readback.
+- Preserve the native merged raw workbook locally as `<YYMMDD-HHMM>_trip_mode2_daily_2site.xlsx`, with exactly `HK` and `RU` worksheets. Validate each worker's exact sheet names and chunk IDs, then the merged per-site complete target-ID set. A six-site completion marker must not suppress a new two-site run.
+- The collector invokes `trip_mode2_direct_delivery.py` directly. Do not recreate the obsolete second-stage agent prompt or a six-site polling/report job. The direct script selects the exact current artifact from `.collection_done`, then calls `scripts/trip_competitor_promo_report.py` using the frozen target and previous natural day's baseline.
+- Historical six-site files are accepted only as read-only prior-day baselines. Keep them and their evidence unchanged; they are not evidence that a new two-site collection finished.
+- Deliver one competitor-report XLSX containing `竞品重点`, `异动明细`, `待确认`, `HK`, `RU`, and `说明`, plus at most two bounded plaintext messages to `telegram:-5186417467`. Use `trip_deliver.py` and verify its exact receipt. Raw merged data remains local; the report embeds all HK/RU rows. Persist source-bound attachment/message receipts so retries resume without duplicating successful sends.
+- Preserve the original business rules: all competitor columns, exact 50% exclusion, pending rather than inferred zero/addition for missing or failed labels/baselines, destination/TSIM pairing, five-percentage-point changes, near-TSIM gaps, and two-site synchronization. Do not substitute the former generic all-product promotion report.
+- Verify separately: deployment parity and shell/test checks; live target count; report generation from real landed artifacts; and actual live collection. A zero CLI exit or expected row count does not prove product content was valid—inspect error fields, and label any live-page blocker explicitly.
 
-```json
-{"run_dir": "/Users/tsimclaw/Documents/trip-sku-price-scrape/YYMMDD-mode2-daily",
- "output_path": "/Users/tsimclaw/Documents/trip-sku-price-scrape/YYMMDD-mode2-daily/trip_mode2_daily_6site.xlsx",
- "processed_count": 966,
- "url_count": 161,
- "sites": "tw,hk,ru,jp,vn,th"}
-```
+- Historical audit evidence `message_id=87582/87636` shows one replayed `python3 scripts/trip_sku_pair_region_compare.py --help` lookup, but the script is absent from both the current working tree and current Git history. It is not a current entry point. For same-region TSim-vs-competitor work, use the Go CLI’s supported `--excel-input ... --compare-vendor "TSIM 網址"` path and its `vendor_compare_<stamp>.xlsx/.json` outputs. See [`references/cli-quick-reference.md`](references/cli-quick-reference.md); do not infer arguments for the missing historical script.
 
-### Prompt
+### 好评率计数语义
 
-```
-你是携程商品信息分析助手。你已经拿到了今天凌晨 03:00 自动完成的 Mode2 六站抓取结果。
-
-前置任务的输出：
-- 原生 XLSX 路径：<output_path>
-- 已处理行数：<processed_count>（站点：TW/HK/RU/JP/VN/TH，覆盖 161 个商品）
-
-任务：
-1. 确认 EXCEL 文件存在无误（执行 `ls -la <output_path>` 输出文件信息）
-2. 使用 `python3 trip_deliver.py <output_path> --to telegram:-5186417467 --subject "携程 Mode2 六站日常列表"` 把原生 XLSX 发到运营自动化执行组
-   — 这个脚本自身返回 exit 0 才表示投递成功（回执写入 .delivered.json）；失败则写 .pending_delivery.json 并退出非零
-3. **重要**：模式2输出仅包含评分/评价数/商品资讯，不含价格或 SKU；报告中只引用原列数据
-4. 发送完成确认到运营自动化执行组，说明成功投递 + 处理行数
-
-交付模板（运营自动化执行组）：
-```
-✅ 携程日常列表 Mode2 六站抓取完成
-📅 日期：<today>
-📊 处理：<processed_count> 条（6 站 × 161 产品）
-📁 文件：已通过 trip_deliver 安全投递到本群
-
-各站概要（从原生 XLSX 读取）：
-| 站点 | 商品数 | 平均评分 |
-|------|--------|----------|
-| TW   | N      | X.X      |
-| HK   | N      | X.X      |
-| RU   | N      | X.X      |
-| JP   | N      | X.X      |
-| VN   | N      | X.X      |
-| TH   | N      | X.X      |
-```
-**如果任何步骤失败：**
-- 投递失败 → 输出 `.pending_delivery.json` 标记、不静默成功、报告原因
-- 分析失败 → 明确说明原因、不输出假数据
-```
-
-These prompt instructions are loaded by the cron job as an agent-mode task that receives context_from the first stage's output and follows them exactly.
-- `scripts/trip_sku_pair_region_compare.py` — build same-region TSim vs competitor comparison sheets from a completed run directory and the canonical product-pair workbook.
+原生 mode1/mode2 XLSX 在 `评价数` 与 `中差评价数` 都是精确、非负整数且总数大于零时，以 `(总数-中差数)/总数*100` 输出一位小数的 `好评率`；`中差评价数=0` 有效，缺失不可当作 0。近似值、非整数、负数或中差数大于总数时不推导，保留已有直供比例作为回退。
