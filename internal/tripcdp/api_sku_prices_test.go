@@ -326,3 +326,23 @@ func TestLiveCalendar65892026CompletePrices(t *testing.T) {
 		}
 	}
 }
+
+func TestCalendarMinPriceUsedOnlyWhenPriceInfoAbsent(t *testing.T) {
+	responses := []capturedAPIResponse{{URL: "/restapi/soa2/14580/getProductPriceCalendar", Status: 200, Text: `{"data":{"packageInfos":[` +
+		`{"packageId":11,"resourceInfos":[{"resourceId":101,"minPrice":1.38,"marketPrice":0}]},` +
+		`{"packageId":12,"resourceInfos":[{"resourceId":102,"minPrice":2.5,"marketPrice":5}]}]}}`}}
+	rows, coverage := parseCapturedAPISKUPrices(responses, "HKD", true)
+	if len(rows) != 2 || !coverage.Complete || rows[0]["real_price"] != "1.38" || rows[0]["price"] != "1.38" || rows[1]["price"] != "5" || rows[1]["real_price"] != "2.5" || rows[0]["price_source"] != priceSourceResourceMinPrice {
+		t.Fatalf("rows=%v coverage=%+v", rows, coverage)
+	}
+}
+
+func TestCalendarMinPriceNotUsedWhenPriceInfoPresentAsZeroOrMissingMin(t *testing.T) {
+	responses := []capturedAPIResponse{{URL: "/restapi/soa2/14580/getProductPriceCalendar", Status: 200, Text: `{"data":{"packageInfos":[` +
+		`{"packageId":11,"resourceInfos":[{"resourceId":101,"minPrice":1.38}],"priceInfo":{"originalPrice":0,"price":0}},` +
+		`{"packageId":12,"resourceInfos":[{"resourceId":102,"minPrice":0}]}]}}`}}
+	rows, coverage := parseCapturedAPISKUPrices(responses, "HKD", true)
+	if len(rows) != 0 || coverage.Complete || coverage.MissingPriceCount != 2 {
+		t.Fatalf("rows=%v coverage=%+v", rows, coverage)
+	}
+}

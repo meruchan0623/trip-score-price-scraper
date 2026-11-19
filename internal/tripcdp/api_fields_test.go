@@ -62,6 +62,49 @@ func TestParseCapturedAPIFieldsUsesListCommentsSubItemScores(t *testing.T) {
 	}
 }
 
+func TestParseCapturedAPIFieldsKeepsZeroSuppliedRateWhenCountsAreUnavailable(t *testing.T) {
+	for _, tt := range []struct {
+		name, body, want string
+	}{
+		{"absent", `{"commentAggregation":{}}`, ""},
+		{"null", `{"commentAggregation":{"goodRate":null}}`, ""},
+		{"empty aggregation", `{"commentAggregation":null}`, ""},
+		{"explicit zero", `{"commentAggregation":{"goodRate":0}}`, "0.0%"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			fields := parseCapturedAPIFields([]capturedAPIResponse{
+				{URL: "https://www.trip.com/restapi/soa2/20047/listComments", Status: 200, Text: tt.body},
+			})
+			if fields.GoodRate != tt.want {
+				t.Fatalf("GoodRate = %q, want %q", fields.GoodRate, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseCapturedAPIFieldsDoesNotTreatMissingMIDBADCountAsZero(t *testing.T) {
+	fields := parseCapturedAPIFields([]capturedAPIResponse{
+		{URL: "https://www.trip.com/restapi/soa2/18084/commonQueryCommentSummary", Status: 200, Text: `{"commentAggregation":{"totalCount":100,"commonTags":[{"tagName":"MIDBAD"}]}}`},
+	})
+	if fields.ReviewCount != "100" || fields.BadReviewCount != "" {
+		t.Fatalf("comment counts = (%q, %q), want (100, empty)", fields.ReviewCount, fields.BadReviewCount)
+	}
+	row := map[string]string{"好评率": "91.1%"}
+	applyCapturedAPIFields(row, fields, false)
+	if row["好评率"] != "91.1%" {
+		t.Fatalf("好评率 = %q, want supplied rate without a MIDBAD count", row["好评率"])
+	}
+}
+
+func TestParseCapturedAPIFieldsKeepsExplicitZeroCommentCounts(t *testing.T) {
+	fields := parseCapturedAPIFields([]capturedAPIResponse{
+		{URL: "https://www.trip.com/restapi/soa2/18084/commonQueryCommentSummary", Status: 200, Text: `{"commentAggregation":{"totalCount":100,"commonTags":[{"tagName":"MIDBAD","totalCount":0}]}}`},
+	})
+	if fields.ReviewCount != "100" || fields.BadReviewCount != "0" {
+		t.Fatalf("comment counts = (%q, %q), want (100, 0)", fields.ReviewCount, fields.BadReviewCount)
+	}
+}
+
 func TestParseCapturedAPIFieldsIgnoresFailedResponses(t *testing.T) {
 	fields := parseCapturedAPIFields([]capturedAPIResponse{
 		{URL: "https://hk.trip.com/restapi/soa2/18084/commonQueryCommentSummary", Status: 403, Text: `{"commentAggregation":{"totalCount":2959,"scoreAvg":4.6,"commonTags":[{"tagName":"MIDBAD","totalCount":263}]}}`},
@@ -137,5 +180,13 @@ func TestApplyCapturedAPIFieldsKeepsDOMFallbackForMissingAPIValues(t *testing.T)
 		if got := row[key]; got != want {
 			t.Fatalf("%s = %q, want DOM fallback %q", key, got, want)
 		}
+	}
+}
+
+func TestApplyCapturedAPIFieldsUsesExactCountsOverSuppliedRate(t *testing.T) {
+	row := map[string]string{"评价数": "100", "中差评价数": "0", "好评率": "91.1%"}
+	applyCapturedAPIFields(row, capturedAPIFields{ReviewCount: "100", BadReviewCount: "0", GoodRate: "91.1%"}, false)
+	if got := row["好评率"]; got != "100.0%" {
+		t.Fatalf("好评率 = %q, want count-derived 100.0%%", got)
 	}
 }

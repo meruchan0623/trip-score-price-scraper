@@ -26,6 +26,7 @@ func TestBaseRowFromGUIBundle(t *testing.T) {
 	assertRowValue(t, row, "方便程度", "4.7")
 	assertRowValue(t, row, "讯号状态", "4.5")
 	assertRowValue(t, row, "中差评价数", "601")
+	assertRowValue(t, row, "好评率", "89.4%")
 	if !strings.Contains(row["商品资讯"], "China Unicom") {
 		t.Fatalf("商品资讯 = %q, want DOM product info", row["商品资讯"])
 	}

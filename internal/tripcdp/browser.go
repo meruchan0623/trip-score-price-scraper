@@ -1777,11 +1777,11 @@ func parseCapturedAPIFields(responses []capturedAPIResponse) capturedAPIFields {
 		if strings.Contains(response.URL, "/restapi/soa2/18084/commonQueryCommentSummary") {
 			var payload struct {
 				CommentAggregation struct {
-					TotalCount int     `json:"totalCount"`
+					TotalCount *int    `json:"totalCount"`
 					ScoreAvg   float64 `json:"scoreAvg"`
 					CommonTags []struct {
 						TagName    string `json:"tagName"`
-						TotalCount int    `json:"totalCount"`
+						TotalCount *int   `json:"totalCount"`
 					} `json:"commonTags"`
 				} `json:"commentAggregation"`
 			}
@@ -1789,22 +1789,22 @@ func parseCapturedAPIFields(responses []capturedAPIResponse) capturedAPIFields {
 				continue
 			}
 			aggregation := payload.CommentAggregation
-			if aggregation.TotalCount > 0 {
-				fields.ReviewCount = strconv.Itoa(aggregation.TotalCount)
+			if aggregation.TotalCount != nil {
+				fields.ReviewCount = strconv.Itoa(*aggregation.TotalCount)
 			}
 			if aggregation.ScoreAvg > 0 {
 				fields.Score = formatPriceNumber(aggregation.ScoreAvg)
 			}
 			for _, tag := range aggregation.CommonTags {
-				if tag.TagName == "MIDBAD" && tag.TotalCount >= 0 {
-					fields.BadReviewCount = strconv.Itoa(tag.TotalCount)
+				if tag.TagName == "MIDBAD" && tag.TotalCount != nil {
+					fields.BadReviewCount = strconv.Itoa(*tag.TotalCount)
 				}
 			}
 		}
 		if strings.Contains(response.URL, "/restapi/soa2/20047/listComments") {
 			var payload struct {
 				CommentAggregation struct {
-					GoodRate    float64 `json:"goodRate"`
+					GoodRate    *float64 `json:"goodRate"`
 					SubItemTags []struct {
 						TagName  string  `json:"tagName"`
 						ScoreAvg float64 `json:"scoreAvg"`
@@ -1814,8 +1814,8 @@ func parseCapturedAPIFields(responses []capturedAPIResponse) capturedAPIFields {
 			if json.Unmarshal([]byte(response.Text), &payload) != nil {
 				continue
 			}
-			if payload.CommentAggregation.GoodRate > 0 {
-				fields.GoodRate = fmt.Sprintf("%.1f%%", payload.CommentAggregation.GoodRate*100)
+			if rate := payload.CommentAggregation.GoodRate; rate != nil && *rate >= 0 && *rate <= 1 {
+				fields.GoodRate = fmt.Sprintf("%.1f%%", *rate*100)
 			}
 			for _, tag := range payload.CommentAggregation.SubItemTags {
 				if tag.ScoreAvg <= 0 {
@@ -1863,6 +1863,9 @@ func applyCapturedAPIFields(row map[string]string, fields capturedAPIFields, inc
 	if includeProductInfo && strings.TrimSpace(fields.ProductInfo) != "" {
 		row["商品资讯"] = fields.ProductInfo
 	}
+	// Exact total and MIDBAD counts are more authoritative than a separately
+	// supplied rate from another response.
+	applyGoodRateFromReviewCounts(row)
 }
 
 func baseRowFromBundle(item ScrapeItem, title string, pageText string, bundle baseRatingBundle, extractProductInfo bool) map[string]string {
@@ -1895,6 +1898,7 @@ func baseRowFromBundle(item ScrapeItem, title string, pageText string, bundle ba
 	if extractProductInfo {
 		row["商品资讯"] = firstNonEmpty(bundle.ProductInfo, productInfo(pageText))
 	}
+	applyGoodRateFromReviewCounts(row)
 	return row
 }
 
@@ -1939,6 +1943,7 @@ func (s *tripScraper) extractAllSKUPrices(ctx context.Context) ([]map[string]str
 			"zero_original_or_real_price_count": coverage.ZeroOriginalOrRealCount,
 			"currency_mismatch_count":           coverage.CurrencyMismatchCount,
 			"wait_ms":                           waitMS,
+			"calendar_responses":                calendarResponseDiagnostics(s.capturedAPIResponses()),
 		})
 		return nil, &priceQualityTracker{failed: true, failReason: "api_calendar_incomplete"}
 	}

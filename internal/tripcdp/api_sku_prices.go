@@ -26,6 +26,14 @@ func (s *tripScraper) waitCapturedAPISKUPrices(ctx context.Context, maxWait time
 }
 
 const priceSourceProductPriceCalendar = "getProductPriceCalendar"
+const priceSourceResourceMinPrice = "getProductPriceCalendar.resourceInfos.minPrice"
+
+func priceSourceFor(price apiSKUPrice) string {
+	if price.FromResourceMinPrice {
+		return priceSourceResourceMinPrice
+	}
+	return priceSourceProductPriceCalendar
+}
 
 type apiSKUPriceCoverage struct {
 	TreeCount               int
@@ -68,6 +76,9 @@ type apiSKUPrice struct {
 	OriginalPrice float64
 	Price         float64
 	PromoTags     []string
+	// FromResourceMinPrice marks a price taken from resourceInfos.minPrice because the
+	// package had no priceInfo object at all (observed on BC 57042119, Nov 2026).
+	FromResourceMinPrice bool
 }
 
 type apiSKUKey struct {
@@ -202,7 +213,7 @@ func parseCapturedAPISKUPrices(responses []capturedAPIResponse, expectedCurrency
 			"item_id":            strconv.FormatInt(price.ResourceID, 10),
 			"promo_matched":      strconv.FormatBool(promoMatched),
 			"price_status":       status,
-			"price_source":       priceSourceProductPriceCalendar,
+			"price_source":       priceSourceFor(price),
 			"raw_captured_price": formatPriceNumber(price.OriginalPrice),
 		})
 	}
@@ -297,9 +308,11 @@ func parseAPIPriceCalendar(raw string) []apiSKUPrice {
 					} `json:"salesPropertyValues"`
 				} `json:"salesProperties"`
 				ResourceInfos []struct {
-					ResourceID int64 `json:"resourceId"`
+					ResourceID  int64   `json:"resourceId"`
+					MinPrice    float64 `json:"minPrice"`
+					MarketPrice float64 `json:"marketPrice"`
 				} `json:"resourceInfos"`
-				PriceInfo struct {
+				PriceInfo *struct {
 					Currency                 string  `json:"currency"`
 					CurrencyCode             string  `json:"currencyCode"`
 					OriginalPrice            float64 `json:"originalPrice"`
@@ -317,18 +330,25 @@ func parseAPIPriceCalendar(raw string) []apiSKUPrice {
 	}
 	out := make([]apiSKUPrice, 0, len(payload.Data.PackageInfos))
 	for _, item := range payload.Data.PackageInfos {
-		price := apiSKUPrice{
-			PackageID:     item.PackageID,
-			Currency:      strings.ToUpper(strings.TrimSpace(firstNonEmpty(item.PriceInfo.Currency, item.PriceInfo.CurrencyCode))),
-			OriginalPrice: item.PriceInfo.OriginalPrice,
-			Price:         item.PriceInfo.Price,
+		price := apiSKUPrice{PackageID: item.PackageID}
+		if item.PriceInfo != nil {
+			price.Currency = strings.ToUpper(strings.TrimSpace(firstNonEmpty(item.PriceInfo.Currency, item.PriceInfo.CurrencyCode)))
+			price.OriginalPrice = item.PriceInfo.OriginalPrice
+			price.Price = item.PriceInfo.Price
 		}
 		for _, property := range item.SalesProperties {
 			for _, value := range property.SalesPropertyValues {
 				price.Properties = append(price.Properties, apiSKUProperty{PropertyID: property.SalesProperty.ID, PropertyName: property.SalesProperty.Name, ValueID: value.ID, ValueName: value.Name})
 			}
 		}
-		for _, promo := range item.PriceInfo.PreferentialPriceDetails {
+		var promos []struct {
+			Title string `json:"preferentialTitle"`
+			Name  string `json:"preferentialName"`
+		}
+		if item.PriceInfo != nil {
+			promos = item.PriceInfo.PreferentialPriceDetails
+		}
+		for _, promo := range promos {
 			if text := strings.TrimSpace(strings.Join([]string{strings.TrimSpace(promo.Title), strings.TrimSpace(promo.Name)}, " ")); text != "" {
 				price.PromoTags = append(price.PromoTags, text)
 			}
@@ -336,6 +356,16 @@ func parseAPIPriceCalendar(raw string) []apiSKUPrice {
 		for _, resource := range item.ResourceInfos {
 			resourcePrice := price
 			resourcePrice.ResourceID = resource.ResourceID
+			// Only when the package carries no priceInfo at all: the resource's own
+			// minPrice is the displayed per-unit price. Explicit zero priceInfo stays untrusted.
+			if item.PriceInfo == nil && resource.MinPrice > 0 {
+				resourcePrice.Price = resource.MinPrice
+				resourcePrice.OriginalPrice = resource.MinPrice
+				if resource.MarketPrice > resource.MinPrice {
+					resourcePrice.OriginalPrice = resource.MarketPrice
+				}
+				resourcePrice.FromResourceMinPrice = true
+			}
 			out = append(out, resourcePrice)
 		}
 	}
@@ -352,6 +382,141 @@ func apiSKUDisplayValues(properties []apiSKUProperty) []string {
 		if value := strings.TrimSpace(property.ValueName); value != "" {
 			out = append(out, value)
 		}
+	}
+	return out
+}
+
+// calendarResponseDiagnostics summarizes captured price-calendar responses without
+// copying request headers, cookies or response text, so an incomplete result can be
+// attributed to missing fields instead of a generic coverage failure.
+func calendarResponseDiagnostics(responses []capturedAPIResponse) []map[string]any {
+	var out []map[string]any
+	for _, response := range responses {
+		if !strings.Contains(response.URL, "/restapi/soa2/14580/getProductPriceCalendar") {
+			continue
+		}
+		item := map[string]any{"http_status": response.Status, "body_bytes": len(response.Text)}
+		var payload struct {
+			Data struct {
+				PackageInfos []struct {
+					ResourceInfos []struct{} `json:"resourceInfos"`
+					PriceInfo     *struct {
+						Currency      string  `json:"currency"`
+						CurrencyCode  string  `json:"currencyCode"`
+						OriginalPrice float64 `json:"originalPrice"`
+						Price         float64 `json:"price"`
+					} `json:"priceInfo"`
+				} `json:"packageInfos"`
+			} `json:"data"`
+			ResponseStatus struct {
+				Ack string `json:"Ack"`
+			} `json:"ResponseStatus"`
+			ResultCode any `json:"resultCode"`
+			ResultMsg  any `json:"resultMessage"`
+			ErrorCode  any `json:"errorCode"`
+			ErrorMsg   any `json:"errorMessage"`
+		}
+		if err := json.Unmarshal([]byte(response.Text), &payload); err != nil {
+			item["json_error"] = true
+			out = append(out, item)
+			continue
+		}
+		withPriceInfo, positiveReal, positiveOriginal, withResource := 0, 0, 0, 0
+		currencies := map[string]int{}
+		for _, pkg := range payload.Data.PackageInfos {
+			if len(pkg.ResourceInfos) > 0 {
+				withResource++
+			}
+			if pkg.PriceInfo == nil {
+				continue
+			}
+			withPriceInfo++
+			if pkg.PriceInfo.Price > 0 {
+				positiveReal++
+			}
+			if pkg.PriceInfo.OriginalPrice > 0 {
+				positiveOriginal++
+			}
+			currencies[strings.ToUpper(firstNonEmpty(pkg.PriceInfo.Currency, pkg.PriceInfo.CurrencyCode))]++
+		}
+		var keys struct {
+			Data struct {
+				PackageInfos []map[string]json.RawMessage `json:"packageInfos"`
+			} `json:"data"`
+		}
+		if json.Unmarshal([]byte(response.Text), &keys) == nil && len(keys.Data.PackageInfos) > 0 {
+			names := make([]string, 0, len(keys.Data.PackageInfos[0]))
+			for name := range keys.Data.PackageInfos[0] {
+				names = append(names, name)
+			}
+			sort.Strings(names)
+			item["first_package_fields"] = names
+			var firstRes []map[string]json.RawMessage
+			if json.Unmarshal(keys.Data.PackageInfos[0]["resourceInfos"], &firstRes) == nil && len(firstRes) > 0 {
+				item["first_resource_price_sample"] = map[string]string{"minPrice": string(firstRes[0]["minPrice"]), "marketPrice": string(firstRes[0]["marketPrice"]), "priceSettingType": string(keys.Data.PackageInfos[0]["priceSettingType"]), "pricingUnit": string(keys.Data.PackageInfos[0]["pricingUnit"])}
+			}
+			for _, nested := range []string{"resourceInfos", "summaryInfos"} {
+				var arr []map[string]json.RawMessage
+				if json.Unmarshal(keys.Data.PackageInfos[0][nested], &arr) == nil && len(arr) > 0 {
+					sub := make([]string, 0, len(arr[0]))
+					for name := range arr[0] {
+						sub = append(sub, name)
+					}
+					sort.Strings(sub)
+					item["first_"+nested+"_fields"] = sub
+				}
+			}
+		}
+		var top map[string]json.RawMessage
+		if json.Unmarshal([]byte(response.Text), &top) == nil {
+			names := []string{}
+			for name := range top {
+				names = append(names, name)
+			}
+			sort.Strings(names)
+			item["top_fields"] = names
+			var data map[string]json.RawMessage
+			if json.Unmarshal(top["data"], &data) == nil {
+				dn := []string{}
+				for name := range data {
+					dn = append(dn, name)
+				}
+				sort.Strings(dn)
+				item["data_fields"] = dn
+				var ps []map[string]json.RawMessage
+				if json.Unmarshal(data["priceAndStockInfos"], &ps) == nil && len(ps) > 0 {
+					item["price_and_stock_count"] = len(ps)
+					pn := []string{}
+					for name := range ps[0] {
+						pn = append(pn, name)
+					}
+					sort.Strings(pn)
+					item["price_and_stock_fields"] = pn
+					for _, k := range []string{"currency", "currencyCode", "price", "originalPrice", "date", "resourceId"} {
+						if v, ok := ps[0][k]; ok {
+							item["pas_first_"+k] = string(v)
+						}
+					}
+				}
+				for _, k := range []string{"currency", "currencyCode", "priceCurrency"} {
+					if v, ok := data[k]; ok {
+						item["data_"+k] = string(v)
+					}
+				}
+			}
+		}
+		item["package_infos"] = len(payload.Data.PackageInfos)
+		item["with_resource"] = withResource
+		item["with_price_info"] = withPriceInfo
+		item["positive_price"] = positiveReal
+		item["positive_original_price"] = positiveOriginal
+		item["currencies"] = currencies
+		item["ack"] = payload.ResponseStatus.Ack
+		item["result_code"] = payload.ResultCode
+		item["result_message"] = payload.ResultMsg
+		item["error_code"] = payload.ErrorCode
+		item["error_message"] = payload.ErrorMsg
+		out = append(out, item)
 	}
 	return out
 }

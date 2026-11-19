@@ -161,6 +161,9 @@ func writeExportSheet(file *excelize.File, sheet string, rows []map[string]strin
 		widths[i] = max(12, runeLen(field)+2)
 	}
 	for rowIndex, row := range rows {
+		// Rows can also originate from fallback and merge paths. Derive the rate
+		// here as a final, mode-independent safeguard before native XLSX output.
+		applyGoodRateFromReviewCounts(row)
 		// Identity fields (厂商/商品ID/URL/商品名称) are written on every SKU row,
 		// including continuation rows of the same 商品ID, so each row is
 		// self-describing when filtered or sorted.
