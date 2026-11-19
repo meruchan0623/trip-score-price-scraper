@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 
 import openpyxl
@@ -194,12 +195,36 @@ def test_previous_run_dir_crosses_month_and_year_boundaries(tmp_path: Path) -> N
     assert MODULE.previous_run_dir(tmp_path / "bogus" / "x.xlsx") is None
 
 
-def test_xlsx_in_prefers_timestamped_then_legacy_name(tmp_path: Path) -> None:
+def test_xlsx_in_prefers_actual_2site_name_then_legacy_6site_name(tmp_path: Path) -> None:
     run_dir = tmp_path / "260910-mode2-daily"
     run_dir.mkdir()
     assert MODULE.xlsx_in(run_dir) is None
-    legacy = _write(run_dir / "trip_mode2_daily_6site.xlsx", YESTERDAY)
+    legacy = _write(run_dir / "260910-0300_trip_mode2_daily_6site.xlsx", YESTERDAY)
     assert MODULE.xlsx_in(run_dir) == legacy
-    stamped = _write(run_dir / "260910-0300_trip_mode2_daily_6site.xlsx", YESTERDAY)
-    assert MODULE.xlsx_in(run_dir) == stamped
+    two_site = _write(run_dir / "260910-0300_trip_mode2_daily_2site.xlsx", YESTERDAY)
+    assert MODULE.xlsx_in(run_dir) == two_site
     assert MODULE.xlsx_in(tmp_path / "nope") is None
+
+
+def test_xlsx_in_prefers_valid_marker_output_over_other_2site_workbooks(tmp_path: Path) -> None:
+    run_dir = tmp_path / "260910-mode2-daily"
+    selected = _write(run_dir / "260910-0300_trip_mode2_daily_2site.xlsx", YESTERDAY)
+    _write(run_dir / "999999-9999_trip_mode2_daily_2site.xlsx", TODAY)
+    (run_dir / ".collection_done").write_text(
+        json.dumps({"sites": "hk,ru", "scope": "hk_ru_2site", "output_path": str(selected)}),
+        encoding="utf-8",
+    )
+    assert MODULE.xlsx_in(run_dir) == selected
+
+
+def test_xlsx_in_rejects_marker_output_outside_run_dir(tmp_path: Path) -> None:
+    run_dir = tmp_path / "260910-mode2-daily"
+    run_dir.mkdir()
+    escaped = _write(tmp_path / "escaped_trip_mode2_daily_2site.xlsx", YESTERDAY)
+    fallback = _write(run_dir / "260910-0300_trip_mode2_daily_2site.xlsx", TODAY)
+    (run_dir / ".collection_done").write_text(
+        json.dumps({"sites": "hk,ru", "scope": "hk_ru_2site", "output_path": str(escaped)}),
+        encoding="utf-8",
+    )
+    assert MODULE.marker_output(run_dir) is None
+    assert MODULE.xlsx_in(run_dir) == fallback

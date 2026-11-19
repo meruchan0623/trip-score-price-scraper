@@ -1146,10 +1146,10 @@ def main(argv=None):
                         site_rows[index] = replacement
                         recovered_browser += 1
             api_success_count += recovered_browser
-            if recovery_problem and not recovered_browser:
-                result_errors.append('browser_recovery_failed')
-            else:
+            if recovered_browser:
                 result_errors.append('browser_recovery_applied')
+            else:
+                result_errors.append('browser_recovery_failed')
             failures = failed_rows(by_site)
 
         if failures and config.mode2_fallback != 'off':

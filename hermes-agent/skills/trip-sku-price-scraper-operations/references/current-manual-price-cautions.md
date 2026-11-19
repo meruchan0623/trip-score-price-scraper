@@ -6,6 +6,7 @@
 
 - 将任何输入的 Trip.com 链接仅作为产品 ID 来源；实际导航固定为 `https://hk.trip.com/things-to-do/detail/<id>/`，并固定 `locale=zh-HK`、`curr=HKD`。
 - 必须使用项目根目录构建的 `./trip-score-price-scraper`，直接以重复 `-input` 传参运行，禁止用临时 shell/Python 包装脚本。
+- 构建策略：仅当源码或依赖自上次构建后有变化，或目标二进制不存在时才构建；无变化直接运行已有二进制。完整测试放在代码修改后执行，不在每次抓取前重复构建或执行完整测试。
 - 固定使用 `-run-mode mode1 -no-headless -site hk -locale zh-HK -currency HKD -delay-profile normal -product-info -no-quality-rerun -output-dir <manual-run-dir>`。
 - 单一产品或少量指定产品顺序运行；输出目录为 `/Users/example/Documents/trip-sku-price-scrape/manual-<ids>`。异常重跑保留旧目录，创建时间戳后缀的 `manual-<ids>-rerun-YYMMDD-HHMM`。
 
@@ -33,6 +34,12 @@ CLI 仅可在已经观察到该同站列表页时，从真实列表页正常回�
 4. 通过 `trip_deliver.py` 投递未二次加工的 Go CLI 原生 XLSX；`.delivered.json` 是送达证据。
 
 成功时只投递原生 Excel 附件，不发送确认、进度、产品信息、价格、SKU 数量、对比、总结、路径或二次整理表。只有失败或影响完整性的异常，才按 `SKILL.md` 的单行前缀报告。
+
+## 明确指定非默认站点补抓
+
+- 用户明确要求台湾站港币补抓时，仅对已核验失败且尚未恢复的产品使用 `-site tw -locale zh-TW -currency HKD`；保留原产物，不把 TW 结果回填冒充 HK/RU 当日数据。
+- 单站跨币种补抓使用 `-site tw`，不要使用 `-sites tw`。当前多站厂商 Mode2 路径会忽略币种覆盖并按 TW 默认 TWD 导航；必须核验 `url_started.navigation_currency` 与 `final_url` 的 `curr=HKD`，而非仅检查输入 URL。
+- 审计补抓覆盖只读取最终输出，不纳入 `_partial_` 检查点或同源报告副本，按产品 ID 去重。Mode2 即使 exit 0、`page_valid=true`，仍可能导出 captcha 空行；按抓取备注、商品名与商品资讯区分成功、风险拦截和字段缺失，不把已处理条数当成功条数。
 
 ## Session 说明
 

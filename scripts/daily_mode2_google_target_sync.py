@@ -37,13 +37,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from daily_mode2_urls import VENDOR_COLS, extract_product_ids, resolve_vendor_columns  # noqa: E402
+from daily_mode2_urls import extract_product_ids, resolve_target_sheet  # noqa: E402
 
 # ---- 集中配置：目标 Google Sheet（公开，无需登录/OAuth） ----
 SPREADSHEET_ID = os.environ.get("TRIP_GOOGLE_SPREADSHEET_ID", "").strip()
 SHEET_GID = os.environ.get("TRIP_GOOGLE_SHEET_GID", "0")
-SHEET_NAME = "Sheet1"
-ACCEPTED_SHEET_NAMES = ("Sheet1", "工作表1")
 EXPORT_URL = (
     "https://docs.google.com/spreadsheets/d/{spreadsheet_id}/export"
     "?format=xlsx&gid={gid}"
@@ -103,29 +101,23 @@ def ensure_xlsx_bytes(data: bytes) -> None:
         raise TargetSyncError("downloaded payload is not an XLSX (zip magic missing)")
 
 
-def validate_target_workbook(path: Path) -> list[int]:
+def validate_target_workbook(path: Path) -> tuple[list[int], str]:
     """校验镜像结构并返回产品 ID（与 daily_mode2_urls.extract_product_ids 语义一致）。"""
     try:
         wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
     except Exception as e:  # noqa: BLE001 — 任何解析失败都视为无效
         raise TargetSyncError(f"cannot open workbook: {e}") from e
     try:
-        sheet_name = next((name for name in ACCEPTED_SHEET_NAMES if name in wb.sheetnames), None)
-        if sheet_name is None:
-            raise TargetSyncError(
-                f"workbook missing one of {list(ACCEPTED_SHEET_NAMES)!r}; found {wb.sheetnames}"
-            )
-        ws = wb[sheet_name]
-        vendor_columns = resolve_vendor_columns(ws)
-        missing = [h for h in VENDOR_COLS if h not in vendor_columns]
-        if missing:
-            raise TargetSyncError(f"workbook missing required headers: {missing}")
+        try:
+            sheet_name = resolve_target_sheet(wb).title
+        except KeyError as e:
+            raise TargetSyncError(str(e)) from e
     finally:
         wb.close()
     ids = extract_product_ids(path)
     if not ids:
         raise TargetSyncError("workbook contains no valid product IDs")
-    return ids
+    return ids, sheet_name
 
 
 def sha256_of(path: Path) -> str:
@@ -143,9 +135,10 @@ def provenance_path(mirror: Path) -> Path:
 def build_provenance(
     mirror: Path,
     ids: list[int],
+    worksheet_name: str,
     sites: tuple[str, ...],
     *,
-    spreadsheet_id: str = SPREADSHEET_ID,
+    spreadsheet_id: str | None = None,
     gid: str = SHEET_GID,
     synced_at: datetime | None = None,
 ) -> dict:
@@ -155,7 +148,7 @@ def build_provenance(
         "source": "google_sheets",
         "spreadsheet_id": spreadsheet_id,
         "gid": gid,
-        "sheet_name": SHEET_NAME,
+        "worksheet_name": worksheet_name,
         "export_url": export_url(spreadsheet_id, gid),
         "synced_at": synced_at.isoformat(),
         "mirror": str(mirror),
@@ -194,6 +187,7 @@ def sync_target(
 ) -> dict:
     """下载 → 校验 → 原子替换镜像 → 写 provenance。失败时抛 TargetSyncError，镜像不变。"""
     fetch = fetch or default_fetch
+    spreadsheet_id = spreadsheet_id if spreadsheet_id is not None else os.environ.get("TRIP_GOOGLE_SPREADSHEET_ID", "").strip()
     mirror = Path(mirror)
     mirror.parent.mkdir(parents=True, exist_ok=True)
     url = export_url(spreadsheet_id, gid)
@@ -210,12 +204,12 @@ def sync_target(
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(data)
-        ids = validate_target_workbook(tmp)
+        ids, worksheet_name = validate_target_workbook(tmp)
         os.replace(tmp, mirror)
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
-    prov = build_provenance(mirror, ids, sites, spreadsheet_id=spreadsheet_id, gid=gid)
+    prov = build_provenance(mirror, ids, worksheet_name, sites, spreadsheet_id=spreadsheet_id, gid=gid)
     _atomic_write_json(provenance_path(mirror), prov)
     return prov
 

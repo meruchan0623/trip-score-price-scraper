@@ -1,5 +1,5 @@
 import os
-os.environ.setdefault("TRIP_GOOGLE_SPREADSHEET_ID", "offline_test_sheet")
+os.environ["TRIP_GOOGLE_SPREADSHEET_ID"] = "offline_test_sheet"
 
 import io
 import json
@@ -88,6 +88,27 @@ def test_public_google_export_localized_default_sheet_is_accepted(mirror):
     assert prov["product_ids"] == ["20001", "20002"]
 
 
+def test_renamed_trip_worksheet_is_accepted_and_recorded(mirror):
+    payload = build_workbook_bytes([[30001, None, None, None, None, None]], sheet_name="Trip")
+    prov = sync.sync_target(mirror, sites=SITES, fetch=fetch_returning(payload))
+    assert extract_product_ids(mirror) == [30001]
+    assert prov["worksheet_name"] == "Trip"
+
+
+def test_ambiguous_schema_sheets_fail_closed_without_replacement(mirror):
+    wb = openpyxl.Workbook()
+    for index, name in enumerate(("Trip", "Copy")):
+        ws = wb.active if index == 0 else wb.create_sheet()
+        ws.title = name
+        ws.append(VENDOR_COLS)
+        ws.append([str(31000 + index), None, None, None, None, None])
+    buf = io.BytesIO(); wb.save(buf)
+    before = mirror.read_bytes()
+    with pytest.raises(sync.TargetSyncError, match="ambiguous"):
+        sync.sync_target(mirror, sites=SITES, fetch=fetch_returning(buf.getvalue()))
+    assert mirror.read_bytes() == before
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -95,7 +116,7 @@ def test_public_google_export_localized_default_sheet_is_accepted(mirror):
         b"<!DOCTYPE html><html><body>Sign in</body></html>",
         b"  <html>login</html>",
         b"not a zip at all",
-        pytest.param(build_workbook_bytes([["1"]], sheet_name="Other"), id="missing-sheet1"),
+        pytest.param(build_workbook_bytes([["1"]], headers=["unrelated"], sheet_name="Other"), id="no-schema-sheet"),
         pytest.param(build_workbook_bytes([["1", "2"]], headers=["TSIM 網址", "BC"]), id="missing-headers"),
         pytest.param(build_workbook_bytes([["abc", None, None, None, None, None]]), id="no-valid-ids"),
         pytest.param(build_workbook_bytes([]), id="no-rows"),

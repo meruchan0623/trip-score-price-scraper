@@ -17,7 +17,6 @@ DEFAULT_OUTPUT_ROOT = Path(
         str(Path.home() / "Documents" / "trip-sku-price-scrape"),
     )
 )
-NATIVE_WORKBOOK_PATTERN = "trip_scoreandprice_results_*.xlsx"
 FRESHNESS_GRACE_SECONDS = 0.0
 
 _PRODUCT_ID_RE = re.compile(r"(?<!\d)(\d{7,12})(?!\d)")
@@ -34,9 +33,13 @@ _SKU_CLICK_FAILURE_RE = re.compile(
     r"SKU[^\n。；;]{0,40}(?:層級|层级)?[^\n。；;]{0,20}(?:點擊失敗|点击失败)",
     re.IGNORECASE,
 )
-_WORKBOOK_TIMESTAMP_RE = re.compile(
+_LEGACY_WORKBOOK_TIMESTAMP_RE = re.compile(
     r"^trip_scoreandprice_results_(\d{6}-\d{4})\.xlsx$"
 )
+_SEMANTIC_WORKBOOK_TIMESTAMP_RE = re.compile(
+    r"^Trip_Mode1_(.+)_(\d{8}-\d{4})\.xlsx$"
+)
+_BATCH_COUNT_RE = re.compile(r"(\d+)产品批次$")
 
 
 class ManualTurn(NamedTuple):
@@ -58,6 +61,27 @@ def _message_text(message) -> str:
     return ""
 
 
+_REPLY_QUOTE_PREFIX = "[Replying to"
+_INJECTED_CONTEXT_MARKER = "本轮是单个或数个指定Trip产品的价格抓取"
+
+
+def _own_text(text: str) -> str:
+    """Return only what the user typed this turn.
+
+    The gateway prepends ``[Replying to: "<quoted message>"]`` and a previous
+    turn's injected guard context can be quoted back. Neither is a new request,
+    so intent/ID detection must ignore both.
+    """
+    text = text or ""
+    if text.startswith(_REPLY_QUOTE_PREFIX):
+        end = text.find('"]\n\n')
+        text = text[end + 4 :].lstrip() if end != -1 else ""
+    marker = text.find(_INJECTED_CONTEXT_MARKER)
+    if marker != -1:
+        text = text[:marker]
+    return text.strip()
+
+
 def _ordered_ids(text: str) -> tuple[str, ...]:
     url_ids = _TRIP_DETAIL_RE.findall(text)
     if url_ids:
@@ -76,7 +100,7 @@ def _history_has_manual_intent(conversation_history: list) -> bool:
     for message in reversed(conversation_history[-8:]):
         if not isinstance(message, dict) or message.get("role") != "user":
             continue
-        text = _message_text(message)
+        text = _own_text(_message_text(message))
         return bool(_MANUAL_INTENT_RE.search(text)) and not _ordered_ids(text)
     return False
 
@@ -90,6 +114,7 @@ def detect_manual_request(
 ) -> ManualTurn | None:
     """Return turn metadata only for a selected-product price scrape request."""
 
+    user_message = _own_text(user_message)
     product_ids = _ordered_ids(user_message)
     if not product_ids:
         return None
@@ -112,29 +137,177 @@ def detect_manual_request(
     )
 
 
-def _fresh_native_workbook(turn: ManualTurn) -> Path | None:
+def _semantic_batch_matches(path: Path, product_ids: tuple[str, ...]) -> bool:
+    """Match the documented final batch field for a selected-product run."""
+    semantic = _SEMANTIC_WORKBOOK_TIMESTAMP_RE.match(path.name)
+    if semantic is None:
+        return False
+    fields = semantic.group(1).split("_")
+    if not fields:
+        return False
+    batch = fields[-1]
+    if len(product_ids) <= 5:
+        return batch == "-".join(product_ids)
+    count = _BATCH_COUNT_RE.fullmatch(batch)
+    return count is not None and int(count.group(1)) == len(product_ids)
+
+
+def _filename_timestamp(path: Path, product_ids: tuple[str, ...]) -> datetime | None:
+    """Return the documented native or renamed Mode1 filename timestamp."""
+    legacy = _LEGACY_WORKBOOK_TIMESTAMP_RE.match(path.name)
+    semantic = _SEMANTIC_WORKBOOK_TIMESTAMP_RE.match(path.name)
+    try:
+        if legacy:
+            return datetime.strptime(legacy.group(1), "%y%m%d-%H%M")
+        if semantic and _semantic_batch_matches(path, product_ids):
+            return datetime.strptime(semantic.group(2), "%Y%m%d-%H%M")
+    except ValueError:
+        pass
+    return None
+
+
+def _is_within(path: Path, directory: Path) -> bool:
+    try:
+        path.resolve(strict=False).relative_to(directory.resolve(strict=False))
+    except ValueError:
+        return False
+    return True
+
+
+def _is_fresh_workbook(path: Path, turn: ManualTurn, directory: Path) -> bool:
+    """Require containment plus both mtime and filename-time freshness."""
+    if path.suffix.lower() != ".xlsx" or not _is_within(path, directory):
+        return False
+    filename_time = _filename_timestamp(path, turn.product_ids)
+    if filename_time is None:
+        return False
     cutoff = turn.started_at - FRESHNESS_GRACE_SECONDS
     cutoff_minute = datetime.fromtimestamp(cutoff).replace(second=0, microsecond=0)
-    candidates: list[tuple[float, Path]] = []
-    if turn.output_dir.is_dir():
-        for path in turn.output_dir.glob(NATIVE_WORKBOOK_PATTERN):
+    try:
+        stat = path.stat()
+        return (
+            path.is_file()
+            and stat.st_size > 0
+            and stat.st_mtime >= cutoff
+            and filename_time >= cutoff_minute
+        )
+    except OSError:
+        return False
+
+
+def _response_workbook_paths(response_text: str) -> list[Path]:
+    paths: list[Path] = []
+    for line in response_text.splitlines():
+        candidate = line.strip()
+        if candidate.startswith("MEDIA:"):
+            candidate = candidate.removeprefix("MEDIA:").strip()
+        path = Path(candidate)
+        if path.suffix.lower() == ".xlsx":
+            paths.append(path)
+    return paths
+
+
+def _rerun_directory(turn: ManualTurn, response_text: str) -> Path | None:
+    """Accept a timestamped rerun sibling only when its workbook was reported."""
+    prefix = f"{turn.output_dir.name}-rerun-"
+    for workbook in _response_workbook_paths(response_text):
+        parent = workbook.parent
+        if parent.parent == turn.output_dir.parent and parent.name.startswith(prefix):
+            stamp = parent.name.removeprefix(prefix)
             try:
-                match = _WORKBOOK_TIMESTAMP_RE.match(path.name)
-                if not match:
-                    continue
-                filename_time = datetime.strptime(match.group(1), "%y%m%d-%H%M")
-                modified_at = path.stat().st_mtime
-                if (
-                    path.is_file()
-                    and modified_at >= cutoff
-                    and filename_time >= cutoff_minute
-                ):
-                    candidates.append((modified_at, path))
-            except (OSError, ValueError):
+                datetime.strptime(stamp, "%y%m%d-%H%M")
+            except ValueError:
+                continue
+            return parent
+    return None
+
+
+def _fresh_native_workbook(turn: ManualTurn, response_text: str = "") -> Path | None:
+    candidates: list[tuple[float, Path]] = []
+    directories = [turn.output_dir]
+    rerun_dir = _rerun_directory(turn, response_text)
+    if rerun_dir is not None:
+        directories.append(rerun_dir)
+    for directory in directories:
+        if not directory.is_dir():
+            continue
+        for path in directory.glob("*.xlsx"):
+            try:
+                if _is_fresh_workbook(path, turn, directory):
+                    candidates.append((path.stat().st_mtime, path))
+            except OSError:
                 continue
     if not candidates:
         return None
     return max(candidates, key=lambda item: (item[0], item[1].name))[1]
+
+
+def _fresh_delivered_workbook(
+    turn: ManualTurn, response_text: str, *, expected_target: str | None
+) -> Path | None:
+    """Find the receipt's exact fresh workbook before any output discovery."""
+    directories = [turn.output_dir]
+    rerun_dir = _rerun_directory(turn, response_text)
+    if rerun_dir is not None:
+        directories.append(rerun_dir)
+    for directory in directories:
+        try:
+            payload = json.loads((directory / ".delivered.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            continue
+        if not isinstance(payload, dict) or not isinstance(payload.get("path"), str):
+            continue
+        workbook = Path(payload["path"])
+        if _is_fresh_workbook(workbook, turn, directory) and _already_sent_by_trip_deliver(
+            workbook, turn, expected_target=expected_target
+        ):
+            return workbook
+    return None
+
+
+def _receipt_state(directory: Path) -> tuple[str, dict | None]:
+    """Return missing, malformed, or structurally valid for a local receipt."""
+    marker = directory / ".delivered.json"
+    if not marker.exists():
+        return "missing", None
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return "malformed", None
+    if not (
+        isinstance(payload, dict)
+        and payload.get("status") == "delivered"
+        and isinstance(payload.get("path"), str)
+        and payload["path"]
+        and (
+            "target" not in payload
+            or (isinstance(payload["target"], str) and payload["target"])
+        )
+    ):
+        return "malformed", None
+    return "valid", payload
+
+
+def _has_fresh_unsupported_workbook(turn: ManualTurn, response_text: str) -> bool:
+    """A fresh nonempty XLSX that fails recognition is an anomaly, not missing."""
+    directories = [turn.output_dir]
+    rerun_dir = _rerun_directory(turn, response_text)
+    if rerun_dir is not None:
+        directories.append(rerun_dir)
+    cutoff = turn.started_at - FRESHNESS_GRACE_SECONDS
+    for directory in directories:
+        if not directory.is_dir():
+            continue
+        for path in directory.glob("*.xlsx"):
+            try:
+                stat = path.stat()
+                if path.is_file() and stat.st_size > 0 and stat.st_mtime >= cutoff:
+                    if _is_fresh_workbook(path, turn, directory):
+                        continue
+                    return True
+            except OSError:
+                continue
+    return False
 
 
 def _affected_product_id(response_text: str, turn: ManualTurn) -> str | None:
@@ -187,7 +360,9 @@ def _normalized_warning(response_text: str, turn: ManualTurn) -> str | None:
     return f"抓取重要警告：{'；'.join(unique_warnings)}。"
 
 
-def _already_sent_by_trip_deliver(workbook: Path, turn: ManualTurn) -> bool:
+def _already_sent_by_trip_deliver(
+    workbook: Path, turn: ManualTurn, *, expected_target: str | None = None
+) -> bool:
     """Whether the dedicated sender already delivered this exact manual run.
 
     `trip_deliver.py` invokes `hermes send` itself. Returning the workbook from
@@ -195,15 +370,38 @@ def _already_sent_by_trip_deliver(workbook: Path, turn: ManualTurn) -> bool:
     The receipt path must match exactly so a new run in the same manual folder
     is never incorrectly suppressed.
     """
-    marker = turn.output_dir / ".delivered.json"
+    # A reported rerun is a timestamped sibling of the base manual directory;
+    # its receipt intentionally lives beside that sibling's workbook.
+    if not _is_within(workbook, workbook.parent):
+        return False
     try:
-        payload = json.loads(marker.read_text(encoding="utf-8"))
+        payload = json.loads((workbook.parent / ".delivered.json").read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
         return False
-    return payload.get("status") == "delivered" and payload.get("path") == str(workbook)
+    if not isinstance(payload, dict):
+        return False
+    path = payload.get("path")
+    if not (
+        payload.get("status") == "delivered"
+        and isinstance(path, str)
+        and path == str(workbook)
+        and workbook.is_file()
+    ):
+        return False
+    try:
+        if workbook.stat().st_size <= 0:
+            return False
+    except OSError:
+        return False
+    if expected_target is not None:
+        target = payload.get("target")
+        return isinstance(target, str) and bool(target) and target == expected_target
+    return True
 
 
-def _suppress_already_delivered_media(response_text: str) -> str | None:
+def _suppress_already_delivered_media(
+    response_text: str, *, expected_target: str | None = None
+) -> str | None:
     """Remove MEDIA/bare workbook lines already sent by ``trip_deliver.py``.
 
     A manual retry can be a follow-up without product IDs, so it is not always
@@ -221,7 +419,7 @@ def _suppress_already_delivered_media(response_text: str) -> str | None:
             workbook.suffix.lower() == ".xlsx"
             and workbook.parent.name.startswith("manual-")
             and _already_sent_by_trip_deliver(
-                workbook, ManualTurn((), workbook.parent, 0.0)
+                workbook, ManualTurn((), workbook.parent, 0.0), expected_target=expected_target
             )
         ):
             suppressed = True
@@ -235,18 +433,53 @@ def _suppress_already_delivered_media(response_text: str) -> str | None:
     return remaining or "附件已发送。"
 
 
-def filter_manual_response(response_text: str, turn: ManualTurn) -> str:
+def _delivery_target(metadata: dict) -> str | None:
+    """Use an explicit usable hook target only; never infer one from a session."""
+    for key in ("target", "delivery_target"):
+        value = metadata.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _recognition_anomaly(turn: ManualTurn, response_text: str) -> bool:
+    directories = [turn.output_dir]
+    rerun_dir = _rerun_directory(turn, response_text)
+    if rerun_dir is not None:
+        directories.append(rerun_dir)
+    return any(_receipt_state(directory)[0] == "malformed" for directory in directories) or (
+        _has_fresh_unsupported_workbook(turn, response_text)
+    )
+
+
+def filter_manual_response(
+    response_text: str, turn: ManualTurn, *, expected_target: str | None = None
+) -> str:
     """Replace a manual scrape response with one allowed delivery path only."""
 
-    workbook = _fresh_native_workbook(turn)
+    # Receipt first: semantic renaming happens before delivery, so old-native
+    # globbing must never turn an already delivered current run into "missing".
+    if _fresh_delivered_workbook(
+        turn, response_text, expected_target=expected_target
+    ) is not None:
+        return "附件已发送。"
+    workbook = _fresh_native_workbook(turn, response_text)
+    if workbook is not None:
+        receipt_state, receipt = _receipt_state(workbook.parent)
+        if receipt_state == "malformed":
+            return "抓取结果异常：原生Excel交付回执或识别异常。"
+        # A receipt for this fresh candidate that did not pass the exact target
+        # check above is a current delivery inconsistency. A valid receipt for
+        # a different (stale) path is harmless in a reused manual directory.
+        if receipt_state == "valid" and receipt["path"] == str(workbook):
+            return "抓取结果异常：原生Excel交付回执或识别异常。"
     if workbook is None:
+        if _recognition_anomaly(turn, response_text):
+            return "抓取结果异常：原生Excel交付回执或识别异常。"
         return f"抓取失败：未生成原生Excel（{turn.output_dir}）"
 
     # The receipt makes trip_deliver.py the sole sender and prevents the final
     # gateway response from attaching an identical workbook a second time.
-    if _already_sent_by_trip_deliver(workbook, turn):
-        return "附件已发送。"
-
     warning = _normalized_warning(response_text, turn)
     if warning:
         return f"{warning}\n{workbook}"
@@ -296,11 +529,15 @@ def register(ctx, *, output_root: Path = DEFAULT_OUTPUT_ROOT):
         return {"context": _manual_context(turn)}
 
     def transform_llm_output(response_text: str, session_id: str, **kwargs):
-        del kwargs
+        expected_target = _delivery_target(kwargs)
         turn = active_turns.pop(session_id, None)
         if turn is None:
-            return _suppress_already_delivered_media(response_text)
-        return filter_manual_response(response_text, turn)
+            return _suppress_already_delivered_media(
+                response_text, expected_target=expected_target
+            )
+        return filter_manual_response(
+            response_text, turn, expected_target=expected_target
+        )
 
     ctx.register_hook("pre_llm_call", pre_llm_call)
     ctx.register_hook("transform_llm_output", transform_llm_output)

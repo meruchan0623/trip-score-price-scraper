@@ -1028,6 +1028,45 @@ def test_browser_recovery_fills_blocked_rows_and_completes(tmp_path, monkeypatch
         assert str(row['总分']) == '4.5'
 
 
+def test_browser_recovery_zero_valid_jsonl_replacements_fails_closed(tmp_path, monkeypatch):
+    """A browser JSONL containing only failed records is not an applied recovery."""
+    product_id = '2000'
+    api_rows = {product_id: {'抓取备注': RISK_NOTE}}
+    _commands, args = _run_offline_main(
+        monkeypatch, tmp_path, api_rows, {}, policy='off', workers=1,
+    )
+
+    def blocked_fetch(_site, _locale, _currency, item, **_kwargs):
+        return {
+            '厂商': item['vendor'],
+            '商品ID': item['id'],
+            'URL': f'https://hk.trip.com/things-to-do/detail/{item["id"]}/',
+            '抓取备注': RISK_NOTE,
+        }
+
+    def failed_records_runner(_command, env, _timeout):
+        ids = json.loads(Path(env['TRIP_RECOVERY_IDS']).read_text(encoding='utf-8'))
+        Path(env['TRIP_RECOVERY_OUT']).write_text(
+            '\n'.join(json.dumps({'id': value, 'status': 430}) for value in ids) + '\n',
+            encoding='utf-8',
+        )
+        return 0, '', ''
+
+    monkeypatch.setattr(collector, 'fetch', blocked_fetch)
+    monkeypatch.setattr(collector, 'browser_recovery_runner', failed_records_runner)
+
+    with pytest.raises(SystemExit, match='部分失败'):
+        collector.main(args)
+
+    run = _only_run(tmp_path)
+    result = json.loads((run / 'run_result.json').read_text(encoding='utf-8'))
+    assert result['status'] == 'failed'
+    assert result['failed_ids'] == ['HK/' + product_id]
+    assert 'browser_recovery_failed' in result['errors']
+    assert 'browser_recovery_applied' not in result['errors']
+    assert not (run / '.collection_done').exists()
+
+
 def test_cool_down_retry_recovers_products_after_transient_block(tmp_path, monkeypatch):
     product_ids = [str(2000 + index) for index in range(14)]
     api_rows = {product_id: {'抓取备注': RISK_NOTE} for product_id in product_ids}

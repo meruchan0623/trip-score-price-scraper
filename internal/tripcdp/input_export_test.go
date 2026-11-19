@@ -433,6 +433,82 @@ func TestExportRowsRatingOnlyProductInfoShapeMatchesLegacyGUI(t *testing.T) {
 	}
 }
 
+func TestNativeWorkbookDerivesGoodRateForMode1AndMode2(t *testing.T) {
+	tests := []struct {
+		name       string
+		ratingOnly bool
+		want       string
+	}{
+		{name: "mode1 price", ratingOnly: false, want: "100.0%"},
+		{name: "mode2 product information", ratingOnly: true, want: "0.0%"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "native.xlsx")
+			nonpositive := "0"
+			if tt.ratingOnly {
+				nonpositive = "10"
+			}
+			rows := []map[string]string{{
+				"商品ID": "12345", "URL": "https://hk.trip.com/things-to-do/detail/12345/", "商品名称": "Product",
+				"SKU层级1": "套餐", "货币": "HKD", "外显价格": "10", "评价数": "10", "中差评价数": nonpositive, "好评率": "12.3%",
+			}}
+			if _, err := exportRows(rows, path, tt.ratingOnly, false, true, false); err != nil {
+				t.Fatal(err)
+			}
+			file, err := excelize.OpenFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer file.Close()
+			sheet := file.GetSheetName(file.GetActiveSheetIndex())
+			values, err := file.GetRows(sheet)
+			if err != nil {
+				t.Fatal(err)
+			}
+			col := -1
+			for i, header := range values[0] {
+				if header == "好评率" {
+					col = i
+				}
+			}
+			if col < 0 || len(values) < 2 || values[1][col] != tt.want {
+				t.Fatalf("native %s 好评率 = %q, want %q", tt.name, values[1][col], tt.want)
+			}
+		})
+	}
+}
+
+func TestNativeWorkbookKeepsSuppliedGoodRateWhenCountsAreMissingOrInvalid(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fallback.xlsx")
+	rows := []map[string]string{
+		{"商品ID": "missing", "URL": "https://hk.trip.com/things-to-do/detail/12345/", "商品名称": "Missing", "评价数": "10", "好评率": "91.1%"},
+		{"商品ID": "invalid", "URL": "https://hk.trip.com/things-to-do/detail/67890/", "商品名称": "Invalid", "评价数": "10.0", "中差评价数": "1", "好评率": "88.8%"},
+	}
+	if _, err := exportRows(rows, path, true, false, true, false); err != nil {
+		t.Fatal(err)
+	}
+	file, err := excelize.OpenFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	values, err := file.GetRows(file.GetSheetName(file.GetActiveSheetIndex()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	goodRateColumn := -1
+	for i, header := range values[0] {
+		if header == "好评率" {
+			goodRateColumn = i
+			break
+		}
+	}
+	if goodRateColumn < 0 || values[1][goodRateColumn] != "91.1%" || values[2][goodRateColumn] != "88.8%" {
+		t.Fatalf("fallback 好评率 cells = %q, %q", values[1][goodRateColumn], values[2][goodRateColumn])
+	}
+}
+
 func TestTraverseSKUCombinationsRefreshesLayerOptions(t *testing.T) {
 	layers := []skuLayerInfo{{Index: 0, Title: "套餐"}, {Index: 1, Title: "天数"}}
 	selected := []string{}

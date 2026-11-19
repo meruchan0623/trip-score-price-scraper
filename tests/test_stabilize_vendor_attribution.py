@@ -31,6 +31,14 @@ def _write_target(path: Path, rows: list[list]) -> Path:
     return path
 
 
+def _write_renamed_target(path: Path, name: str, rows: list[list]) -> Path:
+    target = _write_target(path, rows)
+    wb = openpyxl.load_workbook(target)
+    wb.active.title = name
+    wb.save(target)
+    return target
+
+
 def _write_workbook(path: Path, rows_per_site: dict[str, list[tuple[str, str, str]]]) -> Path:
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
@@ -83,6 +91,12 @@ def test_target_map_reads_float_ids_and_tsim_alias(tmp_path: Path) -> None:
         "5001": "JY",
         "1002": "TSIM 網址",
     }
+
+
+def test_target_map_uses_shared_schema_resolution_for_renamed_trip_sheet(tmp_path: Path) -> None:
+    target = _write_renamed_target(tmp_path / "target.xlsx", "Trip", [[1001.0, "x", "x", 1001.0, None, None, None, None, None]])
+    unique, conflicts, count = MODULE.target_map(target)
+    assert (unique, conflicts, count) == ({"1001": "TSIM 網址"}, {}, 1)
 
 
 def test_conflicts_use_manual_reference_then_join(tmp_path: Path) -> None:
