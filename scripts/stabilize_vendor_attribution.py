@@ -33,8 +33,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from daily_mode2_urls import (  # noqa: E402
-    TARGET_SHEET_NAMES,
     VENDOR_COLS,
+    resolve_target_sheet,
     resolve_vendor_columns,
 )
 
@@ -82,16 +82,6 @@ def product_id(value: object) -> str:
     if text.endswith(".0") and text[:-2].isdigit():
         return text[:-2]
     return text if text.isdigit() else ""
-
-
-def resolve_target_sheet(workbook):
-    for sheet_name in TARGET_SHEET_NAMES:
-        if sheet_name in workbook.sheetnames:
-            return workbook[sheet_name]
-    raise KeyError(
-        f"target workbook missing one of {list(TARGET_SHEET_NAMES)!r}; "
-        f"found {workbook.sheetnames!r}"
-    )
 
 
 def target_map(path: Path) -> tuple[dict[str, str], dict[str, list[str]], int]:

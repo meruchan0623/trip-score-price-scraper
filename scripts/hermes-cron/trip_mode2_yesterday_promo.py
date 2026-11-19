@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Insert a `昨日总促销标签` column before `总促销标签` in a Mode2 six-site workbook.
+"""Insert a `昨日总促销标签` column before `总促销标签` in a Mode2 workbook.
 
 Usage:
     trip_mode2_yesterday_promo.py CURRENT_XLSX [--root RUN_DIR_BASE]
@@ -12,30 +12,60 @@ yields an empty cell. Re-running never adds a second baseline column.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
 ROOT = Path("/Users/tsimclaw/Documents/trip-sku-price-scrape")
 SITES = ("TW", "HK", "RU", "JP", "VN", "TH")
+TWO_SITE_SCOPE = "hk_ru_2site"
 PID_HEADER = "商品ID"
 PROMO_HEADER = "总促销标签"
 BASELINE_HEADER = "昨日总促销标签"
 CHANGED_FONT_COLOR = "FFFF0000"  # red font on today's 总促销标签 when it differs from yesterday
 
 
+def marker_output(run_dir: Path) -> Path | None:
+    """Return the finalized HK/RU workbook named by a valid local marker."""
+    try:
+        marker = json.loads((run_dir / ".collection_done").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(marker, dict):
+        return None
+    if str(marker.get("sites", "")).lower() != "hk,ru" or marker.get("scope") != TWO_SITE_SCOPE:
+        return None
+    output = Path(str(marker.get("output_path", "")))
+    candidate = output if output.is_absolute() else run_dir / output
+    try:
+        candidate = candidate.resolve()
+        candidate.relative_to(run_dir.resolve())
+    except (OSError, ValueError):
+        return None
+    if candidate.is_file() and candidate.stat().st_size and candidate.name.endswith("_trip_mode2_daily_2site.xlsx"):
+        return candidate
+    return None
+
+
 def xlsx_in(run_dir: Path) -> Path | None:
-    """Same lookup order as trip_mode2_direct_delivery.xlsx_in (timestamped, legacy, generic)."""
+    """Find a prior-day baseline: finalized HK/RU, 2site names, then legacy 6site names."""
     if not run_dir.is_dir():
         return None
-    timestamped = sorted(run_dir.glob("*_trip_mode2_daily_6site.xlsx"))
-    if timestamped:
-        return timestamped[-1]
-    standard = run_dir / "trip_mode2_daily_6site.xlsx"
-    if standard.is_file() and standard.stat().st_size:
-        return standard
-    generic = sorted(run_dir.glob("*mode2*6site*.xlsx"))
-    return generic[-1] if generic else None
+    selected = marker_output(run_dir)
+    if selected:
+        return selected
+    for scope in ("2site", "6site"):
+        timestamped = sorted(path for path in run_dir.glob(f"*_trip_mode2_daily_{scope}.xlsx") if path.is_file() and path.stat().st_size)
+        if timestamped:
+            return timestamped[-1]
+        standard = run_dir / f"trip_mode2_daily_{scope}.xlsx"
+        if standard.is_file() and standard.stat().st_size:
+            return standard
+        generic = sorted(path for path in run_dir.glob(f"*mode2*{scope}*.xlsx") if path.is_file() and path.stat().st_size)
+        if generic:
+            return generic[-1]
+    return None
 
 
 def previous_run_dir(current_xlsx: Path, root: Path | None = None) -> Path | None:

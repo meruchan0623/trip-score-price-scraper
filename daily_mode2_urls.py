@@ -7,7 +7,7 @@ daily_mode2_urls.py — 从 日常抓取目标.xlsx 生成 mode2 多站点 URL �
 
 产出：
   - 一行一个产品 URL（格式 `https://hk.trip.com/things-to-do/detail/<ID>/`）
-  - 去重、只读 Sheet1/工作表1 列 TSIM 網址/BC/TGT/FR/JY/其他 中所有数字 ID
+  - 去重、按完整厂商 schema 唯一定位工作表（名称只是线索）并读取所有数字 ID
   - 默认输出到 /tmp/trip_mode2_daily_template.txt
 
 此脚本只做纯数据转换，不启动浏览器、不发请求、不运行抓取。
@@ -25,20 +25,10 @@ DEFAULT_OUTPUT = Path("/tmp/trip_mode2_daily_template.txt")
 VENDOR_COLS = ["TSIM 網址", "BC", "TGT", "FR", "JY", "其他"]
 # The public source calls the canonical TSIM column `TSIM`; legacy mirrors
 # call it `TSIM 網址`. Normalize only the header name, never product values.
-VENDOR_COLUMN_ALIASES = {"TSIM 網址": ("TSIM 網址", "TSIM"), **{name: (name,) for name in VENDOR_COLS[1:]}}
+VENDOR_COLUMN_ALIASES = {"TSIM 網址": ("TSIM 網址", "TSIM网址", "TSIM"), **{name: (name,) for name in VENDOR_COLS[1:]}}
 # Google XLSX exports preserve the source's localized default worksheet name.
 # Accept the canonical local name and the actual public-sheet export name.
 TARGET_SHEET_NAMES = ("Sheet1", "工作表1")
-
-
-def resolve_target_sheet(workbook: openpyxl.Workbook):
-    for sheet_name in TARGET_SHEET_NAMES:
-        if sheet_name in workbook.sheetnames:
-            return workbook[sheet_name]
-    raise KeyError(
-        f"target workbook missing one of {list(TARGET_SHEET_NAMES)!r}; "
-        f"found {workbook.sheetnames!r}"
-    )
 
 
 def resolve_vendor_columns(worksheet) -> dict[str, int]:
@@ -49,6 +39,33 @@ def resolve_vendor_columns(worksheet) -> dict[str, int]:
                 columns[canonical] = cell.column
                 break
     return columns
+
+
+def resolve_target_sheet(workbook: openpyxl.Workbook):
+    """Return the one sheet that has the complete daily vendor schema.
+
+    Google exports can rename the worksheet (for example to ``Trip``).  A
+    familiar sheet name is therefore not authority.  Conversely, accepting
+    the first schema-looking sheet would make a duplicated export ambiguous.
+    Keep this resolver shared by sync, URL generation and attribution so they
+    cannot freeze and consume different inputs.
+    """
+    candidates = []
+    for worksheet in workbook.worksheets:
+        columns = resolve_vendor_columns(worksheet)
+        if all(header in columns for header in VENDOR_COLS):
+            candidates.append(worksheet)
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates:
+        raise KeyError(
+            "target workbook has no worksheet with required vendor schema "
+            f"{VENDOR_COLS!r}; found {workbook.sheetnames!r}"
+        )
+    raise KeyError(
+        "target workbook has ambiguous worksheets with required vendor schema: "
+        f"{[sheet.title for sheet in candidates]!r}"
+    )
 
 
 def parse_product_id(value) -> int | None:
@@ -65,23 +82,22 @@ def parse_product_id(value) -> int | None:
 
 def extract_product_ids(path: Path) -> list[int]:
     wb = openpyxl.load_workbook(path, data_only=True)
-    ws = resolve_target_sheet(wb)
-    col_map = resolve_vendor_columns(ws)
-    ids: list[int] = []
-    seen = set()
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        for col_name in VENDOR_COLS:
-            c = col_map.get(col_name)
-            if c is None:
-                continue
-            v = row[c - 1]
-            pid = parse_product_id(v)
-            if pid is not None:
-                if pid not in seen:
+    try:
+        ws = resolve_target_sheet(wb)
+        col_map = resolve_vendor_columns(ws)
+        ids: list[int] = []
+        seen = set()
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            for col_name in VENDOR_COLS:
+                c = col_map[col_name]
+                v = row[c - 1]
+                pid = parse_product_id(v)
+                if pid is not None and pid not in seen:
                     seen.add(pid)
                     ids.append(pid)
-    wb.close()
-    return ids
+        return ids
+    finally:
+        wb.close()
 
 
 def main(argv: list[str] | None = None) -> None:
