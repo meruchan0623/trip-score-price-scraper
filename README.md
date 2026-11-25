@@ -2,6 +2,25 @@
 
 本项目使用 Go + Chrome DevTools Protocol (CDP) 抓取 Trip.com Things-to-Do 商品的 SKU 价格。下面的「给 Agent 的当前抓取契约」是执行抓取、排障和验收时的唯一准则；网页与接口为实时外部状态，旧的录制结果不能代替本次运行证据。
 
+## Trip Outerlist HK sales recovery
+
+The daily sales collector accepts `--data-source api` (compatible default) or `detail`.
+The HK wrapper uses `detail`: one public detail-page GET per product, parsing only
+`__NEXT_DATA__` at `props.pageProps.initialState.__STATE_MAP__.PageModel.ds.getProductInfo`.
+It fails closed on redirects, challenges, identity mismatch, or incomplete sales; it does
+not use a browser or fall back to the shielded POST API.
+
+Recover a same-day failed run into a new artifact only:
+
+```sh
+python3 scripts/trip_outerlist_mode2_api_daily.py --output-root /path/to/root --data-source detail \
+  --resume-run-dir /path/to/root/YYMMDD-mode2-outerlist-api-daily-cron-OLD --failed-only --run-suffix retry-unique
+```
+
+The source must be a direct failed child of the output root from today with consistent
+persisted Outerlist/sales IDs. Existing valid rows are retained, not presented as fresh;
+only failed or invalid rows are fetched.
+
 ## 给 Agent 的当前抓取契约（2026-09-18）
 
 Trip.com 的商品加载方式已经变化，不能再把「打开详情 URL 后页面有价格」当成抓取成功。
