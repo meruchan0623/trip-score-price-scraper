@@ -1,6 +1,7 @@
 import json
 import os
 import threading
+from urllib.parse import urlparse
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,6 +11,131 @@ import openpyxl
 import pytest
 
 from scripts import trip_outerlist_mode2_api_daily as collector
+
+
+def test_detail_product_mapper_rejects_non_integer_sales_and_accepts_zero():
+    base = {'productId': '57042119', 'basicInfo': {'productName': 'Name'},
+            'commentInfo': {'commentCount': 0},
+            'salesVolume': {'monthlySales': 0, 'yearlySales': 0, 'twoYearSales': 0}}
+    row = collector.row_from_product(base, '57042119', {'vendor': 'V'}, 'hk', 'HKD', 'zh-HK')
+    assert row['月销量'] == row['年销量'] == row['总销量'] == '0'
+    for bad in (True, -1, 1.5, None, '1.0'):
+        product = dict(base, salesVolume=dict(base['salesVolume'], monthlySales=bad))
+        with pytest.raises(RuntimeError, match='monthlySales'):
+            collector.row_from_product(product, '57042119', {'vendor': 'V'}, 'hk', 'HKD', 'zh-HK')
+
+
+def test_detail_fetch_parses_only_next_data_and_rejects_identity_or_challenge(monkeypatch):
+    product = {'productId': '57042119', 'basicInfo': {'productName': 'Name'},
+               'commentInfo': {'commentCount': 1, 'commentScore': 4.6},
+               'salesVolume': {'monthlySales': 1, 'yearlySales': 2, 'twoYearSales': 3}}
+    data = {'props': {'pageProps': {'initialState': {
+        '__STATE_MAP__': {'PageModel': {'ds': {'getProductInfo': [product]}, 'header': {'clientInfo': {'locale': 'zh-HK', 'currency': 'HKD'}}}, 'commonHeaderData': {'site': 'HK', 'locale': 'zh-HK', 'currency': 'HKD'}}
+    }}}}
+    body = '<script id="__NEXT_DATA__" type="application/json">' + json.dumps(data) + '</script>'
+
+    class Response:
+        def __init__(self, page, final='https://hk.trip.com/things-to-do/detail/57042119/?locale=zh-HK&curr=HKD'):
+            self.page, self.final = page, final
+        def read(self): return self.page.encode()
+        def geturl(self): return self.final
+        def __enter__(self): return self
+        def __exit__(self, *_): return None
+    monkeypatch.setattr(collector.urllib.request, 'urlopen', lambda request, timeout: Response(body))
+    assert collector.detail_fetch('hk', 'zh-HK', 'HKD', {'id': '57042119', 'vendor': 'V'})['总销量'] == '3'
+    monkeypatch.setattr(collector.urllib.request, 'urlopen', lambda request, timeout: Response('<html>captcha security check</html>'))
+    assert collector.detail_fetch('hk', 'zh-HK', 'HKD', {'id': '57042119', 'vendor': 'V'})['抓取备注'] == 'detail_http_200_challenge'
+    monkeypatch.setattr(collector.urllib.request, 'urlopen', lambda request, timeout: Response('<html>ordinary broken page</html>'))
+    assert collector.detail_fetch('hk', 'zh-HK', 'HKD', {'id': '57042119', 'vendor': 'V'})['抓取备注'] != 'detail_http_200_challenge'
+    monkeypatch.setattr(collector.urllib.request, 'urlopen', lambda request, timeout: Response(body, 'https://hk.trip.com/things-to-do/detail/9/'))
+    assert collector.detail_fetch('hk', 'zh-HK', 'HKD', {'id': '57042119', 'vendor': 'V'})['抓取备注']
+
+
+@pytest.mark.parametrize('score', [True, 'NaN', 'Infinity', 5.1])
+def test_product_mapper_rejects_nonfinite_or_out_of_range_scores(score):
+    product = {'productId': '1', 'basicInfo': {'productName': 'Name'}, 'commentInfo': {'commentCount': 1, 'commentScore': score},
+               'salesVolume': {'monthlySales': 0, 'yearlySales': 0, 'twoYearSales': 0}}
+    with pytest.raises(RuntimeError, match='commentScore'):
+        collector.row_from_product(product, '1', {'vendor': 'V'}, 'hk', 'HKD', 'zh-HK')
+
+
+def test_detail_main_dispatch_never_calls_api_browser_or_mode2(tmp_path, monkeypatch):
+    _commands, args = _run_offline_main(monkeypatch, tmp_path, {'1': {}}, {}, policy='required')
+    args.extend(['--data-source', 'detail'])
+    monkeypatch.setattr(collector, 'fetch', lambda *_a, **_k: pytest.fail('API called'))
+    monkeypatch.setattr(collector, 'browser_recovery_replacements', lambda *_a: pytest.fail('browser called'))
+    monkeypatch.setattr(collector, 'run_mode2_recovery', lambda *_a: pytest.fail('mode2 called'))
+    monkeypatch.setattr(collector, 'detail_fetch', lambda site, locale, currency, item: {
+        '厂商': item['vendor'], '商品ID': item['id'], 'URL': f'https://{site}.trip.com/things-to-do/detail/{item["id"]}/?curr={currency}&locale={locale}',
+        '商品名称': 'detail', '月销量': '1', '年销量': '2', '总销量': '3', '评价数': '0', '总分': '',
+    })
+    collector.main(args)
+
+
+def test_detail_main_stops_after_first_denial_and_preserves_skipped_rows(tmp_path, monkeypatch):
+    """The real detail transport is paced; pending IDs never reach urlopen."""
+    _commands, args = _run_offline_main(monkeypatch, tmp_path, {'1': {}, '2': {}, '3': {}, '4': {}}, {}, policy='required')
+    args.extend(['--data-source', 'detail', '--workers', '99'])
+    clock, starts = {'value': 10.0}, []
+    monkeypatch.setattr(collector.time, 'monotonic', lambda: clock['value'])
+    monkeypatch.setattr(collector.time, 'sleep', lambda delay: clock.__setitem__('value', clock['value'] + delay))
+
+    def product_page(product_id):
+        product = {'productId': product_id, 'basicInfo': {'productName': 'Name'},
+                   'commentInfo': {'commentCount': 0},
+                   'salesVolume': {'monthlySales': 1, 'yearlySales': 2, 'twoYearSales': 3}}
+        data = {'props': {'pageProps': {'initialState': {'__STATE_MAP__': {
+            'PageModel': {'ds': {'getProductInfo': [product]},
+                          'header': {'clientInfo': {'locale': 'zh-HK', 'currency': 'HKD', 'site': 'HK'}}}
+        }}}}}
+        return '<script id="__NEXT_DATA__" type="application/json">' + json.dumps(data) + '</script>'
+
+    class Response:
+        def __init__(self, body, url): self.body, self.url = body, url
+        def read(self): return self.body.encode()
+        def geturl(self): return self.url
+        def __enter__(self): return self
+        def __exit__(self, *_args): return None
+
+    def fake_urlopen(request, timeout):
+        product_id = urlparse(request.full_url).path.rstrip('/').rsplit('/', 1)[-1]
+        starts.append((product_id, clock['value']))
+        if product_id == '2':
+            raise HTTPError(request.full_url, 403, 'blocked', None, None)
+        return Response(product_page(product_id), request.full_url)
+
+    monkeypatch.setattr(collector.urllib.request, 'urlopen', fake_urlopen)
+    with pytest.raises(SystemExit, match='部分失败'):
+        collector.main(args)
+
+    run = _only_run(tmp_path)
+    result = json.loads((run / 'run_result.json').read_text(encoding='utf-8'))
+    rows = _sheet_rows(Path(result['workbook']), 'HK')
+    assert starts == [('1', 10.0), ('2', 12.0)]
+    assert rows['2']['抓取备注'] == 'detail_http_403'
+    assert rows['3']['抓取备注'] == rows['4']['抓取备注'] == 'detail_skipped_after_block'
+    assert result['errors'] == ['detail_access_blocked']
+    assert result['failed_ids'] == ['HK/2', 'HK/3', 'HK/4']
+    assert not (run / '.collection_done').exists()
+
+
+def test_detail_main_healthy_path_is_sequential_even_with_many_workers(tmp_path, monkeypatch):
+    _commands, args = _run_offline_main(monkeypatch, tmp_path, {'1': {}, '2': {}}, {}, policy='off')
+    args.extend(['--data-source', 'detail', '--workers', '99'])
+    clock, starts = {'value': 0.0}, []
+    monkeypatch.setattr(collector.time, 'monotonic', lambda: clock['value'])
+    monkeypatch.setattr(collector.time, 'sleep', lambda delay: clock.__setitem__('value', clock['value'] + delay))
+
+    def fake_detail(_site, _locale, _currency, item):
+        starts.append((item['id'], clock['value']))
+        return {'厂商': item['vendor'], '商品ID': item['id'], 'URL': 'https://hk.trip.com/',
+                '商品名称': 'detail', '月销量': '1', '年销量': '2', '总销量': '3', '评价数': '0'}
+
+    monkeypatch.setattr(collector, 'detail_fetch', fake_detail)
+    collector.main(args)
+    run = _only_run(tmp_path)
+    assert starts == [('1', 0.0), ('2', 2.0)]
+    assert (run / '.collection_done').exists()
 
 
 def test_parse_config_preserves_legacy_defaults():
@@ -80,16 +206,15 @@ def test_parse_config_rejects_invalid_mode2_policy():
         collector.parse_config(['--mode2-fallback', 'sometimes'])
 
 
-def test_runtime_policy_accepts_mode2_and_still_rejects_resume_requests(tmp_path):
+def test_runtime_policy_accepts_mode2_and_resume_pair(tmp_path):
     required = collector.parse_config(['--mode2-fallback', 'required'])
     collector.validate_runtime_policy(required)
 
     explicit_workers = collector.parse_config(['--mode2-workers', '3'])
     collector.validate_runtime_policy(explicit_workers)
 
-    resume = collector.parse_config(['--resume-run-dir', str(tmp_path), '--failed-only'])
-    with pytest.raises(collector.UnsupportedPolicyError, match='resume'):
-        collector.validate_runtime_policy(resume)
+    resume = collector.parse_config(['--resume-run-dir', str(tmp_path), '--failed-only', '--run-suffix', 'retry'])
+    collector.validate_runtime_policy(resume)
 
 
 def test_build_run_result_is_serializable_text_compatible_and_credential_free(tmp_path):
@@ -231,8 +356,8 @@ def test_fetch_keeps_yearly_sales_separate_from_two_year_delta_basis(monkeypatch
                 'yearlySales': 99,
                 'twoYearSales': 200,
             },
-            'commentInfo': {},
-            'basicInfo': {},
+            'commentInfo': {'commentCount': 0},
+            'basicInfo': {'productName': 'Name'},
         }],
     }
 
@@ -313,7 +438,9 @@ def test_fetch_retries_http_430_risk_block_with_bounded_jitter(monkeypatch):
     def success_response():
         yield SimpleNamespace(read=lambda: json.dumps({
             'ResponseStatus': {'Ack': 'Success'},
-            'productInfos': [{'productId': '123', 'salesVolume': {}}],
+            'productInfos': [{'productId': '123', 'basicInfo': {'productName': 'Name'},
+                              'commentInfo': {'commentCount': 0},
+                              'salesVolume': {'monthlySales': 0, 'yearlySales': 0, 'twoYearSales': 0}}],
         }).encode())
 
     def fake_urlopen(_request, timeout):
@@ -385,6 +512,12 @@ def _run_offline_main(monkeypatch, tmp_path, api_rows, mode2_rows, *, policy, wo
             'URL': f'https://hk.trip.com/things-to-do/detail/{item["id"]}/',
         }
         row.update(api_rows[item['id']])
+        if not row.get('抓取备注'):
+            row.setdefault('商品名称', 'API ' + item['id'])
+            row.setdefault('月销量', '0')
+            row.setdefault('年销量', '0')
+            row.setdefault('总销量', '0')
+            row.setdefault('评价数', '0')
         return row
 
     monkeypatch.setattr(collector, 'fetch', fake_fetch)
@@ -522,7 +655,7 @@ def test_mode2_off_never_invokes_go_and_keeps_failed_run_incomplete(tmp_path, mo
 
 def test_mode2_auto_partitions_only_failed_ids_and_merges_without_zeroing_sales(tmp_path, monkeypatch):
     api_rows = {
-        '1': {'商品名称': 'API success', '总销量': '100'},
+        '1': {'商品名称': 'API success', '月销量': '1', '年销量': '10', '总销量': '100', '评价数': '0'},
         '2': {'商品名称': 'API old name', '总销量': '250', '抓取备注': 'api failed'},
         '3': {'抓取备注': 'api failed'},
         '4': {'抓取备注': 'api failed'},
@@ -536,10 +669,11 @@ def test_mode2_auto_partitions_only_failed_ids_and_merges_without_zeroing_sales(
             '年销量': '250',
             '总销量': '250',
             '评分': '4.7',
+            '评价数': '0',
             '抓取备注': '',
         },
         '3': {'商品ID': '3', '商品名称': 'Recovered no sales', '总销量': '', '抓取备注': ''},
-        '4': {'商品ID': '4', '月销量': '40', '年销量': '400', '总销量': '400', '抓取备注': ''},
+        '4': {'商品ID': '4', '商品名称': 'Mode2 four', '月销量': '40', '年销量': '400', '总销量': '400', '评价数': '0', '抓取备注': ''},
     }
     previous = {
         ('HK', '2'): {'total': 200, 'score': None},
@@ -603,7 +737,7 @@ def test_mode2_required_records_partial_recovery_as_non_success_without_marker(t
         '20': {'抓取备注': 'api failed'},
     }
     mode2_rows = {
-        '10': {'商品ID': '10', '月销量': '50', '年销量': '500', '总销量': '500', '抓取备注': ''},
+        '10': {'商品ID': '10', '商品名称': 'Recovered', '月销量': '50', '年销量': '500', '总销量': '500', '评价数': '0', '抓取备注': ''},
         '20': {'商品ID': '20', '总销量': '600', '抓取备注': 'mode2 failed'},
     }
     commands, args = _run_offline_main(
@@ -1095,7 +1229,10 @@ def test_cool_down_retry_recovers_products_after_transient_block(tmp_path, monke
             '商品ID': item['id'],
             'URL': f'https://hk.trip.com/things-to-do/detail/{item["id"]}/',
             '商品名称': 'Recovered',
+            '月销量': '0',
+            '年销量': '0',
             '总销量': '321',
+            '评价数': '0',
         }
 
     monkeypatch.setattr(collector, 'fetch', flaky_fetch)

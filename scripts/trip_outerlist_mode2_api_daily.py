@@ -16,6 +16,8 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from html.parser import HTMLParser
+from urllib.parse import parse_qs, urlparse
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -64,6 +66,7 @@ class CollectorConfig:
     api_retry_interval_sec: float
     resume_run_dir: Path | None
     failed_only: bool
+    data_source: str
 
 
 def positive_int(value):
@@ -119,6 +122,8 @@ def build_parser():
                         help='API 重试固定间隔；0 保留原有递增间隔')
     parser.add_argument('--resume-run-dir')
     parser.add_argument('--failed-only', action='store_true')
+    parser.add_argument('--data-source', choices=('api', 'detail'), default='api',
+                        help='sales source; detail reads public __NEXT_DATA__ only')
     return parser
 
 
@@ -137,13 +142,16 @@ def parse_config(argv=None):
         api_retry_interval_sec=args.api_retry_interval_sec,
         resume_run_dir=Path(args.resume_run_dir).expanduser() if args.resume_run_dir else None,
         failed_only=args.failed_only,
+        data_source=args.data_source,
     )
 
 
 def validate_runtime_policy(config):
     """Reject valid options whose execution path is intentionally deferred."""
-    if config.resume_run_dir is not None or config.failed_only:
-        raise UnsupportedPolicyError('--resume-run-dir/--failed-only resume execution is unavailable in stage 1')
+    if bool(config.resume_run_dir) != config.failed_only:
+        raise UnsupportedPolicyError('--resume-run-dir and --failed-only must be used together')
+    if config.resume_run_dir is not None and not config.run_suffix:
+        raise UnsupportedPolicyError('same-day recovery requires a unique --run-suffix')
 
 
 SAFE_RESULT_ERRORS = frozenset({
@@ -160,6 +168,7 @@ SAFE_RESULT_ERRORS = frozenset({
     'mode2_recovery_skipped_risk_block',
     'browser_recovery_applied',
     'browser_recovery_failed',
+    'detail_access_blocked',
 })
 SAFE_EXCEPTION_TYPE = re.compile(r'^exception_type=[A-Za-z_][A-Za-z0-9_]*$')
 
@@ -174,7 +183,9 @@ def safe_error(value):
 
 def build_run_result(*, status, phase, run_id, outerlist_count=0, api_success_count=0,
                      mode2_recovered_count=0, failed_ids=(), baseline_path=None,
-                     workbook=None, errors=()):
+                     workbook=None, errors=(), data_source='api', resume_source_run=None,
+                     reused_count=0, newly_collected_count=0, recovery_success_count=0,
+                     source_observed_at=None, recovery_started_at=None, recovery_completed_at=None):
     """Build the credential-free, JSON-safe contract for one collector run."""
     return {
         'status': text(status),
@@ -188,6 +199,14 @@ def build_run_result(*, status, phase, run_id, outerlist_count=0, api_success_co
         'delta_basis': 'twoYearSales',
         'workbook': text(workbook) or None,
         'errors': [safe_error(value) for value in errors],
+        'data_source': text(data_source),
+        'resume_source_run': text(resume_source_run) or None,
+        'reused_count': text(reused_count),
+        'newly_collected_count': text(newly_collected_count),
+        'recovery_success_count': text(recovery_success_count),
+        'source_observed_at': text(source_observed_at) or 'original interval unknown',
+        'recovery_started_at': text(recovery_started_at) or None,
+        'recovery_completed_at': text(recovery_completed_at) or None,
     }
 
 
@@ -197,6 +216,14 @@ def write_run_result(run, result):
     temporary = run / '.run_result.json.tmp'
     temporary.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
     temporary.replace(target)
+
+
+def read_json_object(path):
+    try:
+        value = json.loads(Path(path).read_text(encoding='utf-8'))
+    except (OSError, ValueError, TypeError):
+        return None
+    return value if isinstance(value, dict) else None
 
 
 def clear_completion_marker(run):
@@ -315,6 +342,8 @@ def products_from_outerlist_book(output):
     for row in ws.iter_rows(min_row=3, values_only=True):
         product_id = text(row[headers['商品ID']] if len(row) > headers['商品ID'] else '').strip()
         if product_id:
+            if not re.fullmatch(r'[1-9]\d*', product_id):
+                raise RuntimeError('Outerlist商品ID必须为正整数')
             products.append({'id': product_id, 'vendor': text(row[headers['厂商']] if len(row) > headers['厂商'] else '') or '未标注'})
     wb.close()
     if not products:
@@ -372,6 +401,22 @@ class ApiRequestPacer:
             self.next_request_at = now + self.interval + random.uniform(0, API_PACING_JITTER_SEC)
 
 
+class DetailRequestPacer:
+    """Keep public detail-page request starts at least two seconds apart."""
+
+    interval = 2.0
+
+    def __init__(self):
+        self.next_request_at = 0.0
+
+    def wait(self):
+        now = time.monotonic()
+        while now < self.next_request_at:
+            time.sleep(self.next_request_at - now)
+            now = time.monotonic()
+        self.next_request_at = now + self.interval
+
+
 def is_risk_block(exc):
     if isinstance(exc, urllib.error.HTTPError) and exc.code == 430:
         return True
@@ -386,6 +431,13 @@ def is_risk_block(exc):
 def note_is_risk_block(note):
     lowered = text(note).lower()
     return any(marker in lowered for marker in RISK_NOTE_MARKERS)
+
+
+def detail_access_blocked(note):
+    """True only for the denial statuses which terminate a detail batch."""
+    return text(note).strip() in {
+        'detail_http_401', 'detail_http_403', 'detail_http_429', 'detail_http_430', 'detail_http_200_challenge',
+    }
 
 
 def failure_row(site, locale, currency, product_id, vendor, note):
@@ -590,6 +642,44 @@ def browser_recovery_replacements(rows, site, locale, currency, workdir, runner=
     return replacements, problem
 
 
+def exact_nonnegative_int(value, field):
+    """Accept only JSON integer values; booleans and numeric strings are not sales."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise RuntimeError(f'invalid {field}')
+    return value
+
+
+def row_from_product(product, product_id, item, site, currency, locale):
+    """Map the identical public product object used by API and detail sources."""
+    if not isinstance(product, dict) or text(product.get('productId')) != product_id:
+        raise RuntimeError('returned product ID mismatch')
+    sales = product.get('salesVolume')
+    comment = product.get('commentInfo')
+    basic = product.get('basicInfo')
+    if not isinstance(sales, dict) or not isinstance(comment, dict) or not isinstance(basic, dict):
+        raise RuntimeError('product payload incomplete')
+    monthly = exact_nonnegative_int(sales.get('monthlySales'), 'monthlySales')
+    yearly = exact_nonnegative_int(sales.get('yearlySales'), 'yearlySales')
+    total = exact_nonnegative_int(sales.get('twoYearSales'), 'twoYearSales')
+    name = text(basic.get('productName')).strip()
+    count = exact_nonnegative_int(comment.get('commentCount'), 'commentCount')
+    score = comment.get('commentScore')
+    decimal_score = None if isinstance(score, bool) else as_decimal(score)
+    if score is not None and (decimal_score is None or not decimal_score.is_finite() or not Decimal('0') <= decimal_score <= Decimal('5')):
+        raise RuntimeError('invalid commentScore')
+    if count != 0 and decimal_score is None:
+        raise RuntimeError('invalid commentScore')
+    if not name:
+        raise RuntimeError('missing productName')
+    return {
+        '厂商': item['vendor'], '商品ID': product_id,
+        'URL': f'https://{site}.trip.com/things-to-do/detail/{product_id}/?curr={currency}&locale={locale}',
+        '商品名称': name, '商品资讯': brief_info(product.get('addInfos')),
+        '月销量': str(monthly), '年销量': str(yearly), '总销量': str(total),
+        '评价数': str(count), '总分': '' if score is None else text(score),
+    }
+
+
 def row_from_api_response(data, product_id, item, site, currency, locale):
     """Map one getProductInfo response body to a workbook row.
 
@@ -599,20 +689,94 @@ def row_from_api_response(data, product_id, item, site, currency, locale):
     if data.get('ResponseStatus', {}).get('Ack') != 'Success':
         errors = data.get('ResponseStatus', {}).get('Errors') or [{}]
         raise RuntimeError(errors[0].get('Message', 'API failed'))
-    product = (data.get('productInfos') or [{}])[0]
-    if text(product.get('productId')) != product_id:
-        raise RuntimeError('returned product ID mismatch')
-    sales = product.get('salesVolume') or {}
-    comment = product.get('commentInfo') or {}
-    basic = product.get('basicInfo') or {}
-    # Total score is sourced from the public response commentInfo.commentScore, never the page DOM.
-    return {
-        '厂商': item['vendor'], '商品ID': product_id,
-        'URL': f'https://{site}.trip.com/things-to-do/detail/{product_id}/?curr={currency}&locale={locale}',
-        '商品名称': text(basic.get('productName')), '商品资讯': brief_info(product.get('addInfos')),
-        '月销量': text(sales.get('monthlySales')), '年销量': text(sales.get('yearlySales')), '总销量': text(sales.get('twoYearSales')),
-        '评价数': text(comment.get('commentCount')), '总分': text(comment.get('commentScore')),
-    }
+    products = data.get('productInfos')
+    if not isinstance(products, list) or len(products) != 1:
+        raise RuntimeError('API product payload invalid')
+    return row_from_product(products[0], product_id, item, site, currency, locale)
+
+
+class NextDataParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.capture = False
+        self.parts = []
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        self.capture = tag == 'script' and attributes.get('id') == '__NEXT_DATA__' and attributes.get('type') == 'application/json'
+    def handle_data(self, data):
+        if self.capture:
+            self.parts.append(data)
+    def handle_endtag(self, tag):
+        if tag == 'script':
+            self.capture = False
+
+
+def detail_product_from_html(html, site, locale, currency):
+    parser = NextDataParser()
+    parser.feed(html)
+    if len(parser.parts) != 1:
+        raise RuntimeError('missing __NEXT_DATA__')
+    try:
+        data = json.loads(parser.parts[0])
+        state = data['props']['pageProps']['initialState']['__STATE_MAP__']
+        products = state['PageModel']['ds']['getProductInfo']
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError('invalid __NEXT_DATA__ product payload') from exc
+    if not isinstance(products, list) or len(products) != 1:
+        raise RuntimeError('invalid __NEXT_DATA__ product list')
+    contexts = []
+    page_header = state.get('PageModel', {}).get('header', {})
+    if isinstance(page_header, dict):
+        contexts.append(page_header.get('clientInfo'))
+    contexts.append(state.get('PageModel', {}).get('commonHeaderData'))
+    seen = False
+    for context in contexts:
+        if not isinstance(context, dict):
+            continue
+        seen = True
+        if context.get('locale') != locale or context.get('currency') != currency:
+            raise RuntimeError('detail page market context mismatch')
+        if context.get('site') is not None and text(context['site']).lower() != site:
+            raise RuntimeError('detail page site context mismatch')
+    if not seen:
+        raise RuntimeError('detail page market context missing')
+    return products[0]
+
+
+def detail_fetch(site, locale, currency, item):
+    """One ordinary public GET; never retries or falls back to browser/API."""
+    product_id = item['id']
+    url = f'https://{site}.trip.com/things-to-do/detail/{product_id}/?locale={locale}&curr={currency}'
+    try:
+        request = urllib.request.Request(url, headers={'Accept': 'text/html', 'User-Agent': FRONTEND_USER_AGENT})
+        with urllib.request.urlopen(request, timeout=35) as response:
+            final = urlparse(response.geturl())
+            expected_host = f'{site}.trip.com'
+            expected_path = f'/things-to-do/detail/{product_id}/'
+            query = parse_qs(final.query)
+            if final.hostname != expected_host or final.path != expected_path:
+                raise RuntimeError('detail redirect or product URL mismatch')
+            if ('locale' in query and query['locale'] != [locale]) or ('curr' in query and query['curr'] != [currency]):
+                raise RuntimeError('detail locale or currency mismatch')
+            html = response.read().decode('utf-8', errors='strict')
+            try:
+                product = detail_product_from_html(html, site, locale, currency)
+            except RuntimeError as exc:
+                # A 200 challenge page is distinct from a malformed product page.
+                # Do not treat every absent/malformed JSON payload as a challenge.
+                lowered = html.lower()
+                if ('__NEXT_DATA__' not in html and any(marker in lowered for marker in
+                        ('captcha', 'verify you are human', 'security check', 'access denied', 'whaleguard challenge'))):
+                    return failure_row(site, locale, currency, product_id, item['vendor'], 'detail_http_200_challenge')
+                raise exc
+            return row_from_product(product,
+                                    product_id, item, site, currency, locale)
+    except urllib.error.HTTPError as exc:
+        code = exc.code if exc.code in {401, 403, 429, 430} else 0
+        note = f'detail_http_{code}' if code else 'detail_http_error'
+        return failure_row(site, locale, currency, product_id, item['vendor'], note)
+    except Exception as exc:
+        return failure_row(site, locale, currency, product_id, item['vendor'], '详情页请求失败：' + type(exc).__name__)
 
 
 def fetch(site, locale, currency, item, api_retries=0, api_retry_interval_sec=0):
@@ -998,8 +1162,97 @@ def failed_rows(by_site):
         site + '/' + text(row.get('商品ID')).strip()
         for site, rows in by_site.items()
         for row in rows
-        if text(row.get('抓取备注')).strip()
+        if text(row.get('抓取备注')).strip() or not valid_sales_row(row)
     ]
+
+
+def valid_sales_row(row):
+    """A persisted row is reusable only when it is a complete successful row."""
+    try:
+        if text(row.get('抓取备注')).strip() or not text(row.get('商品名称')).strip():
+            return False
+        for field in ('月销量', '年销量', '总销量'):
+            value = text(row.get(field)).strip()
+            if not re.fullmatch(r'0|[1-9]\d*', value):
+                return False
+        count = text(row.get('评价数')).strip()
+        if not re.fullmatch(r'0|[1-9]\d*', count):
+            return False
+        score = text(row.get('总分')).strip()
+        if count != '0' and not score:
+            return False
+        if score:
+            parsed = as_decimal(score)
+            if parsed is None or not parsed.is_finite() or not Decimal('0') <= parsed <= Decimal('5'):
+                return False
+        return True
+    except (AttributeError, TypeError):
+        return False
+
+
+def resume_source(config, day, selected):
+    """Validate a same-day failed child run before any request is possible."""
+    source = config.resume_run_dir.resolve()
+    root = config.output_root.resolve()
+    if source.parent != root or not source.is_dir() or run_day(source) != day:
+        raise RuntimeError('resume source must be a direct same-day output child')
+    result = read_json_object(source / 'run_result.json')
+    if not result or result.get('status') != 'failed':
+        raise RuntimeError('resume source is not a failed run')
+    raw = result.get('workbook')
+    if not isinstance(raw, str):
+        raise RuntimeError('resume source workbook missing')
+    workbook = Path(raw).resolve()
+    if workbook.parent != source or not workbook.is_file():
+        raise RuntimeError('resume source workbook escapes source run')
+    products = products_from_outerlist_book(workbook)
+    outer = openpyxl.load_workbook(workbook, read_only=True, data_only=True)
+    try:
+        ws_outer = outer['Outerlist商品清单']
+        if day.strftime('%Y年%m月%d日') not in text(ws_outer.cell(1, 1).value):
+            raise RuntimeError('resume source Outerlist date invalid')
+        allowed_sheets = {'Outerlist商品清单', *(site.upper() for site, _, _ in selected)}
+        if set(outer.sheetnames) != allowed_sheets:
+            raise RuntimeError('resume source selected market contamination')
+    finally:
+        outer.close()
+    expected = [item['id'] for item in products]
+    if len(set(expected)) != len(expected):
+        raise RuntimeError('resume Outerlist IDs duplicate')
+    by_site = {}
+    wb = openpyxl.load_workbook(workbook, read_only=True, data_only=True)
+    try:
+        for site, locale, currency in selected:
+            name = site.upper()
+            if name not in wb.sheetnames:
+                raise RuntimeError('resume source selected site missing')
+            ws = wb[name]
+            headers = {text(cell.value): index for index, cell in enumerate(ws[2])}
+            if not set(HEADERS).difference({'销量增量'}).issubset(headers) or len(headers) != len(ws[2]):
+                raise RuntimeError('resume source sales header invalid')
+            rows, ids = [], []
+            for values in ws.iter_rows(min_row=3, values_only=True):
+                row = {field: text(values[index] if index < len(values) else '') for field, index in headers.items()}
+                ident = row.get('商品ID', '').strip()
+                if ident:
+                    rows.append(row); ids.append(ident)
+            if ids != expected or len(set(ids)) != len(ids):
+                raise RuntimeError('resume source IDs inconsistent')
+            for row, item in zip(rows, products):
+                expected_url = f'https://{site}.trip.com/things-to-do/detail/{item["id"]}/?curr={currency}&locale={locale}'
+                if row.get('厂商', '').strip() != item['vendor'] or (valid_sales_row(row) and row.get('URL', '').strip() != expected_url):
+                    raise RuntimeError('resume source row identity inconsistent')
+            by_site[name] = rows
+    finally:
+        wb.close()
+    actual_failed = {site + '/' + row['商品ID'] for site, rows in by_site.items() for row in rows if not valid_sales_row(row)}
+    declared = result.get('failed_ids')
+    expected_declared = {site.upper() + '/' + item['id'] for site, _, _ in selected for item in products}
+    if (not isinstance(declared, list) or len(declared) != len(set(declared))
+            or any(not isinstance(value, str) or value not in expected_declared for value in declared)
+            or set(declared) != actual_failed):
+        raise RuntimeError('resume source failed IDs inconsistent')
+    return source, workbook, products, by_site
 
 
 def main(argv=None):
@@ -1029,7 +1282,15 @@ def main(argv=None):
             raise SystemExit('指定的基线工作簿未读到商品ID和总销量/总分：' + str(baseline))
     else:
         previous, baseline = previous_metrics(root, day)
-    source_dir, source_items = latest_outerlist()
+    resume = None
+    if config.resume_run_dir:
+        try:
+            resume = resume_source(config, day, selected)
+        except RuntimeError as exc:
+            raise SystemExit(str(exc)) from exc
+        source_dir, source_book, source_products, resume_rows = resume
+    else:
+        source_dir, source_items = latest_outerlist()
     run.mkdir()
 
     output = run / daily_output_filename(started)
@@ -1041,21 +1302,42 @@ def main(argv=None):
     mode2_recovered_count = 0
     mode2_attempted = False
     result_errors = []
+    reused_count = 0
+    recovery_started_at = None
     try:
         # Stage 1: persist the raw, de-duplicated Outerlist table.
-        persisted_outerlist = outerlist_rows(source_items)
-        create_outerlist_book(output, day, source_dir, persisted_outerlist)
+        if resume:
+            # Copy, never mutate, the failed artifact; first-sheet formatting/order survive.
+            shutil.copy2(source_book, output)
+            persisted_outerlist = [{'id': item['id']} for item in source_products]
+            items = source_products
+            by_site = resume_rows
+        else:
+            persisted_outerlist = outerlist_rows(source_items)
+            create_outerlist_book(output, day, source_dir, persisted_outerlist)
         # Stage 2: read the persisted table as the authoritative API input.
         phase = 'api_collection'
-        items = products_from_outerlist_book(output)
-        by_site = {site.upper(): [] for site, _, _ in selected}
-        tasks = [(site, locale, currency, item) for site, locale, currency in selected for item in items]
+        if not resume:
+            items = products_from_outerlist_book(output)
+            by_site = {site.upper(): [] for site, _, _ in selected}
+        tasks = [(site, locale, currency, item) for site, locale, currency in selected for item in items
+                 if not resume or not valid_sales_row(next(row for row in by_site[site.upper()] if row['商品ID'] == item['id']))]
+        reused_count = len(items) * len(selected) - len(tasks)
+        if resume:
+            recovery_started_at = datetime.now().isoformat()
 
         breaker = RiskCircuitBreaker()
         pacer = ApiRequestPacer(config.workers)
 
         def run_task(task, active_pacer=pacer, active_breaker=breaker):
             site, locale, currency, item = task
+            if config.data_source == 'detail':
+                if active_breaker.opened:
+                    return site.upper(), failure_row(site, locale, currency, item['id'], item['vendor'], 'detail_http_risk_430')
+                active_pacer.wait()
+                row = detail_fetch(site, locale, currency, item)
+                active_breaker.record(text(row.get('抓取备注')).startswith('detail_http_risk_'))
+                return site.upper(), row
             if active_breaker.opened:
                 # Systemic rejection: skip the request instead of replaying it.
                 return site.upper(), failure_row(
@@ -1074,21 +1356,50 @@ def main(argv=None):
         def run_tasks(tasks_to_run, active_pacer, active_breaker):
             if not tasks_to_run:
                 return []
+            if config.data_source == 'detail':
+                # Detail mode is intentionally single-file and deliberately slow:
+                # never queue work that could outlive the first access denial.
+                detail_pacer = DetailRequestPacer()
+                rows = []
+                for index, task in enumerate(tasks_to_run):
+                    site, locale, currency, item = task
+                    detail_pacer.wait()
+                    row = detail_fetch(site, locale, currency, item)
+                    rows.append((site.upper(), row))
+                    if detail_access_blocked(row.get('抓取备注')):
+                        for pending_site, pending_locale, pending_currency, pending_item in tasks_to_run[index + 1:]:
+                            rows.append((pending_site.upper(), failure_row(
+                                pending_site, pending_locale, pending_currency,
+                                pending_item['id'], pending_item['vendor'],
+                                'detail_skipped_after_block',
+                            )))
+                        break
+                return rows
             with futures.ThreadPoolExecutor(max_workers=config.workers) as pool:
                 return list(pool.map(
                     lambda target: run_task(target, active_pacer, active_breaker), tasks_to_run,
                 ))
 
         for site, row in run_tasks(tasks, pacer, breaker):
-            by_site[site].append(row)
-            if not text(row.get('抓取备注')).strip():
+            if resume:
+                rows = by_site[site]
+                rows[next(index for index, old in enumerate(rows) if old['商品ID'] == row['商品ID'])] = row
+            else:
+                by_site[site].append(row)
+            if not text(row.get('抓取备注')).strip() and valid_sales_row(row):
                 api_success_count += 1
 
-        if breaker.opened:
+        if config.data_source == 'detail' and any(
+            detail_access_blocked(row.get('抓取备注'))
+            for rows in by_site.values() for row in rows
+        ):
+            result_errors.append('detail_access_blocked')
+
+        if config.data_source == 'api' and breaker.opened:
             result_errors.append('risk_circuit_opened')
 
         failures = failed_rows(by_site)
-        if failures and breaker.opened:
+        if config.data_source == 'api' and failures and breaker.opened:
             # One bounded re-probe: these blocks are usually short-lived, so a
             # single slower round after a cool-down is worth it, but the run must
             # never spend its whole budget replaying one rejection.
@@ -1099,7 +1410,7 @@ def main(argv=None):
             failed_keys = {
                 (site, text(row.get('商品ID')).strip())
                 for site, rows in by_site.items()
-                for row in rows if text(row.get('抓取备注')).strip()
+                for row in rows if not valid_sales_row(row)
             }
             retry_tasks = [task for task in tasks if (task[0].upper(), task[3]['id']) in failed_keys]
             replacements = {
@@ -1123,7 +1434,7 @@ def main(argv=None):
             row for rows in by_site.values() for row in rows
             if note_is_risk_block(row.get('抓取备注'))
         ]
-        if risk_failed_rows:
+        if config.data_source == 'api' and risk_failed_rows:
             # The HTTP client is shield-blocked while an in-page same-origin
             # fetch from the logged-in browser session answers HTTP 200.
             recovered_browser = 0
@@ -1152,12 +1463,12 @@ def main(argv=None):
                 result_errors.append('browser_recovery_failed')
             failures = failed_rows(by_site)
 
-        if failures and config.mode2_fallback != 'off':
+        if config.data_source == 'api' and failures and config.mode2_fallback != 'off':
             hk_rows = by_site.get('HK', [])
             failed_hk_ids = [
                 text(row.get('商品ID')).strip()
                 for row in hk_rows
-                if text(row.get('抓取备注')).strip()
+                if not valid_sales_row(row)
             ]
             risk_blocked_hk = [
                 row for row in hk_rows
@@ -1192,13 +1503,21 @@ def main(argv=None):
             status='failed' if failures else 'success',
             phase=result_phase,
             run_id=run.name,
-            outerlist_count=len(persisted_outerlist),
+            outerlist_count=len(items),
             api_success_count=api_success_count,
             mode2_recovered_count=mode2_recovered_count,
             failed_ids=failures,
             baseline_path=baseline,
             workbook=output,
             errors=result_errors,
+            data_source=config.data_source,
+            resume_source_run=source_dir.name if resume else None,
+            reused_count=reused_count,
+            newly_collected_count=len(tasks),
+            recovery_success_count=sum(1 for site, rows in by_site.items() for row in rows if resume and valid_sales_row(row)) - reused_count if resume else 0,
+            source_observed_at=datetime.fromtimestamp(source_book.stat().st_mtime).isoformat() if resume else started.isoformat(),
+            recovery_started_at=recovery_started_at,
+            recovery_completed_at=datetime.now().isoformat() if resume else None,
         )
         write_run_result(run, run_result)
 
@@ -1208,20 +1527,29 @@ def main(argv=None):
             'sites': ','.join(site for site, _, _ in selected), 'processed_count': len(items) * len(selected),
             'failed_count': len(failures), 'failed_samples': failures[:20], 'baseline_run': str(baseline) if baseline else None,
             'sales_delta_definition': '当次总销量-前一天总销量',
-            'method': ('public_product_info_api_with_headed_mode2_recovery' if mode2_attempted
-                       else 'public_product_info_api_no_browser'),
-            'rating_source': 'productInfos[0].commentInfo.commentScore',
+            'method': ('public_detail_next_data' if config.data_source == 'detail' else
+                       ('public_product_info_api_with_headed_mode2_recovery' if mode2_attempted else 'public_product_info_api_no_browser')),
+            'rating_source': 'PageModel.ds.getProductInfo[0].commentInfo.commentScore' if config.data_source == 'detail' else 'productInfos[0].commentInfo.commentScore',
             'mode2_recovered_count': mode2_recovered_count,
+            'data_source': config.data_source,
+            'resume_source_run': source_dir.name if resume else None,
+            'reused_count': reused_count,
+            'newly_collected_count': len(tasks),
+            'recovery_success_count': sum(1 for rows in by_site.values() for row in rows if resume and valid_sales_row(row)) - reused_count if resume else 0,
+            'source_observed_at': datetime.fromtimestamp(source_book.stat().st_mtime).isoformat() if resume else started.isoformat(),
             'started_at': started.isoformat(), 'completed_at': datetime.now().isoformat(),
         }
         (run / '任务说明.md').write_text(
             f'# 每日 Trip HK Outerlist 商品销量接口抓取\n\n'
             f'- 抓取日期：{day.isoformat()}\n- Outerlist表来源：{source_dir}\n'
+            + (f'- 恢复来源：{source_dir.name}；复用有效行：{reused_count}；重新采集：{len(tasks)}；原始采集区间：unknown（保留行未宣称为本次采集）。\n' if resume else '') +
             f'- 数据流：先输出 `Outerlist商品清单`，再从该表读取商品ID抓取 HK 销量和总分。\n'
             f'- 对比基准：{baseline or "无（销量及评分变化留空）"}\n'
             f'- 销量增量定义：当次`总销量`减前一天`总销量`。\n'
-            f'- 销量、评价和总分接口：POST /restapi/soa2/21052/getProductInfo\n'
-            f'- 总分路径：`productInfos[0].commentInfo.commentScore`。API-only 全部成功时不启动浏览器；API 失败且尝试恢复时，可能启动 headed Go Mode2。\n', encoding='utf-8')
+            f'- 数据来源：{"公开详情页 __NEXT_DATA__" if config.data_source == "detail" else "POST /restapi/soa2/21052/getProductInfo"}。\n'
+            f'- 总分路径：`commentInfo.commentScore`；详情页模式不启动浏览器且不回退 API。'
+            + ('API-only 全部成功时不启动浏览器；API 失败且尝试恢复时，可能启动 headed Go Mode2。\n'
+               if config.data_source == 'api' else '\n'), encoding='utf-8')
         if not failures:
             (run / '.collection_done').write_text(json.dumps(done, ensure_ascii=False, indent=2), encoding='utf-8')
     except BaseException as exc:
@@ -1230,13 +1558,20 @@ def main(argv=None):
             status='failed',
             phase=phase,
             run_id=run.name,
-            outerlist_count=len(persisted_outerlist),
+            outerlist_count=len(items),
             api_success_count=api_success_count,
             mode2_recovered_count=mode2_recovered_count,
             failed_ids=failures,
             baseline_path=baseline,
             workbook=output if output.exists() else None,
             errors=[*result_errors, f'exception_type={type(exc).__name__}'],
+            data_source=config.data_source,
+            resume_source_run=source_dir.name if resume else None,
+            reused_count=reused_count,
+            newly_collected_count=len(tasks) if 'tasks' in locals() else 0,
+            source_observed_at=(datetime.fromtimestamp(source_book.stat().st_mtime).isoformat() if resume else started.isoformat()),
+            recovery_started_at=recovery_started_at,
+            recovery_completed_at=datetime.now().isoformat() if resume else None,
         )
         try:
             write_run_result(run, failed_result)
