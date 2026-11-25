@@ -8,9 +8,9 @@ trip_deliver.py — 携程 SKU/商品信息抓取「结果一定不漏发」投�
 保证机制：
 1. 从 CLI 的 run_done JSONL 事件（或直接给 output_path）解析最终输出文件。
 2. 校验输出文件存在且非空。
-3. 用 `hermes send --to <target> "MEDIA:<path>"` 把原生 XLSX 发送到发起聊天。
-4. **仅当 hermes send 返回 exit 0 才写入 .delivered 成功回执并 exit 0。**
-5. 任何失败（缺文件/空文件/hermes send 非 0）→ 写 .pending_delivery 标记、返回非零，
+3. 用 `hermes send --json --to <target> "MEDIA:<path>"` 把原生 XLSX 发送到发起聊天。
+4. Telegram 仅在 exit 0 且 JSON 服务回执确认实际送达时写入 .delivered 成功回执并 exit 0。
+5. 任何失败（缺文件/空文件/hermes send 非 0/未验证回执）→ 写 .pending_delivery 标记、返回非零，
    让调用方/上层把该任务标记为「失败待补发」，绝不静默当作成功。
 
 6. `--force` 显式覆盖重复投递保护（仅用于操作者确认的「修正后重发同一 run」）。
@@ -23,6 +23,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 STABILIZER = Path(__file__).resolve().parent / "scripts" / "stabilize_vendor_attribution.py"
@@ -92,17 +93,103 @@ def _already_delivered(run_dir: Path, output_path: Path, target: str) -> bool:
     )
 
 
+def _target_parts(target: str) -> tuple[str, str, str | None]:
+    platform, separator, remainder = target.partition(":")
+    if not separator:
+        return platform, "", None
+    chat_id, separator, thread_id = remainder.partition(":")
+    return platform, chat_id, thread_id if separator else None
+
+
+def _receipt_field(value: object, name: str) -> object | None:
+    """Find a Hermes JSON response field, including its result/target wrappers."""
+    if isinstance(value, dict):
+        if name in value:
+            return value[name]
+        for child in value.values():
+            found = _receipt_field(child, name)
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = _receipt_field(child, name)
+            if found is not None:
+                return found
+    return None
+
+
+def _receipt_has_problem(value: object) -> bool:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key in {"error", "errors", "warning", "warnings"} and child:
+                return True
+            if key == "skipped" and child is True:
+                return True
+            if _receipt_has_problem(child):
+                return True
+    elif isinstance(value, list):
+        return any(_receipt_has_problem(child) for child in value)
+    return False
+
+
+def _write_transport_receipt(output_path: Path, raw_receipt: str) -> None:
+    receipt_path = output_path.parent / "delivery_transport_receipt.json"
+    fd, temporary_path = tempfile.mkstemp(
+        prefix=f".{receipt_path.name}.", dir=receipt_path.parent, text=True
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(raw_receipt)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, receipt_path)
+    except BaseException:
+        Path(temporary_path).unlink(missing_ok=True)
+        raise
+
+
+def _verify_telegram_receipt(target: str, raw_receipt: str) -> bool:
+    try:
+        receipt = json.loads(raw_receipt)
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(receipt, dict) or receipt.get("success") is not True:
+        return False
+    if _receipt_has_problem(receipt):
+        return False
+    platform, chat_id, requested_thread_id = _target_parts(target)
+    if str(_receipt_field(receipt, "platform") or "") != platform:
+        return False
+    if str(_receipt_field(receipt, "chat_id") or "") != chat_id:
+        return False
+    response_thread_id = _receipt_field(receipt, "thread_id")
+    if requested_thread_id is not None and str(response_thread_id or "") != requested_thread_id:
+        return False
+    message_id = _receipt_field(receipt, "message_id")
+    return message_id is not None and str(message_id).strip() != ""
+
+
 def _deliver(target: str, output_path: Path, subject: str | None) -> int:
     body = f"MEDIA:{output_path}"
-    cmd = ["hermes", "send", "--to", target]
+    cmd = ["hermes", "send", "--json", "--to", target]
     if subject:
         cmd += ["--subject", subject]
     cmd.append(body)
     result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode == 0:
+    if result.returncode != 0:
+        sys.stderr.write(f"hermes send failed rc={result.returncode}: {result.stderr}\n")
+        return 1
+    if not target.startswith("telegram:"):
         return 0
-    sys.stderr.write(f"hermes send failed rc={result.returncode}: {result.stderr}\n")
-    return 1
+    if not _verify_telegram_receipt(target, result.stdout):
+        sys.stderr.write("hermes send returned an unverified Telegram delivery receipt\n")
+        return 1
+    try:
+        _write_transport_receipt(output_path, result.stdout)
+    except OSError as exc:
+        sys.stderr.write(f"could not save verified Telegram delivery receipt: {exc}\n")
+        return 1
+    return 0
 
 
 def main(argv: list[str]) -> int:
