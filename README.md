@@ -10,6 +10,16 @@ The HK wrapper uses `detail`: one public detail-page GET per product, parsing on
 It fails closed on redirects, challenges, identity mismatch, or incomplete sales; it does
 not use a browser or fall back to the shielded POST API.
 
+Detail-mode redirect contract: the only eligible correction is one paced HK GET after an
+observed HTTPS `hk.trip.com/things-to-do/experiences/<category>/` redirect (a single
+nonempty category segment). All other `/things-to-do/*` routes are terminal. Returned
+`locale` and `curr`, when present, must each occur exactly once and match the requested
+market; blank, duplicate, or conflicting values are terminal even on the category route.
+An explicit HTTP-200 human-verification page takes precedence over correction and stops
+the remaining detail batch. Responses are bounded to 12 MiB, generic schema failures are
+fixed diagnostics that do not open that access-denial circuit, and the collector never
+uses exception text as a diagnostic.
+
 Recover a same-day failed run into a new artifact only:
 
 ```sh

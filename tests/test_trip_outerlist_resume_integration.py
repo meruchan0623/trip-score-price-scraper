@@ -54,7 +54,7 @@ def test_resume_only_refetches_incomplete_or_noted_rows_and_preserves_source(tmp
     calls = []
     monkeypatch.setattr(collector, 'previous_metrics', lambda *_: ({}, None))
     monkeypatch.setattr(collector, 'browser_recovery_replacements', lambda *_: (_ for _ in ()).throw(AssertionError('no browser')))
-    def detail(site, locale, currency, item):
+    def detail(site, locale, currency, item, **_kwargs):
         calls.append(item['id'])
         return {'厂商': item['vendor'], '商品ID': item['id'], 'URL': f'https://{site}.trip.com/things-to-do/detail/{item["id"]}/?curr={currency}&locale={locale}',
                 '商品名称': 'recovered ' + item['id'], '月销量': '7', '年销量': '8', '总销量': '9', '评价数': '0', '总分': ''}

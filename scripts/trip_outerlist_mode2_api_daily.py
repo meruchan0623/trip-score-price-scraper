@@ -381,6 +381,7 @@ RISK_NOTE_MARKERS = ('430', 'whaleguard', 'risk challenge')
 FRONTEND_USER_AGENT = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
                        'AppleWebKit/537.36 (KHTML, like Gecko) '
                        'Chrome/140.0.0.0 Safari/537.36')
+DETAIL_MAX_RESPONSE_BYTES = 12 * 1024 * 1024
 
 
 class ApiRequestPacer:
@@ -743,40 +744,101 @@ def detail_product_from_html(html, site, locale, currency):
     return products[0]
 
 
-def detail_fetch(site, locale, currency, item):
-    """One ordinary public GET; never retries or falls back to browser/API."""
-    product_id = item['id']
-    url = f'https://{site}.trip.com/things-to-do/detail/{product_id}/?locale={locale}&curr={currency}'
+def detail_redirect_diagnostic(final_url, site, product_id):
+    """Return a fixed reason unless a final URL remains the requested detail page."""
+    expected_id = text(product_id)
     try:
-        request = urllib.request.Request(url, headers={'Accept': 'text/html', 'User-Agent': FRONTEND_USER_AGENT})
-        with urllib.request.urlopen(request, timeout=35) as response:
-            final = urlparse(response.geturl())
-            expected_host = f'{site}.trip.com'
-            expected_path = f'/things-to-do/detail/{product_id}/'
-            query = parse_qs(final.query)
-            if final.hostname != expected_host or final.path != expected_path:
-                raise RuntimeError('detail redirect or product URL mismatch')
-            if ('locale' in query and query['locale'] != [locale]) or ('curr' in query and query['curr'] != [currency]):
-                raise RuntimeError('detail locale or currency mismatch')
-            html = response.read().decode('utf-8', errors='strict')
-            try:
-                product = detail_product_from_html(html, site, locale, currency)
-            except RuntimeError as exc:
-                # A 200 challenge page is distinct from a malformed product page.
-                # Do not treat every absent/malformed JSON payload as a challenge.
+        final = urlparse(final_url)
+        port = final.port
+    except (TypeError, ValueError):
+        return 'detail_redirect_invalid_url'
+
+    expected_host = f'{site}.trip.com'
+    if (final.scheme != 'https' or final.hostname != expected_host or
+            final.username is not None or final.password is not None or
+            port not in (None, 443)):
+        return 'detail_redirect_invalid_url'
+
+    # This is the sole observed correction route. Do not broaden it to other
+    # Things-to-Do pages: those pages are not evidence for this product.
+    if re.fullmatch(r'/things-to-do/experiences/[A-Za-z0-9][A-Za-z0-9-]*/', final.path):
+        return 'detail_redirect_category'
+
+    # Trip canonicalizes some valid detail URLs to an ID-plus-slug path.  Keep
+    # the ID boundary strict so a prefix (for example 742962260) cannot pass.
+    match = re.fullmatch(r'/things-to-do/detail/([0-9]+)(?:-[A-Za-z0-9][A-Za-z0-9-]*)?/?', final.path)
+    if match is None:
+        return 'detail_redirect_invalid_url'
+    if match.group(1) != expected_id:
+        return 'detail_redirect_wrong_id'
+    return None
+
+
+def detail_market_diagnostic(query, locale, currency):
+    """Require any returned market key to occur exactly once with its expected value."""
+    for key, expected in (('locale', locale), ('curr', currency)):
+        if key in query and query[key] != [expected]:
+            return 'detail_redirect_market_mismatch'
+    return None
+
+
+def detail_fetch(site, locale, currency, item, request_pacer=None):
+    """Fetch a public detail page, with one HK-only category-route correction."""
+    product_id = item['id']
+    primary_url = f'https://{site}.trip.com/things-to-do/detail/{product_id}/?locale={locale}&curr={currency}'
+
+    def fetch_once(url):
+        """A single default-urllib public GET; every failure is terminal."""
+        try:
+            # Deliberately omit browser-shaped headers. urllib supplies its
+            # normal default user agent for both the primary and correction GET.
+            request = urllib.request.Request(url)
+            with urllib.request.urlopen(request, timeout=35) as response:
+                final = urlparse(response.geturl())
+                query = parse_qs(final.query, keep_blank_values=True)
+                market_note = detail_market_diagnostic(query, locale, currency)
+                if market_note:
+                    return failure_row(site, locale, currency, product_id, item['vendor'], market_note)
+                payload = response.read(DETAIL_MAX_RESPONSE_BYTES + 1)
+                if len(payload) > DETAIL_MAX_RESPONSE_BYTES:
+                    return failure_row(site, locale, currency, product_id, item['vendor'], 'detail_response_too_large')
+                html = payload.decode('utf-8', errors='strict')
+                # A human-verification response is a stronger access signal
+                # than a category redirect, so never spend the correction GET.
                 lowered = html.lower()
                 if ('__NEXT_DATA__' not in html and any(marker in lowered for marker in
                         ('captcha', 'verify you are human', 'security check', 'access denied', 'whaleguard challenge'))):
                     return failure_row(site, locale, currency, product_id, item['vendor'], 'detail_http_200_challenge')
-                raise exc
-            return row_from_product(product,
-                                    product_id, item, site, currency, locale)
-    except urllib.error.HTTPError as exc:
-        code = exc.code if exc.code in {401, 403, 429, 430} else 0
-        note = f'detail_http_{code}' if code else 'detail_http_error'
-        return failure_row(site, locale, currency, product_id, item['vendor'], note)
-    except Exception as exc:
-        return failure_row(site, locale, currency, product_id, item['vendor'], '详情页请求失败：' + type(exc).__name__)
+                redirect_note = detail_redirect_diagnostic(response.geturl(), site, product_id)
+                if redirect_note:
+                    return failure_row(site, locale, currency, product_id, item['vendor'], redirect_note)
+                try:
+                    product = detail_product_from_html(html, site, locale, currency)
+                except RuntimeError:
+                    return failure_row(site, locale, currency, product_id, item['vendor'], 'detail_schema_invalid')
+                try:
+                    return row_from_product(product,
+                                            product_id, item, site, currency, locale)
+                except RuntimeError:
+                    return failure_row(site, locale, currency, product_id, item['vendor'], 'detail_schema_invalid')
+        except urllib.error.HTTPError as exc:
+            code = exc.code if exc.code in {401, 403, 429, 430} else 0
+            note = f'detail_http_{code}' if code else 'detail_http_error'
+            return failure_row(site, locale, currency, product_id, item['vendor'], note)
+        except Exception:
+            return failure_row(site, locale, currency, product_id, item['vendor'], 'detail_request_failed')
+
+    row = fetch_once(primary_url)
+    # Production's slash/query route is the normal route. A category redirect
+    # is the sole case in which HK gets one correction GET, and it is paced just
+    # like the next outer request. Challenges, denials, mismatches, and every
+    # other error remain terminal.
+    if site == 'hk' and row.get('抓取备注') == 'detail_redirect_category':
+        if request_pacer is not None:
+            request_pacer.wait()
+        bare_url = f'https://hk.trip.com/things-to-do/detail/{product_id}'
+        return fetch_once(bare_url)
+    return row
 
 
 def fetch(site, locale, currency, item, api_retries=0, api_retry_interval_sec=0):
@@ -1364,7 +1426,7 @@ def main(argv=None):
                 for index, task in enumerate(tasks_to_run):
                     site, locale, currency, item = task
                     detail_pacer.wait()
-                    row = detail_fetch(site, locale, currency, item)
+                    row = detail_fetch(site, locale, currency, item, request_pacer=detail_pacer)
                     rows.append((site.upper(), row))
                     if detail_access_blocked(row.get('抓取备注')):
                         for pending_site, pending_locale, pending_currency, pending_item in tasks_to_run[index + 1:]:

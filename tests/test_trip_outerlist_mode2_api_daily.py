@@ -37,7 +37,7 @@ def test_detail_fetch_parses_only_next_data_and_rejects_identity_or_challenge(mo
     class Response:
         def __init__(self, page, final='https://hk.trip.com/things-to-do/detail/57042119/?locale=zh-HK&curr=HKD'):
             self.page, self.final = page, final
-        def read(self): return self.page.encode()
+        def read(self, _limit=-1): return self.page.encode()
         def geturl(self): return self.final
         def __enter__(self): return self
         def __exit__(self, *_): return None
@@ -49,6 +49,224 @@ def test_detail_fetch_parses_only_next_data_and_rejects_identity_or_challenge(mo
     assert collector.detail_fetch('hk', 'zh-HK', 'HKD', {'id': '57042119', 'vendor': 'V'})['抓取备注'] != 'detail_http_200_challenge'
     monkeypatch.setattr(collector.urllib.request, 'urlopen', lambda request, timeout: Response(body, 'https://hk.trip.com/things-to-do/detail/9/'))
     assert collector.detail_fetch('hk', 'zh-HK', 'HKD', {'id': '57042119', 'vendor': 'V'})['抓取备注']
+
+
+def test_detail_fetch_keeps_slash_query_primary_route_and_default_urllib_ua(monkeypatch):
+    requested = []
+
+    class Response:
+        def read(self, _limit=-1): return b'<html>ordinary broken page</html>'
+        def geturl(self): return 'https://hk.trip.com/things-to-do/detail/74296226/?locale=zh-HK&curr=HKD'
+        def __enter__(self): return self
+        def __exit__(self, *_): return None
+
+    def fake_urlopen(request, timeout):
+        requested.append((request.full_url, {name.lower(): value for name, value in request.header_items()}))
+        return Response()
+
+    monkeypatch.setattr(collector.urllib.request, 'urlopen', fake_urlopen)
+    collector.detail_fetch('hk', 'zh-HK', 'HKD', {'id': '74296226', 'vendor': 'V'})
+
+    assert requested == [('https://hk.trip.com/things-to-do/detail/74296226/?locale=zh-HK&curr=HKD', {})]
+
+
+@pytest.mark.parametrize(
+    ('final_url', 'expected_note'),
+    [
+        ('https://hk.trip.com/things-to-do/detail/74296226-vietnam-mobifone-vnsky-local-4g-5g-esim-daily-10gb-activation/', None),
+        ('https://hk.trip.com/things-to-do/detail/74296226-vietnam-mobifone/', None),
+        ('https://hk.trip.com/things-to-do/detail/74296226', None),
+        ('https://hk.trip.com:443/things-to-do/detail/74296226-vietnam-mobifone/', None),
+        ('https://hk.trip.com/things-to-do/detail/742962260-valid-looking-slug/', 'detail_redirect_wrong_id'),
+        ('https://hk.trip.com/things-to-do/detail/7429622-vietnam-mobifone/', 'detail_redirect_wrong_id'),
+        ('http://hk.trip.com/things-to-do/detail/74296226-vietnam-mobifone/', 'detail_redirect_invalid_url'),
+        ('https://other.trip.com/things-to-do/detail/74296226-vietnam-mobifone/', 'detail_redirect_invalid_url'),
+        ('https://user@hk.trip.com/things-to-do/detail/74296226-vietnam-mobifone/', 'detail_redirect_invalid_url'),
+        ('https://hk.trip.com:444/things-to-do/detail/74296226-vietnam-mobifone/', 'detail_redirect_invalid_url'),
+    ],
+)
+def test_detail_fetch_accepts_only_compatible_canonical_detail_urls(monkeypatch, final_url, expected_note):
+    product = {'productId': '74296226', 'basicInfo': {'productName': 'Name'},
+               'commentInfo': {'commentCount': 1, 'commentScore': 4.6},
+               'salesVolume': {'monthlySales': 1, 'yearlySales': 2, 'twoYearSales': 3}}
+    data = {'props': {'pageProps': {'initialState': {'__STATE_MAP__': {
+        'PageModel': {'ds': {'getProductInfo': [product]},
+                      'header': {'clientInfo': {'site': 'HK', 'locale': 'zh-HK', 'currency': 'HKD'}}}
+    }}}}}
+    body = '<script id="__NEXT_DATA__" type="application/json">' + json.dumps(data) + '</script>'
+
+    class Response:
+        def read(self, _limit=-1): return body.encode()
+        def geturl(self): return final_url
+        def __enter__(self): return self
+        def __exit__(self, *_): return None
+
+    monkeypatch.setattr(collector.urllib.request, 'urlopen', lambda request, timeout: Response())
+    row = collector.detail_fetch('hk', 'zh-HK', 'HKD', {'id': '74296226', 'vendor': 'V'})
+
+    if expected_note is None:
+        assert row['总销量'] == '3'
+        assert '抓取备注' not in row
+    else:
+        assert row['抓取备注'] == expected_note
+
+
+def test_detail_fetch_category_uses_one_paced_bare_hk_correction_and_accepts_valid_data(monkeypatch):
+    requested, clock = [], {'value': 5.0}
+    product = {'productId': '117072053', 'basicInfo': {'productName': 'Name'},
+               'commentInfo': {'commentCount': 0},
+               'salesVolume': {'monthlySales': 1, 'yearlySales': 2, 'twoYearSales': 3}}
+    data = {'props': {'pageProps': {'initialState': {'__STATE_MAP__': {
+        'PageModel': {'ds': {'getProductInfo': [product]},
+                      'header': {'clientInfo': {'site': 'HK', 'locale': 'zh-HK', 'currency': 'HKD'}}}
+    }}}}}
+    body = '<script id="__NEXT_DATA__" type="application/json">' + json.dumps(data) + '</script>'
+
+    class Response:
+        def __init__(self, url, page): self.url, self.page = url, page
+        def read(self, _limit=-1): return self.page.encode()
+        def geturl(self): return self.url
+        def __enter__(self): return self
+        def __exit__(self, *_): return None
+
+    def fake_urlopen(request, timeout):
+        requested.append((request.full_url, clock['value'], {name.lower(): value for name, value in request.header_items()}))
+        if len(requested) == 1:
+            return Response('https://hk.trip.com/things-to-do/experiences/beijing-travel-services/', '')
+        return Response('https://hk.trip.com/things-to-do/detail/117072053', body)
+
+    monkeypatch.setattr(collector.time, 'monotonic', lambda: clock['value'])
+    monkeypatch.setattr(collector.time, 'sleep', lambda delay: clock.__setitem__('value', clock['value'] + delay))
+    monkeypatch.setattr(collector.urllib.request, 'urlopen', fake_urlopen)
+    pacer = collector.DetailRequestPacer()
+    pacer.wait()
+    row = collector.detail_fetch('hk', 'zh-HK', 'HKD', {'id': '117072053', 'vendor': 'V'}, request_pacer=pacer)
+
+    assert row['总销量'] == '3'
+    assert requested == [
+        ('https://hk.trip.com/things-to-do/detail/117072053/?locale=zh-HK&curr=HKD', 5.0, {}),
+        ('https://hk.trip.com/things-to-do/detail/117072053', 7.0, {}),
+    ]
+
+
+def test_detail_fetch_category_correction_denial_is_terminal(monkeypatch):
+    requested = []
+
+    class Response:
+        def read(self, _limit=-1): return b''
+        def geturl(self): return 'https://hk.trip.com/things-to-do/experiences/beijing-travel-services/'
+        def __enter__(self): return self
+        def __exit__(self, *_): return None
+
+    def fake_urlopen(request, timeout):
+        requested.append(request.full_url)
+        if len(requested) == 1:
+            return Response()
+        raise HTTPError(request.full_url, 403, 'blocked', None, None)
+
+    monkeypatch.setattr(collector.urllib.request, 'urlopen', fake_urlopen)
+    row = collector.detail_fetch('hk', 'zh-HK', 'HKD', {'id': '117072053', 'vendor': 'V'})
+
+    assert row['抓取备注'] == 'detail_http_403'
+    assert requested == [
+        'https://hk.trip.com/things-to-do/detail/117072053/?locale=zh-HK&curr=HKD',
+        'https://hk.trip.com/things-to-do/detail/117072053',
+    ]
+
+
+@pytest.mark.parametrize('final_url', [
+    'https://hk.trip.com/things-to-do/experiences/',
+    'https://hk.trip.com/things-to-do/experiences/airport-transfer/extra/',
+    'https://hk.trip.com/things-to-do/tickets/airport-transfer/',
+    'https://hk.trip.com/things-to-do/experiences/airport-transfer?locale=zh-HK&curr=HKD',
+    'https://www.trip.com/things-to-do/experiences/airport-transfer/',
+])
+def test_detail_fetch_corrects_only_exact_same_host_experiences_category(monkeypatch, final_url):
+    requested = []
+
+    class Response:
+        def read(self, _limit=-1): return b''
+        def geturl(self): return final_url
+        def __enter__(self): return self
+        def __exit__(self, *_): return None
+
+    monkeypatch.setattr(collector.urllib.request, 'urlopen', lambda request, timeout: requested.append(request.full_url) or Response())
+    row = collector.detail_fetch('hk', 'zh-HK', 'HKD', {'id': '117072053', 'vendor': 'V'})
+
+    assert row['抓取备注'] == 'detail_redirect_invalid_url'
+    assert len(requested) == 1
+
+
+@pytest.mark.parametrize('query', [
+    'locale=&curr=HKD',
+    'locale=zh-HK&locale=zh-HK&curr=HKD',
+    'locale=zh-HK&curr=HKD&curr=USD',
+])
+def test_detail_fetch_rejects_ambiguous_market_on_category_before_correction(monkeypatch, query):
+    requested = []
+
+    class Response:
+        def read(self, _limit=-1): return b''
+        def geturl(self): return 'https://hk.trip.com/things-to-do/experiences/airport-transfer/?' + query
+        def __enter__(self): return self
+        def __exit__(self, *_): return None
+
+    monkeypatch.setattr(collector.urllib.request, 'urlopen', lambda request, timeout: requested.append(request.full_url) or Response())
+    row = collector.detail_fetch('hk', 'zh-HK', 'HKD', {'id': '117072053', 'vendor': 'V'})
+
+    assert row['抓取备注'] == 'detail_redirect_market_mismatch'
+    assert len(requested) == 1
+
+
+def test_detail_fetch_prefers_200_human_verification_over_category_correction(monkeypatch):
+    requested = []
+
+    class Response:
+        def read(self, _limit=-1): return b'<html>verify you are human</html>'
+        def geturl(self): return 'https://hk.trip.com/things-to-do/experiences/airport-transfer/'
+        def __enter__(self): return self
+        def __exit__(self, *_): return None
+
+    monkeypatch.setattr(collector.urllib.request, 'urlopen', lambda request, timeout: requested.append(request.full_url) or Response())
+    row = collector.detail_fetch('hk', 'zh-HK', 'HKD', {'id': '117072053', 'vendor': 'V'})
+
+    assert row['抓取备注'] == 'detail_http_200_challenge'
+    assert len(requested) == 1
+
+
+def test_detail_fetch_bounds_response_and_uses_fixed_diagnostics(monkeypatch):
+    class Response:
+        def __init__(self): self.read_limit = None
+        def read(self, limit=-1):
+            self.read_limit = limit
+            return b'x' * limit
+        def geturl(self): return 'https://hk.trip.com/things-to-do/detail/117072053/?locale=zh-HK&curr=HKD'
+        def __enter__(self): return self
+        def __exit__(self, *_): return None
+
+    response = Response()
+    monkeypatch.setattr(collector.urllib.request, 'urlopen', lambda *_args, **_kwargs: response)
+    row = collector.detail_fetch('hk', 'zh-HK', 'HKD', {'id': '117072053', 'vendor': 'V'})
+
+    assert response.read_limit == collector.DETAIL_MAX_RESPONSE_BYTES + 1
+    assert row['抓取备注'] == 'detail_response_too_large'
+
+
+def test_detail_fetch_preserves_http_read_failure_and_redacts_other_exception_types(monkeypatch):
+    class Response:
+        def read(self, _limit=-1): raise HTTPError('https://hk.trip.com/', 430, 'blocked', None, None)
+        def geturl(self): return 'https://hk.trip.com/things-to-do/detail/117072053/'
+        def __enter__(self): return self
+        def __exit__(self, *_): return None
+
+    monkeypatch.setattr(collector.urllib.request, 'urlopen', lambda *_args, **_kwargs: Response())
+    row = collector.detail_fetch('hk', 'zh-HK', 'HKD', {'id': '117072053', 'vendor': 'V'})
+    assert row['抓取备注'] == 'detail_http_430'
+
+    class SensitiveTransportFailure(Exception): pass
+    monkeypatch.setattr(collector.urllib.request, 'urlopen', lambda *_args, **_kwargs: (_ for _ in ()).throw(SensitiveTransportFailure()))
+    row = collector.detail_fetch('hk', 'zh-HK', 'HKD', {'id': '117072053', 'vendor': 'V'})
+    assert row['抓取备注'] == 'detail_request_failed'
 
 
 @pytest.mark.parametrize('score', [True, 'NaN', 'Infinity', 5.1])
@@ -65,14 +283,19 @@ def test_detail_main_dispatch_never_calls_api_browser_or_mode2(tmp_path, monkeyp
     monkeypatch.setattr(collector, 'fetch', lambda *_a, **_k: pytest.fail('API called'))
     monkeypatch.setattr(collector, 'browser_recovery_replacements', lambda *_a: pytest.fail('browser called'))
     monkeypatch.setattr(collector, 'run_mode2_recovery', lambda *_a: pytest.fail('mode2 called'))
-    monkeypatch.setattr(collector, 'detail_fetch', lambda site, locale, currency, item: {
+    monkeypatch.setattr(collector, 'detail_fetch', lambda site, locale, currency, item, **_kwargs: {
         '厂商': item['vendor'], '商品ID': item['id'], 'URL': f'https://{site}.trip.com/things-to-do/detail/{item["id"]}/?curr={currency}&locale={locale}',
         '商品名称': 'detail', '月销量': '1', '年销量': '2', '总销量': '3', '评价数': '0', '总分': '',
     })
     collector.main(args)
 
 
-def test_detail_main_stops_after_first_denial_and_preserves_skipped_rows(tmp_path, monkeypatch):
+@pytest.mark.parametrize(('blocked_response', 'expected_note'), [
+    ('http_403', 'detail_http_403'),
+    ('human_200', 'detail_http_200_challenge'),
+])
+def test_detail_main_stops_after_first_denial_and_preserves_skipped_rows(tmp_path, monkeypatch,
+                                                                          blocked_response, expected_note):
     """The real detail transport is paced; pending IDs never reach urlopen."""
     _commands, args = _run_offline_main(monkeypatch, tmp_path, {'1': {}, '2': {}, '3': {}, '4': {}}, {}, policy='required')
     args.extend(['--data-source', 'detail', '--workers', '99'])
@@ -92,7 +315,7 @@ def test_detail_main_stops_after_first_denial_and_preserves_skipped_rows(tmp_pat
 
     class Response:
         def __init__(self, body, url): self.body, self.url = body, url
-        def read(self): return self.body.encode()
+        def read(self, _limit=-1): return self.body.encode()
         def geturl(self): return self.url
         def __enter__(self): return self
         def __exit__(self, *_args): return None
@@ -101,7 +324,9 @@ def test_detail_main_stops_after_first_denial_and_preserves_skipped_rows(tmp_pat
         product_id = urlparse(request.full_url).path.rstrip('/').rsplit('/', 1)[-1]
         starts.append((product_id, clock['value']))
         if product_id == '2':
-            raise HTTPError(request.full_url, 403, 'blocked', None, None)
+            if blocked_response == 'http_403':
+                raise HTTPError(request.full_url, 403, 'blocked', None, None)
+            return Response('<html>verify you are human</html>', request.full_url)
         return Response(product_page(product_id), request.full_url)
 
     monkeypatch.setattr(collector.urllib.request, 'urlopen', fake_urlopen)
@@ -112,11 +337,52 @@ def test_detail_main_stops_after_first_denial_and_preserves_skipped_rows(tmp_pat
     result = json.loads((run / 'run_result.json').read_text(encoding='utf-8'))
     rows = _sheet_rows(Path(result['workbook']), 'HK')
     assert starts == [('1', 10.0), ('2', 12.0)]
-    assert rows['2']['抓取备注'] == 'detail_http_403'
+    assert rows['2']['抓取备注'] == expected_note
     assert rows['3']['抓取备注'] == rows['4']['抓取备注'] == 'detail_skipped_after_block'
     assert result['errors'] == ['detail_access_blocked']
     assert result['failed_ids'] == ['HK/2', 'HK/3', 'HK/4']
     assert not (run / '.collection_done').exists()
+
+
+def test_detail_main_continues_after_generic_schema_failure(tmp_path, monkeypatch):
+    """Only explicit access denials stop the sequential public-detail batch."""
+    _commands, args = _run_offline_main(monkeypatch, tmp_path, {'1': {}, '2': {}}, {}, policy='off')
+    args.extend(['--data-source', 'detail'])
+    starts = []
+
+    def product_page(product_id):
+        product = {'productId': product_id, 'basicInfo': {'productName': 'Name'},
+                   'commentInfo': {'commentCount': 0},
+                   'salesVolume': {'monthlySales': 1, 'yearlySales': 2, 'twoYearSales': 3}}
+        data = {'props': {'pageProps': {'initialState': {'__STATE_MAP__': {
+            'PageModel': {'ds': {'getProductInfo': [product]},
+                          'header': {'clientInfo': {'locale': 'zh-HK', 'currency': 'HKD', 'site': 'HK'}}}
+        }}}}}
+        return '<script id="__NEXT_DATA__" type="application/json">' + json.dumps(data) + '</script>'
+
+    class Response:
+        def __init__(self, body, url): self.body, self.url = body, url
+        def read(self, _limit=-1): return self.body.encode()
+        def geturl(self): return self.url
+        def __enter__(self): return self
+        def __exit__(self, *_args): return None
+
+    def fake_urlopen(request, timeout):
+        product_id = urlparse(request.full_url).path.rstrip('/').rsplit('/', 1)[-1]
+        starts.append(product_id)
+        body = '<html>ordinary malformed page</html>' if product_id == '1' else product_page(product_id)
+        return Response(body, request.full_url)
+
+    monkeypatch.setattr(collector.urllib.request, 'urlopen', fake_urlopen)
+    with pytest.raises(SystemExit, match='部分失败'):
+        collector.main(args)
+
+    result = json.loads((_only_run(tmp_path) / 'run_result.json').read_text(encoding='utf-8'))
+    rows = _sheet_rows(Path(result['workbook']), 'HK')
+    assert starts == ['1', '2']
+    assert rows['1']['抓取备注'] == 'detail_schema_invalid'
+    assert not rows['2']['抓取备注']
+    assert result['errors'] == []
 
 
 def test_detail_main_healthy_path_is_sequential_even_with_many_workers(tmp_path, monkeypatch):
@@ -126,7 +392,7 @@ def test_detail_main_healthy_path_is_sequential_even_with_many_workers(tmp_path,
     monkeypatch.setattr(collector.time, 'monotonic', lambda: clock['value'])
     monkeypatch.setattr(collector.time, 'sleep', lambda delay: clock.__setitem__('value', clock['value'] + delay))
 
-    def fake_detail(_site, _locale, _currency, item):
+    def fake_detail(_site, _locale, _currency, item, **_kwargs):
         starts.append((item['id'], clock['value']))
         return {'厂商': item['vendor'], '商品ID': item['id'], 'URL': 'https://hk.trip.com/',
                 '商品名称': 'detail', '月销量': '1', '年销量': '2', '总销量': '3', '评价数': '0'}
